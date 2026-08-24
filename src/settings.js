@@ -10,7 +10,7 @@
  *   compaction summarization request carries `reasoningEffort: 'off'`, which
  *   the LLM adapter maps to `thinking: { type: 'disabled' }` — i.e. the
  *   provider's thinking/reasoning is switched off for the summarization call.
- * - `autoThresholdTokens` (number, default `120000`): the automatic
+ * - `autoThresholdTokens` (number, default `80000`): the automatic
  *   compaction trigger threshold in tokens. Compaction runs only when the
  *   session's estimated total context is at least this many tokens; below it,
  *   the checkpoint is skipped.
@@ -43,7 +43,7 @@ export const NS = 'falling-ts-force-compact'
  */
 export const DEFAULTS = Object.freeze({
   disableThinking: true,
-  autoThresholdTokens: 120000,
+  autoThresholdTokens: 80000,
 })
 
 /**

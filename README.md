@@ -115,14 +115,14 @@ with other plugins' keys):
 | key | type | default | effect |
 | --- | --- | --- | --- |
 | `disableThinking` | `boolean` | `true` | when `true`, **every model request** carries `reasoningEffort: 'off'`, which the LLM adapter maps to `thinking: { type: 'disabled' }` — the provider's thinking/reasoning is switched off for the request. Also applies to the plugin's own summarization calls. |
-| `autoThresholdTokens` | `number` | `120000` | the forced-compaction trigger threshold in tokens. **Before a model request**, the session's total context tokens (via `tokenMeter`) are measured; when they are **>= this value**, the request is rejected and a forced compaction runs instead. The `session/flush` checkpoint path also uses this threshold as its trigger gate. |
+| `autoThresholdTokens` | `number` | `80000` | the forced-compaction trigger threshold in tokens. **Before a model request**, the session's total context tokens (via `tokenMeter`) are measured; when they are **>= this value**, the request is rejected and a forced compaction runs instead. The `session/flush` checkpoint path also uses this threshold as its trigger gate. |
 
 Example `$DSH_HOME/settings.yaml`:
 
 ```yaml
 falling-ts-force-compact:
   disableThinking: true
-  autoThresholdTokens: 120000
+  autoThresholdTokens: 80000
 ```
 
 When the `settings` service is absent, the plugin falls back to these same
@@ -140,7 +140,7 @@ a hard dependency.
   Waterfalls receive the `Agent` in their payload and need no `agents` lookup.
 - **Optional dependency:** the `settings` service. When absent, the two
   parameters resolve to their defaults (`disableThinking: true`,
-  `autoThresholdTokens: 120000`).
+  `autoThresholdTokens: 80000`).
 - **Optional dependency:** the `tokenMeter` service. Used by the `agent/pre-step`
   threshold gate; when absent, the gate falls back to a coarse character-based
   estimate of the session's surface content.

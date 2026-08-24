@@ -100,14 +100,14 @@ dsh web --patch dsh-force-compact/cordis.patch.yml
 | 键 | 类型 | 默认值 | 作用 |
 | --- | --- | --- | --- |
 | `disableThinking` | `boolean` | `true` | 为 `true` 时，**每次模型请求**都携带 `reasoningEffort: 'off'`，LLM 适配器将其映射为 `thinking: { type: 'disabled' }`——即请求时关闭提供方的思考/推理。同样作用于插件自己的摘要调用。 |
-| `autoThresholdTokens` | `number` | `120000` | 强制压缩触发阈值（单位 tokens）。**在请求模型前**，通过 `tokenMeter` 测量会话上下文总 tokens 数；当其**达到或超过**该值时，**不请求模型**，而是强制执行一次强制压缩。`session/flush` 检查点路径也把它作为触发门禁。 |
+| `autoThresholdTokens` | `number` | `80000` | 强制压缩触发阈值（单位 tokens）。**在请求模型前**，通过 `tokenMeter` 测量会话上下文总 tokens 数；当其**达到或超过**该值时，**不请求模型**，而是强制执行一次强制压缩。`session/flush` 检查点路径也把它作为触发门禁。 |
 
 `$DSH_HOME/settings.yaml` 示例：
 
 ```yaml
 falling-ts-force-compact:
   disableThinking: true
-  autoThresholdTokens: 120000
+  autoThresholdTokens: 80000
 ```
 
 当 `settings` 服务不存在时，插件回退到同样的默认值，压缩照常进行——设置命名空间
@@ -121,7 +121,7 @@ falling-ts-force-compact:
   flush 触发时 `Agent` 已被注销，插件打印 `no live agent … — skipping` 并跳过
   该检查点。`agent/*` Waterfall 的 payload 直接携带 `Agent`，无需 `agents` 查找。
 - **可选依赖：** `settings` 服务。不存在时，两个参数回退到默认值
-  （`disableThinking: true`、`autoThresholdTokens: 120000`）。
+  （`disableThinking: true`、`autoThresholdTokens: 80000`）。
 - **可选依赖：** `tokenMeter` 服务。供 `agent/pre-step` 阈值门禁使用；不存在时，
   门禁回退到对会话 surface 内容的粗略字符估算。
 - **每次请求读取设置：** 两个参数都**每次模型请求**读取
