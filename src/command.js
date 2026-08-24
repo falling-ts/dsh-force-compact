@@ -37,9 +37,9 @@ export function registerCommand(ctx) {
       const session = agent.session
       const compaction = ctx.get('compaction')
 
-      // The compaction service is a hard dependency of this plugin; guard the
-      // rare case it is not available so the command settles as an error rather
-      // than throwing out of the handler.
+      // The compaction service is provided by the preset plane (read live via
+      // ctx.get); guard the case it is not available so the command settles as
+      // an error rather than throwing out of the handler.
       if (compaction === undefined || typeof compaction.compactNow !== 'function') {
         ctx.logger.warn(`[force-compact] ${session.id}: compaction service unavailable`)
         return { kind: 'error', text: 'compaction service unavailable' }

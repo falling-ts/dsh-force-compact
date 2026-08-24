@@ -5,8 +5,9 @@
  * streams it through `ctx.llm`, and returns the condensed checkpoint.
  *
  * This is a pre-commit preview + shrink gate: the durable surface mutation is
- * delegated to `ctx.compaction.compactRegion`, which is the authoritative
- * summarizer. See `compact.js` for the orchestration.
+ * delegated to the `compaction` service's `compactRegion` (read live via
+ * `ctx.get('compaction')`), which is the authoritative summarizer. See
+ * `compact.js` for the orchestration.
  *
  * @module @falling-ts/dsh-force-compact/summarizer
  */

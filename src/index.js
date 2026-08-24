@@ -13,12 +13,12 @@
  *   session's total context tokens; when they reach the `autoThresholdTokens`
  *   threshold the proposed step is rejected (the model request is NOT made)
  *   and the **earliest `autoEarliestRatio`** of the conversation's tokens is
- *   compacted via `ctx.compaction.compactRegion` instead.
+ *   compacted via the `compaction` service's `compactRegion` instead.
  *
  * The plugin also keeps the `session/flush` durability checkpoint: a
  * checkpoint-driven compaction (its own region policy + LLM summarizer,
- * delegated to `ctx.compaction.compactRegion`) so useful history is condensed
- * even between model requests.
+ * delegated to the `compaction` service's `compactRegion`) so useful history
+ * is condensed even between model requests.
  *
  * The compaction implementation lives in `src/`:
  * - `config.js`       — tunables.
@@ -41,18 +41,21 @@ import { handleAgentStatus } from './turn-end.js'
 /** @type {string} the function plugin's display name. */
 export const name = 'force-compact'
 
-/** @type {readonly string[]} the services this plugin hard-depends on. */
-export const inject = ['compaction']
-
 /**
  * Register the model-request Waterfalls, the `session/flush` listener, and the
  * `falling-ts-force-compact` settings namespace (the "强制压缩配置" surface).
  *
- * `compaction` is a hard dependency (`inject`). The `agents`, `settings`, and
- * `tokenMeter` services are optional: each is read with `ctx.get(...)` and
- * guarded against `undefined`, so a missing optional service never blocks a
- * listener (the plugin falls back to its composition defaults or a coarse
- * estimate).
+ * `compaction` is a runtime dependency provided by the preset plane
+ * (`include:agent-presets:compaction-basic`, enabled and mounted by default):
+ * every compaction path reads it live at event time with `ctx.get('compaction')`
+ * and guards against `undefined`, so a missing service never blocks a listener
+ * (the path skips with a log and the request proceeds). The plugin therefore
+ * declares no `inject` — profile entries activate at process boot, before the
+ * preset plane mounts the service, and a boot-time `inject` would fail the
+ * boot assertion. `agents`, `settings`, `tokenMeter`, and `commands` are
+ * likewise optional: each is read with `ctx.get(...)` and guarded against
+ * `undefined` (the plugin falls back to its composition defaults, a coarse
+ * estimate, or a skipped registration).
  *
  * @param {import('@deepseek-ai/cordis').Context} ctx
  */

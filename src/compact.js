@@ -1,8 +1,9 @@
 /**
  * dsh-force-compact's compaction orchestrator. Selects a region with its own
  * policy, runs its own LLM summarizer as a pre-commit preview + shrink gate,
- * then delegates the durable surface mutation to `ctx.compaction.compactRegion`
- * — which is the authoritative summarizer and commits the summary node.
+ * then delegates the durable surface mutation to the `compaction` service's
+ * `compactRegion` (read live via `ctx.get('compaction')`) — which is the
+ * authoritative summarizer and commits the summary node.
  *
  * @module @falling-ts/dsh-force-compact/compact
  */
@@ -20,8 +21,9 @@ const CHARS_PER_TOKEN = 4
  *
  * Flow: select the region with the plugin's own policy → project the region's
  * messages → run the plugin's own LLM summarizer as a pre-commit preview +
- * shrink gate → delegate the durable surface mutation to
- * `ctx.compaction.compactRegion` (the authoritative summarizer).
+ * shrink gate → delegate the durable surface mutation to the `compaction`
+ * service's `compactRegion` (the authoritative summarizer, read live via
+ * `ctx.get('compaction')`).
  *
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @param {import('@deepseek-ai/dsh-agent').Agent} agent
@@ -76,7 +78,15 @@ export async function compactSession(ctx, agent, controller) {
     return null
   }
 
-  const result = await ctx.compaction.compactRegion(region.start, region.end, agent, controller.signal)
+  // The compaction service is provided by the preset plane (read live — the
+  // plugin does not hard-inject it). When it is not available the checkpoint
+  // skips the compaction rather than failing the awaited checkpoint.
+  const compaction = ctx.get('compaction')
+  if (compaction === undefined || typeof compaction.compactRegion !== 'function') {
+    ctx.logger.warn(`[force-compact] ${session.id}: compaction service unavailable at checkpoint; skipping`)
+    return null
+  }
+  const result = await compaction.compactRegion(region.start, region.end, agent, controller.signal)
   ctx.logger.info(
     `[force-compact] ${session.id}: shadowed ${result.shadowedSeqs.length} nodes `
     + `(seqs ${result.shadowedRange.start}-${result.shadowedRange.end}, ~${result.shadowedTokenCount} tokens)`,

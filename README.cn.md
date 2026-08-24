@@ -23,9 +23,10 @@
   （每次请求）读取，因此 `settings.yaml` 的改动在下一次请求即生效。
 - **`agent/pre-step`** —— 每个模型步骤之前的 Waterfall。通过 `tokenMeter` 服务
   读取会话**上下文总 tokens 数**；当其**达到或超过** `autoThresholdTokens` 时，
-  返回 `{ kind: 'reject' }` **不发起模型请求**，并通过
-  `ctx.compaction.compactRegion` 从头压缩最早 `autoEarliestRatio` 的对话（将该
-  区间浓缩为一个摘要节点，让循环以更小的上下文重试）。
+  返回 `{ kind: 'reject' }` **不发起模型请求**，并通过 compaction 服务的
+  `compactRegion`（经 `ctx.get('compaction')` 实时读取）从头压缩最早
+  `autoEarliestRatio` 的对话（将该区间浓缩为一个摘要节点，让循环以更小的
+  上下文重试）。
 - **`session/flush`** —— 一个被等待（awaited）的 `parallel` 持久化检查点。检查点
   会等待所有监听器完成，因此压缩在调用方继续之前就已结束，摘要保证落盘。
 - **`/force-compact`** —— 通过 `/` 选择执行的斜杠命令，强制压缩该 Agent 的会话
@@ -56,8 +57,8 @@
 - **`src/summarizer.js`** —— 插件自己的一次性 LLM 摘要器：回放区间消息，把压缩
   指令作为最后一条 user 消息追加，通过 `ctx.llm` 流式生成，返回浓缩后的检查点。
 - **`src/compact.js`** —— 检查点编排器：选区间 → 投影区间消息 → 运行预览 + 收缩
-  门禁 → 把持久变更委托给 **`ctx.compaction.compactRegion(start, end, agent,
-  signal)`**（权威摘要器）。
+  门禁 → 把持久变更委托给 compaction 服务的 **`compactRegion(start, end,
+  agent, signal)`**（经 `ctx.get('compaction')` 实时读取；权威摘要器）。
 
 ```
 agent/request(payload, next)              # 每次模型请求
@@ -135,8 +136,7 @@ falling-ts-force-compact:
 
 ## 行为说明
 
-- **硬依赖：** `compaction` 服务。没有它插件不做任何事（强制压缩路径会降级为
-  让请求继续）。
+- **运行时依赖：** `compaction` 服务，由 preset 平面（`include:agent-presets:compaction-basic`，默认启用并挂载）提供，事件时经 `ctx.get('compaction')` 实时读取。不可用时插件不做任何事（强制压缩路径会降级为让请求继续）。
 - **可选依赖：** `agents` 服务。仅供 `session/flush` 检查点路径使用；若某次
   flush 触发时 `Agent` 已被注销，插件打印 `no live agent … — skipping` 并跳过
   该检查点。`agent/*` Waterfall 的 payload 直接携带 `Agent`，无需 `agents` 查找。

@@ -31,8 +31,9 @@ requirement), plus the durability checkpoint:
   session's **total context tokens** through the `tokenMeter` service. When the
   total is **>= `autoThresholdTokens`**, it returns `{ kind: 'reject' }` so the
   model request is **not** made, and compacts the **earliest `autoEarliestRatio`**
-  of the conversation's tokens via `ctx.compaction.compactRegion` (which condenses
-  that span into one summary node and lets the loop retry with a smaller context).
+  of the conversation's tokens via the `compaction` service's `compactRegion`
+  (read live via `ctx.get('compaction')`, which condenses that span into one
+   summary node and lets the loop retry with a smaller context).
 - **`session/flush`** — an awaited `parallel` durability checkpoint. Because
   the checkpoint awaits every listener, the compaction finishes before the
   caller proceeds, so the summary is durable.
@@ -70,8 +71,9 @@ Supporting modules:
   message, streams through `ctx.llm`, and returns the condensed checkpoint.
 - **`src/compact.js`** — the checkpoint orchestrator: select region → project
   region messages → run the preview + shrink gate → delegate the durable
-  mutation to **`ctx.compaction.compactRegion(start, end, agent, signal)`**,
-  which is the authoritative summarizer.
+  mutation to the `compaction` service's **`compactRegion(start, end, agent,
+   signal)`**
+  (read live via `ctx.get('compaction')`), which is the authoritative summarizer.
 
 ```
 agent/request(payload, next)              # every model request
@@ -152,9 +154,11 @@ a hard dependency.
 
 ## Behavior notes
 
-- **Hard dependency:** the `compaction` service. Without it the plugin does
-  nothing (the forced-compaction path falls through and lets the request
-  proceed).
+- **Runtime dependency:** the `compaction` service, provided by the preset
+  plane (`include:agent-presets:compaction-basic`, enabled and mounted by
+  default). It is read live at event time with `ctx.get('compaction')`; when it
+  is not available the plugin does nothing (the forced-compaction path falls
+  through and lets the request proceed).
 - **Optional dependency:** the `agents` service. Used only by the `session/flush`
   checkpoint path; if a flush fires after the Agent is unregistered, the plugin
   logs `no live agent … — skipping` and skips that checkpoint. The `agent/*`

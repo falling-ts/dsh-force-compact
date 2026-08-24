@@ -15,9 +15,9 @@
  *   session's **total context tokens** through the `tokenMeter` service. When
  *   the total is **>= `autoThresholdTokens`**, the guard rejects the proposed
  *   step (so the model request is NOT made) and instead compacts the **earliest
- *   `autoEarliestRatio`** of the conversation's tokens via
- *   `ctx.compaction.compactRegion`, which condenses the head history and lets
- *   the loop retry with a smaller context.
+ *   `autoEarliestRatio`** of the conversation's tokens via the `compaction`
+ *   service's `compactRegion` (read live via `ctx.get('compaction')`), which
+ *   condenses the head history and lets the loop retry with a smaller context.
  *
  * Both settings are read **per request** through the synchronous
  * `settings.get('falling-ts-force-compact')` so a `settings.yaml` edit is picked up on the
@@ -68,8 +68,9 @@ export function takeForceCompact(sessionId) {
  * session's total context tokens (via `tokenMeter` or a character-based
  * fallback), computes the token budget (`totalTokens * ratio`), selects the
  * head-anchored span with `selectEarliestByTokens`, and delegates the durable
- * mutation to `ctx.compaction.compactRegion(start, end, agent, signal)`,
- * forwarding the caller's `AbortSignal` for cancellation. Resolves `true` when a
+ * mutation to the `compaction` service's `compactRegion(start, end, agent,
+ * signal)` (read live via `ctx.get('compaction')`), forwarding the caller's
+ * `AbortSignal` for cancellation. Resolves `true` when a
  * compaction was committed, `false` otherwise (missing service, no compactable
  * span, or a thrown error) — it never throws.
  * @param {import('@deepseek-ai/cordis').Context} ctx
