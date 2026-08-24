@@ -1,0 +1,11 @@
+# Opt-in overlay: mount the Session Auto-Compact function plugin over the
+# current composition without changing shipped defaults.
+#
+#   dsh web --patch dsh-compact/cordis.yml
+#
+# The plugin auto-compacts a session's useful history into a summary node at
+# every session durability checkpoint (session/flush).
+
+- insert:
+    - id: auto-compact
+      name: '@deepseek-ai/dsh-compact'

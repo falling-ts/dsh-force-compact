@@ -1,0 +1,34 @@
+{
+  "name": "@deepseek-ai/dsh-compact",
+  "description": "Automatically compact a session's useful history into a summary node at every session durability checkpoint",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.yml",
+    "README.md",
+    "README.zh.md"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/<owner>/dsh-compact.git"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "cordis",
+    "plugin",
+    "compaction",
+    "session",
+    "auto-compact"
+  ]
+}
