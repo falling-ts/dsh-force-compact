@@ -12,6 +12,8 @@ import { resolveConfig } from './config.js'
 import { selectRegion } from './region.js'
 import { summarize } from './summarizer.js'
 import { readSettings, DEFAULTS } from './settings.js'
+import { dbg } from './request-guard.js'
+import { resolveCompaction } from './service-resolver.js'
 
 /** Characters per token, mirroring the official token meter's coarse estimate. */
 const CHARS_PER_TOKEN = 4
@@ -28,9 +30,10 @@ const CHARS_PER_TOKEN = 4
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @param {import('@deepseek-ai/dsh-agent').Agent} agent
  * @param {AbortController} controller
+ * @param {string|undefined} mode the `compactionMode` setting (passed by the caller); undefined re-reads live.
  * @returns {Promise<object | null>} the compaction result, or `null` when nothing was worth compacting.
  */
-export async function compactSession(ctx, agent, controller) {
+export async function compactSession(ctx, agent, controller, mode) {
   const session = agent.session
   const config = resolveConfig()
 
@@ -44,6 +47,7 @@ export async function compactSession(ctx, agent, controller) {
   // estimated total context reaches the configured threshold. Below it, the
   // checkpoint is skipped so short sessions are never force-compacted.
   const sessionTokens = estimateSessionTokens(session)
+  void dbg(ctx, `[force-compact] ${session.id}: session/flush checkpoint fired — session ~${sessionTokens} tokens (threshold ${settings.autoThresholdTokens}), disableThinking=${settings.disableThinking}`)
   if (sessionTokens < settings.autoThresholdTokens) {
     ctx.logger.debug(`[force-compact] ${session.id}: context ~${sessionTokens} tokens below threshold ${settings.autoThresholdTokens}; skipping`)
     return null
@@ -78,12 +82,18 @@ export async function compactSession(ctx, agent, controller) {
     return null
   }
 
-  // The compaction service is provided by the preset plane (read live — the
-  // plugin does not hard-inject it). When it is not available the checkpoint
-  // skips the compaction rather than failing the awaited checkpoint.
-  const compaction = ctx.get('compaction')
+  // The compaction backend is provided by the preset plane, mounted PER AGENT
+  // REALM (the standard preset isolates `compaction`), so locate it through the
+  // agent's own context with a host-global fallback (see `service-resolver.js`).
+  // When it is not available the checkpoint skips rather than failing the
+  // awaited checkpoint.
+  const compaction = await resolveCompaction(ctx, agent, mode)
   if (compaction === undefined || typeof compaction.compactRegion !== 'function') {
-    ctx.logger.warn(`[force-compact] ${session.id}: compaction service unavailable at checkpoint; skipping`)
+    const effMode = (mode !== undefined ? mode : settings.compactionMode)
+    ctx.logger.warn(
+      `[force-compact] ${session.id}: compaction service unavailable at checkpoint (mode=${effMode}); skipping. ` +
+      `See plugin AGENTS.md §preset-realm-limitation if your preset isolates \`compaction\`.`
+    )
     return null
   }
   const result = await compaction.compactRegion(region.start, region.end, agent, controller.signal)

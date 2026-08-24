@@ -28,6 +28,31 @@
 
 import { readSettings, DEFAULTS } from './settings.js'
 import { selectEarliestByTokens } from './region.js'
+import { resolveCompaction } from './service-resolver.js'
+
+/**
+ * The plugin's OWN debug logger — the single, consistent observability channel.
+ *
+ * Writes one line through the standard `[force-compact]`-marked `ctx.logger`
+ * path, but ONLY when the `debug` setting is on (read live, falling back to the
+ * composition default `true`). Because the `[force-compact]` marker is what the
+ * debug-log exporter filters on, this is the reliable way to get a diagnostic
+ * line into `~/.dsw/logs/dsh-force-compact.log`: marked lines land there exactly
+ * when `debug === true` and the exporter is installed. The explicit `debug` check
+ * also keeps the highest-frequency call sites (once per model request) at zero
+ * cost when debug is off.
+ *
+ * `msg` is the full `[force-compact] …` line. Call sites need not re-read the
+ * settings themselves.
+ * @param {import('@deepseek-ai/cordis').Context} ctx
+ * @param {string} msg
+ * @returns {Promise<void>}
+ */
+export async function dbg(ctx, msg) {
+  const settings = (await readSettings(ctx)) ?? DEFAULTS
+  if (settings.debug !== true) return
+  ctx.logger.debug(msg)
+}
 
 /**
  * Process-local "force compact now" flags, one per session (keyed by
@@ -77,14 +102,21 @@ export function takeForceCompact(sessionId) {
  * @param {import('@deepseek-ai/dsh-agent').Agent} agent
  * @param {AbortSignal|undefined} signal the current turn's signal (forwarded to compaction).
  * @param {number} ratio a fraction in (0, 1] of the session's tokens to compact from the head.
+ * @param {string|undefined} mode the `compactionMode` setting (passed by the caller); undefined re-reads live.
  * @returns {Promise<boolean>} whether a compaction was committed.
  */
-async function compactEarliestRatio(ctx, agent, signal, ratio) {
+async function compactEarliestRatio(ctx, agent, signal, ratio, mode) {
   const settings = (await readSettings(ctx)) ?? DEFAULTS
   const session = agent.session
-  const compaction = ctx.get('compaction')
+  // Locate the compaction backend through the agent's realm (preset-isolated)
+  // with a host-global fallback (see `service-resolver.js`).
+  const compaction = await resolveCompaction(ctx, agent, mode)
   if (compaction === undefined || typeof compaction.compactRegion !== 'function') {
-    ctx.logger.warn(`[force-compact] ${session.id}: compaction service unavailable; no compaction performed`)
+    const effMode = (mode !== undefined ? mode : settings.compactionMode)
+    ctx.logger.warn(
+      `[force-compact] ${session.id}: compaction service unavailable (mode=${effMode}); no compaction performed. ` +
+      `See plugin AGENTS.md §preset-realm-limitation if your preset isolates \`compaction\` in a realm this plugin cannot reach.`
+    )
     return false
   }
   // Measure the session's total context tokens (authoritative when tokenMeter is
@@ -95,9 +127,10 @@ async function compactEarliestRatio(ctx, agent, signal, ratio) {
     : undefined
   const region = selectEarliestByTokens(session, ratio, totalTokens)
   if (region === null) {
-    ctx.logger.debug(`[force-compact] ${session.id}: no earliest ${ratio} token region to compact`)
+    await dbg(ctx, `[force-compact] ${session.id}: no earliest ${ratio} token region to compact (totalTokens=${totalTokens == null ? 'unknown(fallback est)' : totalTokens})`)
     return false
   }
+  await dbg(ctx, `[force-compact] ${session.id}: compacting earliest ${ratio} -> span seqs ${region.start}..${region.end} (totalTokens=${totalTokens})`)
   try {
     const result = await compaction.compactRegion(region.start, region.end, agent, signal)
     if (result === undefined || result === null) {
@@ -125,9 +158,10 @@ async function compactEarliestRatio(ctx, agent, signal, ratio) {
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @param {import('@deepseek-ai/dsh-agent').Agent} agent
  * @param {AbortSignal|undefined} signal the current turn's signal.
+ * @param {string|undefined} mode the `compactionMode` setting (passed by the caller); undefined re-reads live.
  * @returns {Promise<boolean>} `true` when the caller should return `{ kind: 'reject' }`.
  */
-export async function forceCompactIfNeeded(ctx, agent, signal) {
+export async function forceCompactIfNeeded(ctx, agent, signal, mode) {
   const settings = (await readSettings(ctx)) ?? DEFAULTS
   const session = agent.session
 
@@ -136,18 +170,26 @@ export async function forceCompactIfNeeded(ctx, agent, signal) {
   // `forceEarliestRatio` of the conversation.
   if (takeForceCompact(session.id)) {
     ctx.logger.info(`[force-compact] ${session.id}: /force-compact queued; force-compacting the earliest ${settings.forceEarliestRatio} immediately`)
-    return await compactEarliestRatio(ctx, agent, signal, settings.forceEarliestRatio)
+    const committed = await compactEarliestRatio(ctx, agent, signal, settings.forceEarliestRatio, mode)
+    await dbg(ctx, `[force-compact] ${session.id}: /force-compact forced compaction ${committed ? 'COMMITTED' : 'did not commit'} — letting the request proceed`)
+    return committed
   }
 
   // Total context tokens for this session — the authoritative measurement the
   // official `compaction-basic` uses for its pressure gate.
   const meter = ctx.get('tokenMeter')
-  if (meter === undefined || typeof meter.measure !== 'function') return false
+  if (meter === undefined || typeof meter.measure !== 'function') {
+    await dbg(ctx, `[force-compact] ${session.id}: tokenMeter unavailable — threshold gate skipped, letting the request proceed`)
+    return false
+  }
   const measurement = meter.measure(session)
   const total = measurement && typeof measurement.totalTokens === 'number'
     ? measurement.totalTokens
     : estimateSessionTokens(session)
-  if (total < settings.autoThresholdTokens) return false
+  if (total < settings.autoThresholdTokens) {
+    await dbg(ctx, `[force-compact] ${session.id}: total ~${total} tokens < threshold ${settings.autoThresholdTokens} — below gate, letting the request proceed`)
+    return false
+  }
 
   // At or above the threshold: do NOT request the model. Compact the earliest
   // `autoEarliestRatio` of the conversation instead; the loop retries the step
@@ -156,7 +198,9 @@ export async function forceCompactIfNeeded(ctx, agent, signal) {
     `[force-compact] ${session.id}: context ~${total} tokens >= threshold ${settings.autoThresholdTokens}; `
     + `rejecting the model request and compacting the earliest ${settings.autoEarliestRatio}`,
   )
-  return await compactEarliestRatio(ctx, agent, signal, settings.autoEarliestRatio)
+  const committed = await compactEarliestRatio(ctx, agent, signal, settings.autoEarliestRatio, mode)
+  await dbg(ctx, `[force-compact] ${session.id}: threshold-gate compaction ${committed ? 'COMMITTED' : 'did not commit'} — letting the request proceed`)
+  return committed
 }
 
 /**

@@ -20,6 +20,8 @@
  */
 
 import { readSettings, DEFAULTS } from './settings.js'
+import { dbg } from './request-guard.js'
+import { resolveCompaction } from './service-resolver.js'
 
 /**
  * Handle one `agent/status` emission: when the agent transitions to `idle` and
@@ -28,19 +30,36 @@ import { readSettings, DEFAULTS } from './settings.js'
  * the listener (a failing compaction is logged and swallowed).
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @param {{agent: import('@deepseek-ai/dsh-agent').Agent, status: string}} payload
+ * @param {string|undefined} mode the `compactionMode` setting (passed by the caller); undefined re-reads live.
  * @returns {Promise<void>}
  */
-export async function handleAgentStatus(ctx, payload) {
+export async function handleAgentStatus(ctx, payload, mode) {
   const { agent, status } = payload
   if (status !== 'idle') return
 
   const settings = (await readSettings(ctx)) ?? DEFAULTS
-  if (settings.turnEndForceCompactionEnabled !== true) return
+  if (settings.turnEndForceCompactionEnabled !== true) {
+    // Visible so a tester who flipped the setting OFF can confirm the guard is
+    // what suppressed the idle compaction (not a missing listener).
+    const sid = agent.session ? agent.session.id : '?'
+    void dbg(ctx, `[force-compact] ${sid}: turn-end compaction disabled by settings — idle transition ignored`)
+    return
+  }
 
   const session = agent.session
-  const compaction = ctx.get('compaction')
+  // Locate the compaction backend through the agent's realm (preset-isolated)
+  // with a host-global fallback (see `service-resolver.js`). At idle the agent
+  // is still live in the registry, so its realm-scoped context still resolves
+  // the instance the `compactNow` idle entry needs.
+  const compaction = await resolveCompaction(ctx, agent, mode)
   if (compaction === undefined || typeof compaction.compactNow !== 'function') {
-    ctx.logger.warn(`[force-compact] ${session.id}: compaction service unavailable at idle`)
+    const effMode = (mode !== undefined ? mode : settings.compactionMode)
+    ctx.logger.warn(
+      `[force-compact] ${session.id}: compaction service unavailable at idle (mode=${effMode}). ` +
+      `If your agent preset isolates the \`compaction\` service into a realm this plugin cannot reach, ` +
+      `move the \`compaction-basic\` row OUTSIDE the preset's \`compaction\` group \`isolate\` (see plugin AGENTS.md §preset-realm-limitation), ` +
+      `or configure a global-scope backend.`
+    )
     return
   }
 

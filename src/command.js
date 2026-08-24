@@ -13,7 +13,9 @@
  * @module @falling-ts/dsh-force-compact/command
  */
 
-import { queueForceCompact } from './request-guard.js'
+import { queueForceCompact, dbg } from './request-guard.js'
+import { resolveCompaction } from './service-resolver.js'
+import { readRawSetting } from './settings.js'
 
 /**
  * Register the global `/force-compact` command. A no-op when the `commands`
@@ -35,11 +37,16 @@ export function registerCommand(ctx) {
     handler: async (invocation) => {
       const agent = invocation.agent
       const session = agent.session
-      const compaction = ctx.get('compaction')
+      // Locate the compaction backend through `agent.ctx` (presets isolate it)
+      // with a host-global fallback (see `service-resolver.js`). The
+      // `compactionMode` setting is read once here (raw, cheap) and passed so
+      // the resolver need not re-read settings.
+      const mode = await readRawSetting(ctx, 'compactionMode')
+      const compaction = await resolveCompaction(ctx, agent, mode)
+      void dbg(ctx, `[force-compact] ${session.id}: /force-compact command handler entered (compaction ${compaction && typeof compaction.compactNow === 'function' ? 'available' : 'UNAVAILABLE'})`)
 
-      // The compaction service is provided by the preset plane (read live via
-      // ctx.get); guard the case it is not available so the command settles as
-      // an error rather than throwing out of the handler.
+      // Guard the case it is not available so the command settles as an error
+      // rather than throwing out of the handler.
       if (compaction === undefined || typeof compaction.compactNow !== 'function') {
         ctx.logger.warn(`[force-compact] ${session.id}: compaction service unavailable`)
         return { kind: 'error', text: 'compaction service unavailable' }
