@@ -2,39 +2,93 @@
 
 本规则适用于 `dsh-force-compact/`，并补充[集合约定](../AGENTS.md)。
 
-## 预设域限制（§preset-realm-limitation）
+## 双引擎架构（内置引擎 + 官方服务并列共存）
 
-现代 harness 组合中，`compaction-basic` 通常**挂在 agent preset 的一个 `isolate` 组里**
-（例如 `standard` preset 的 `- id: compaction / name: cordis:group / isolate: {compaction:true,…}`
-组），导致服务仅在该组**后代 realm**可见。本插件是 **Host 全局监听器**——`apply` 上下文、
-`event-dispatch` 上下文、`agent.ctx` 都不一定是该组的 descendant，于是 `ctx.get('compaction')`
-从这些候选上下文中读取为 `undefined`（经 `agent.ctx` 实测确认：`sessions/llm/tokenMeter/
-settings/agents` 都能解析，唯独 `compaction` 不能——证明我们持有的 realm **不是**该组的
-descendant，而是同级的另一个 scope）。
+本插件拥有**两条独立的压缩路径**，通过统一的 `resolveCompaction(ctx, agent, mode)` facade
+对外呈现，对调用者透明。facade 始终返回**统一形状**的后端对象
+（`{ compactNow, compactRegion, kind: 'official' | 'builtin' }` 或 `undefined`），
+所有下游调用点（`compact.js`、`turn-end.js`、`command.js`、`request-guard.js`）
+只关心这个形状，不需要知道是哪一路产出的结果。
 
-本插件遵守 AGENTS.md 既有约束"**不声明 `inject`**"（preset 平面晚于插件 boot 挂载，
-硬 inject 会触发启动断言失败），所以**无法通过注入获取该服务**。结果是：
+### 优先级：官方优先，内置后备
 
-- **默认（`compactionMode:'realm'`）**：尝试 `agent.ctx.get('compaction')`，然后
-  回落 `ctx.get('compaction')`。在标准 preset 部署下两者都为 `undefined`，
-  四条压缩路径全部**优雅降级为 skip + WARN**（包含本段落指引）。
-- **`compactionMode:'global'`**：只用 `ctx.get('compaction')`，适合**将 `compaction-basic`
-  行移出 preset 的 `isolate` 组**（改为 root-realm 暴露，或独立 bundle 挂载到 host
-  plane）后的部署——此时 `ctx.get` 能命中。
-- **真正让压缩"跑起来"的方式**（三选一）：
-  1. 修改 agent preset 的 `cordis.yml`，把 `compaction-basic`（连同它需要的
-     `toolResultPruner` 协作方）放在**本插件可达的 realm** 下（通常是 root-realm，
-     即移出 `isolate` 组）。代价：失去组内隔离，`toolResultPruner` 也变全局——需评估
-     是否会与同进程内其它 preset 的同名服务冲突。
-  2. 用 `dsh-market` 或独立 profile `bundles` 把 `compaction-basic` 挂到 **Host
-     plane**（而非 preset plane），使其成为 root-realm 服务；插件 `ctx.get('compaction')`
-     即刻可读（等价 `compactionMode:'global'`）。
-  3. 放弃 `compaction-basic`，用**另一个能挂到 root-realm 的 compaction 后端**
-     实现同样契约（暴露 `compactNow` / `compactRegion`）。
+```
+resolveCompaction
+├── 1. findOfficialService(ctx, agent, mode)
+│     ├── compactionMode='realm' (默认): agent.ctx → ctx.get('compaction')
+│     └── compactionMode='global':       仅 ctx.get('compaction')
+└── 2. builtinBackend(ctx, agent)        ← 内置引擎
+      门槛: builtinEnabled !== false (默认 true)
+            + agent.session 存在
+            + ctx.get('llm').stream 是函数
+```
 
-插件代码层面**已做到最优**：realm-first → global-fallback 的两级解析 + 优雅降级 +
-诊断级 WARN。问题本质是**上游 preset 的组合拓扑**与本插件"纯 Host 监听器、零 inject"
-之间的张力，只能从**组合**一侧解决。
+官方服务可达 → 使用官方；不可达 → 自动落到内置引擎。**用户无需手动切换**。
+
+### 内置引擎（src/builtin-engine.js）
+
+自包含、不依赖官方 `compaction` 服务的完整持久事务：
+
+| 步骤 | 追加的事件 | 说明 |
+|------|-----------|------|
+| 打开锁 | `fc-compact/start` | `compactionId`（UUID），`turn`（当前 open turn 号或 null） |
+| 摘要生成 | — | 通过 `ctx.llm.stream` 流式生成，受 `maxSummaryTokens` 上限约束 |
+| 收缩门禁 | — | `tokenMeter.estimateMessage` 判定摘要 tokens < 被遮蔽区间 tokens，否则中止 |
+| 提交摘要标记 | `fc-compact/summary` | 记录 `compactionId`、`shadowedRange`、`shadowedSeqs`、`shadowedTokenCount`、可选 `provider`/`model` |
+| Surface 替换 | `user/message` + `surfaceOp:{op:'replace',start,end}` | 带 `source={kind:'plugin',plugin:'force-compact-builtin'}`；`sourceEventSeqs` 指向 start+summary+shadowed |
+| 闭合锁 | `fc-compact/end` | 同上 `compactionId`；失败路径在此带 `error:` 字段 |
+
+**为什么事件名用 `fc-compact/*` 前缀而不复用官方 `compaction/*`：** 官方有全局
+`compaction/invariant` 监听器校验每一个落地的 `compaction/*` 事件的合法性；
+我们的事件如果复用同名词汇会被该监听器拒绝。用独立的前缀完全绕开了这条约束，
+使两套引擎可以在同一进程并存（官方挂了就走官方、没挂就内置接管），互不干扰。
+
+### 历史背景（为何需要内置引擎）
+
+早期版本只做了一件事：从 preset 的 `isolate` 组里解析 `compaction` 服务。标准
+preset 把 `compaction-basic` 挂在了 `- isolate:{compaction:true,…}` 组里，而本插件
+是 **Host 全局监听器**——`apply` 上下文、`event-dispatch` 上下文、`agent.ctx`
+都不是该组的 descendant，所以 `ctx.get('compaction')` 在这些上下文里都返回
+`undefined`（经验证：`agent.ctx` 能解析 `sessions/llm/tokenMeter/settings/agents`，
+唯独 `compaction` 不能——证明我们持有的是同级另一个 scope）。同时 AGENTS.md 既有
+约束禁止 `inject:['compaction']`（preset 平面晚挂载，硬 inject 会触发启动断言
+失败）。结果是标准 preset 下四条路径全退化为 skip + WARN，压缩实际从未发生过。
+
+内置引擎正是为了填补这一空白而生：它**绕过服务解析问题**，直接用公开可用的
+`ctx.sessions.append` + `ctx.llm.stream` + `ctx.tokenMeter.estimateMessage`
+完成整条事务链，不需要碰 `compaction` 服务本体。
+
+### 配置项（`falling-ts-force-compact` 命名空间）
+
+| 参数 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| `disableThinking` | boolean | `true` | 摘要 LLM 调用携带 `reasoningEffort:'off'` |
+| `autoThresholdTokens` | number | `131000` | `agent/pre-step` 自动压缩触发阈值 |
+| `autoEarliestRatio` | number (0.01–1) | `0.3` | 自动路径从头部选取的对话比例 |
+| `forceEarliestRatio` | number (0.01–1) | `0.5` | `/force-compact` 命令从头部选取的比例 |
+| `turnEndForceCompactionEnabled` | boolean | `true` | agent 转入 `idle` 时是否触发一轮结束压缩 |
+| `debug` | boolean | `true` | `[force-compact]` 调试日志开关 |
+| `logFile` | string | `~/.dsh/logs/dsh-force-compact.log` | 调试日志目标路径 |
+| `compactionMode` | `'realm'\|'global'` | `'realm'` | 官方服务解析策略（仅影响 priority-1 路径） |
+| `builtinEnabled` | boolean | `true` | **内置引擎闸门**。`false` 时严格只走官方；缺省视为 `true`（兼容旧 yaml） |
+| `maxSummaryTokens` | integer (256–200000) | `2400` | 摘要 LLM 调用的 `maxTokens` 上限；防超长摘要 |
+
+### 如何验证内置引擎工作
+
+1. 重启 3180 dev 实例（`bash harness-server-dev.sh`）。
+2. 建一个短会话并发送任意消息（哪怕 "Say hello"），等回合结束进入 `idle`。
+3. 看 `%USERPROFILE%\.dsh\logs\dsh-force-compact.log` 末行是否出现
+   `idle compaction (builtin) shadowed N nodes (~M tokens)` 以及
+   `builtin fc-compact OK — replaced span seq[…] (N nodes, ~M tokens) with a P-char checkpoint`。
+4. `session.history` 查该会话，应看到 4 个连续事件：
+   `fc-compact/start` → `fc-compact/summary` → `user/message`(replace) → `fc-compact/end`，
+   共享同一个 `compactionId`。
+
+### 如何让官方服务"赢回来"
+
+如果你的 preset 改过组合拓扑，使 `compaction-basic` 不再 isolate（root-realm
+或服务被显式挂到 host plane），则 `ctx.get('compaction')` 可命中，priority-1 路径
+直接胜出，内置引擎自然不参与——无需改动任何配置。
 
 ## 如何判断插件是否加载成功
 
@@ -67,8 +121,11 @@ descendant，而是同级的另一个 scope）。
 
 ## 概览
 
-- 插件唯一的持久效果是 `compaction` 服务追加到会话日志的摘要节点；插件不引入其他状态。不要引入 timer 或内存态存储；Host 半部保持它是**核心模型请求缝**（`agent/request` / `agent/pre-step`）与 `session/flush` 上的纯 Host 监听器。**另有一个 web client 半部**（`src/client.js`，`package.json` 的 `exports["./client"]` + `dsh.client.platform: web`，经 client module 系统自动组成，无需改 web-app 组合）：仅注册一个 `settings.section`（设置页左侧菜单"强制压缩 / Force Compact"分区，order 30），经 `settingsScope.bind({ namespace: 'falling-ts-force-compact' })` 镜像成 uSES 安全的 `SnapshotStore` 并读写字段（`scope.set`/`scope.unset` 写回 `settings.yaml`），**不**引入 timer、内存态存储或额外订阅；client 半部 `inject: ['slots','locale','settingsScope']`（这三个 client 服务在 client 启动时即可用，与 Host 侧的 `compaction` 运行时依赖不同）。
-- `compaction` 是**运行时依赖**，由 preset 平面（`include:agent-presets:compaction-basic`，默认启用并挂载）提供，**不是**启动时硬依赖：插件**不**声明 `inject`——profile 层条目在进程启动时激活，彼时 preset 平面尚未挂载该服务，硬 `inject` 会导致 `assertEntriesActivated` 启动断言失败；各压缩路径在事件时经 `ctx.get('compaction')`（读全局服务存储）实时读取，对 `undefined` 做守卫——服务不可用时该路径记日志后跳过，绝不阻塞请求。`agents`、`settings`、`tokenMeter`、`commands` 都是可选依赖（`ctx.get(...)`，对 `undefined` 做守卫）：`agents` 仅供 `session/flush` 路径（缺少 Agent 是记录日志后跳过）；缺少 `settings` 时两个参数回退到默认值；缺少 `tokenMeter` 时阈值门禁回退到粗略字符估算；缺少 `commands` 时 `/force-compact` 命令不注册（`src/command.js` 是 no-op）。
+- 插件的持久效果是**追加到会话日志的压缩事务**——具体形态取决于实际走了哪条引擎：走官方时落 `compaction/*` 系列（`compaction/start`、`compaction/summary`、`compaction/end`）加一个 `surfaceOp:replace` 的 `user/message`；走内置时落 `fc-compact/*` 系列（`fc-compact/start`、`fc-compact/summary`、`fc-compact/end`）加同样形态的 `user/message`。两种事务都以"前置括号事件 + 后置 replace 表面节点"的形式落地。插件不引入 timer 或内存态存储；Host 半部保持是**核心模型请求缝**（`agent/request` / `agent/pre-step`）与 `session/flush` 上的纯 Host 监听器。**另有一个 web client 半部**（`src/client.js`，`package.json` 的 `exports["./client"]` + `dsh.client.platform: web`，经 client module 系统自动组成，无需改 web-app 组合）：仅注册一个 `settings.section`（设置页左侧菜单"强制压缩 / Force Compact"分区，order 30），经 `settingsScope.bind({ namespace: 'falling-ts-force-compact' })` 镜像成 uSES 安全的 `SnapshotStore` 并读写字段（`scope.set`/`scope.unset` 写回 `settings.yaml`），**不**引入 timer、内存态存储或额外订阅；client 半部 `inject: ['slots','locale','settingsScope']`（这三个 client 服务在 client 启动时即可用，与 Host 侧的 `compaction` 运行时依赖不同）。
+- **两条压缩引擎**（见上文"双引擎架构"节）：
+  - **官方引擎**——`compaction` 服务提供的 `compactNow` / `compactRegion`，由 preset 平面（`include:agent-presets:compaction-basic`）挂载，**是运行时可选依赖**：插件**不**声明 `inject`——profile 层条目在进程启动时激活，彼时 preset 平面尚未挂载该服务，硬 `inject` 会导致 `assertEntriesActivated` 启动断言失败；各压缩路径在事件时经 `findOfficialService`（`service-resolver.js`）按 `compactionMode`（`realm` 先试 `agent.ctx` 再试 `ctx`；`global` 只试 `ctx`）定位。
+  - **内置引擎**——`src/builtin-engine.js` 自实现的完整压缩事务，只依赖 `ctx.sessions.append`、`ctx.llm.stream`、`ctx.tokenMeter.estimateMessage`（全部经 `ctx.get` 读取、可缺省、对 `undefined` 做守卫）。它追加独立命名的 `fc-compact/*` 事件与 `user/message`(replace)，**刻意不复用官方的 `compaction/*` 词汇表**——因为官方有全局 `compaction/invariant` 监听器校验每一条 `compaction/*` 事件的合法性，复用语义会让内置事务被拒收。两引擎并存时优先级：官方可达即用官方；官方不可达才落到内置（`builtinEnabled !== false` 且 `agent.session` / `llm.service/stream` 可用）。
+- `agents`、`settings`、`tokenMeter`、`commands`、`llm` 都是可选依赖（`ctx.get(...)`，对 `undefined` 做守卫）：`agents` 仅供 `session/flush` 路径（缺少 Agent 是记录日志后跳过）；缺少 `settings` 时所有参数回退到默认值；缺少 `tokenMeter` 时阈值门禁回退到粗略字符估算；缺少 `commands` 时 `/force-compact` 命令不注册（`src/command.js` 是 no-op）；缺少 `llm` 时内置引擎不可用（官方引擎不受影响）。
 - **钩住核心模型请求（`agent/request` / `agent/pre-step`）：** 插件的核心行为是钩住官方模型请求缝，**每次请求模型前**读取设置：
   - **`agent/request`**（围绕冻结调用配置的 Waterfall）——`disableThinking` 为 `true` 时，返回的 `LlmCallConfig` 携带 `reasoningEffort: 'off'`（适配器映射为 `thinking: { type: 'disabled' }`），即**每次模型请求**都关闭思考。监听器 `await next()` 取得机器本会使用的配置，再返回替换值；**不得**在缺少 `next()` 时短路（必须调用 `next()`）。
   - **`agent/pre-step`**（每个模型步骤前的 Waterfall）——通过 `tokenMeter.measure(session).totalTokens` 读取会话上下文总 tokens；当其**≥ `autoThresholdTokens`** 时，返回 `{ kind: 'reject' }` **不发起模型请求**，并从头压缩最早 `autoEarliestRatio` 的对话（`compactRegion`）；低于阈值时调用 `next()` 让请求继续。强制压缩失败（无安全区间 / 已活跃）时降级为 `next()`，绝不阻塞请求。
@@ -77,7 +134,7 @@ descendant，而是同级的另一个 scope）。
   - 直接调用 compaction 服务的 `compactNow(agent, invocation.signal)`（事件时经 `ctx.get('compaction')` 实时读取；owner `null`，空闲手动入口）压缩会话——空闲时立即生效，使用引擎自身的区间选择。
   - 若 `compactNow` 抛出（Agent 繁忙 / 无安全区间），调用 `queueForceCompact(session.id)` **插入一个 JS 内存标记**（process-local `Map`，无持久态、无 timer），返回 "将在下一个模型步骤强制压缩"。
   - 该标记由 `agent/pre-step` 钩子（`takeForceCompact`）在**下一个模型步骤**读取并**立即消费**：读到强制标记则**跳过 token 阈值门禁**、压缩最早 `forceEarliestRatio`（`compactRegion`），并返回 `{ kind: 'reject' }` **不再请求模型**——即"再请求钩子中如果读取到强制命令, 立马执行压缩, 不再请求模型"。
-- **强制压缩配置（`falling-ts-force-compact` 设置命名空间）：** 当 `settings` 服务挂载时，`apply` 注册 `falling-ts-force-compact` 命名空间（`src/settings.js`；`falling-ts-` 前缀防止与其他插件的配置键冲突），两个参数可从 `$DSH_HOME/settings.yaml` 配置：
+- **强制压缩配置（`falling-ts-force-compact` 设置命名空间）：** 当 `settings` 服务挂载时，`apply` 注册 `falling-ts-force-compact` 命名空间（`src/settings.js`；`falling-ts-` 前缀防止与其他插件的配置键冲突），九个参数可从 `$DSH_HOME/settings.yaml` 配置（详见上文配置项表格）：
   - `disableThinking`（`boolean`，默认 `true`）——为 `true` 时**每次模型请求**（以及插件自己的摘要调用）携带 `reasoningEffort: 'off'`（适配器映射为 `thinking: { type: 'disabled' }`），即关闭思考。
   - `autoThresholdTokens`（`number`，默认 `131000`）——强制压缩触发阈值；`agent/pre-step` 仅在会话总上下文 tokens ≥ 该值时强制压缩，低于则跳过。
   - `autoEarliestRatio`（`number` 0.01..1，默认 `0.3`）——**自动压缩最早对话比例**：`agent/pre-step` 阈值门禁触发时，按 `tokenMeter` 测量的会话总 tokens 的该比例，从头累计 tokens 至预算后截断（末端对齐 `user/message` 边界），压缩该区间。
@@ -96,7 +153,7 @@ descendant，而是同级的另一个 scope）。
   - `src/command.js` —— `/force-compact` 斜杠命令（`commands` 服务，可选依赖）：空闲时经 `compactNow` 压缩；繁忙时插入 JS 内存标记。
   - `src/turn-end.js` —— 一轮结束强制压缩：`agent/status` 上的 `idle` 监听器，经 `compactNow`（引擎自身区间选择）压缩。
   - `src/index.js` —— Cordis 函数插件入口（`name` / `apply`，不声明 `inject`），注册 `agent/request` / `agent/pre-step` / `agent/status` / `session/flush` 四个监听器、设置命名空间与 `/force-compact` 命令。
-- 插件自己的摘要器是**预提交预览 + 收缩门禁**：它在提交前验证压缩是否值得。持久摘要内容由 `compaction` 服务权威生成（`compactRegion` 重新摘要并提交）。不要在持久路径上重复摘要。
+- 每条引擎内部都会做**预提交预览 + 收缩门禁**（各自的 LLM 摘要 + 收缩判定），所以本插件不在持久路径上重复摘要。`compact.js` 本身只做"选区间 + 委派"，不再额外跑一次预览——这是上一版的遗留 bug（曾在此处双重摘要，现已被清理）。
 - Monorepo 集成会把它包进 `src/index.ts`，并新增一个真实组合（REAL-composition）测试：启动仅测试用的 `cordis.yml` 并断言持久的摘要节点；本独立产物是 plain JS，无构建步骤。
 
 ## 会话数据模型——本插件往什么里追加
@@ -110,4 +167,4 @@ descendant，而是同级的另一个 scope）。
 
 **落盘。** 每个事件一行 JSONL，默认包裹在拼接的带校验和 zstd 帧中（每个追加批次一帧）；SQLite 后端改存打包的 chunk 行。`SESSION_FORMAT_VERSION = 0`——预发布，无迁移；后端拒绝任何其它版本。崩溃恢复从不截断：未闭合的 `turn/start` 以合成 `turn/end { reason: { kind: 'interrupted' } }` 闭合。
 
-**dsh-force-compact 追加的内容**（其全部持久效果，经由 `compaction` 服务）：一个 log-only 的 `compaction/*` 节点（如 `compaction/summary`，含 `shadowedRange` / `shadowedSeqs` / `shadowedTokenCount`），它不带 `surfaceOp`，因此自身从不进入模型历史；随后同步追加一个 **surface `user/message`**，携带 `surfaceOp: { op: 'replace', start, end }` 遮蔽被压缩区间——该 `replace` 才是真正的 surface 替换。推理/"思考"是**内容块类型**（`ContentBlock.type === 'reasoning'`），不是事件类型：它存在于 `assistant/message.content` 内（由 `reasoning-delta` 流块 / `reasoning-chunks` 行组装），UI 通过 `toAssistantBlock()` 把它渲染为可折叠区域。
+**dsh-force-compact 追加的内容**（其全部持久效果）：一组 log-only 的事务括号事件——官方路径是 `compaction/*`（如 `compaction/summary`，含 `shadowedRange` / `shadowedSeqs` / `shadowedTokenCount`），内置路径是 `fc-compact/*`（`fc-compact/summary` 字段形状相同）——它们不带 `surfaceOp`，因此自身从不进入模型历史；随后同步追加一个 **surface `user/message`**，携带 `surfaceOp: { op: 'replace', start, end }` 遮蔽被压缩区间——该 `replace` 才是真正的 surface 替换。内置引擎的 `user/message` 额外带 `source: { kind: 'plugin', plugin: 'force-compact-builtin' }` 便于追溯。推理/"思考"是**内容块类型**（`ContentBlock.type === 'reasoning'`），不是事件类型：它存在于 `assistant/message.content` 内（由 `reasoning-delta` 流块 / `reasoning-chunks` 行组装），UI 通过 `toAssistantBlock()` 把它渲染为可折叠区域。

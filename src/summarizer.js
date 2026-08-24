@@ -36,7 +36,7 @@ export const COMPACTION_INSTRUCTION = [
  * @param {import('@deepseek-ai/dsh-agent').Agent} agent
  * @param {import('@deepseek-ai/dsh-llm').Message[]} messages the replayed region messages (without the directive).
  * @param {AbortSignal} signal
- * @param {{ reasoningEffort?: 'off' | 'low' | 'high' | 'max' }} [extra] optional generation overrides.
+ * @param {{ reasoningEffort?: 'off' | 'low' | 'high' | 'max', maxTokens?: number }} [extra] optional generation overrides. `reasoningEffort` maps to the LLM adapter's thinking toggle; `maxTokens` OVERRIDES the `config.maxSummaryTokens` base value when present (this lets callers like `builtin-engine.js` route through the `settings.maxSummaryTokens` runtime knob without requiring the static `config` constant to change).
  * @returns {Promise<{summary: Array, provider: string, model: string, maxTokens?: number} | null>} the condensed checkpoint, or `null` when no target can be resolved or the stream yields no text.
  */
 export async function summarize(ctx, config, agent, messages, signal, extra) {
@@ -60,6 +60,14 @@ export async function summarize(ctx, config, agent, messages, signal, extra) {
   if (extra !== undefined && typeof extra.reasoningEffort === 'string') {
     options.reasoningEffort = extra.reasoningEffort
   }
+  // Callers may override the static `config.maxSummaryTokens` via the
+  // `extra.maxTokens` knob (e.g., to honor the `settings.maxSummaryTokens`
+  // runtime setting without changing the compile-time default). Only apply
+  // when the caller supplied a positive numeric override — otherwise keep the
+  // static `config` value.
+  if (extra !== undefined && Number.isFinite(extra.maxTokens) && extra.maxTokens > 0) {
+    options.maxTokens = extra.maxTokens
+  }
   if (agent.session !== undefined) options.sessionId = agent.session.id
   // This one-shot call IS the compaction preview: tag it with the closed-union
   // `purpose` the LLM service understands (adapters may map it to
@@ -76,7 +84,9 @@ export async function summarize(ctx, config, agent, messages, signal, extra) {
     summary: [{ type: 'text', text }],
     provider: target.provider,
     model: target.model,
-    maxTokens: config.maxSummaryTokens,
+    // Reflect the ACTUAL maxTokens used on the request (override-aware), so
+    // callers can report what the summarization was really capped at.
+    maxTokens: options.maxTokens,
   }
 }
 

@@ -30,39 +30,83 @@
 
 import { readRawSetting, COMPACT_MODE_GLOBAL } from './settings.js'
 
-// NOTE: We intentionally DO NOT declare `inject: ['compaction']` anywhere in
-// this plugin — the plugin must boot even when the backend is absent (legacy
-// bundles without compaction). Reading `ctx.compaction` as a PROPERTY on a
-// context where the service was not declared triggers Cordis's strict
-// injection contract check and KILLS THE PROCESS with a fatal load failure.
-// Every lookup therefore MUST go through `ctx.get('compaction')` (the safe,
-// optional path) or `agent.ctx.get(...)` — never a raw property read on the
-// context itself.
+import { compactNowBuiltin, compactRegionBuiltin } from './builtin-engine.js'
 
 /**
- * Find the live `compaction` service instance for one agent.
+ * Find a usable compaction backend for one agent.
+ *
+ * Resolution order (priority 1 first):
+ *   1. the OFFICIAL `compaction` service (`compactNow`/`compactRegion`) — the
+ *      authoritative summarizer; preferred whenever it is reachable from this
+ *      agent's context (see the historical note above about realm placement);
+ *   2. this plugin's BUILTIN engine (its own transaction, event names, and
+ *      summarizer) — the fallback used whenever the official service is
+ *      unreachable from this context (the common `standard` preset layout) and
+ *      the `builtinEnabled` setting allows it (default `true`).
+ *
+ * Both backends expose the SAME shape — `compactNow` and `compactRegion` — so
+ * callers are agnostic to which produced the result.
  *
  * @param {import('@deepseek-ai/cordis').Context} ctx a context to fall back to (the plugin-global context) when the agent-side candidates do not resolve.
- * @param {import('@deepseek-ai/dsh-agent').Agent|undefined} agent the agent owning the target session. May be `undefined` (then only the ctx-side candidates are tried).
- * @param {string|undefined} mode the `compactionMode` setting value (`'realm'`|`'global'`). When omitted it is read live from settings.
- * @returns {Promise<object|undefined>} the compaction service instance, or `undefined` when no candidate resolves.
+ * @param {import('@deepseek-ai/dsh-agent').Agent|undefined} agent the agent owning the target session.
+ * @param {string|undefined} mode the `compactionMode` setting value (`'realm'`|`'global'`).
+ * @returns {Promise<{ compactNow: Function, compactRegion: Function, kind: 'official'|'builtin' }|undefined>} a normalized backend, or `undefined` when neither the official service nor the builtin engine is usable.
  */
 export async function resolveCompaction(ctx, agent, mode) {
+  const official = await findOfficialService(ctx, agent, mode)
+  if (official !== undefined) {
+    return { compactNow: official.compactNow, compactRegion: official.compactRegion, kind: 'official' }
+  }
+  return await builtinBackend(ctx, agent)
+}
+
+/**
+ * Locate the OFFICIAL `compaction` service for this agent via the historical
+ * two-tier resolver. Reads the `compactionMode` setting (`'realm'` default,
+ * `'global'` opt-out) to choose candidates:
+ *   - `'realm'` (default): the agent's OWN realm-scoped context (`agent.ctx`,
+ *     the canonical modern location), then the host-global `ctx.get('compaction')`;
+ *   - `'global'`: only the host-global `ctx.get('compaction')`.
+ *
+ * NEVER declares `inject:['compaction']` and NEVER reads `ctx.compaction` as a
+ * property (that would trip the strict-injection fatal). Only `ctx.get` /
+ * `agent.ctx.get` — both safe and tolerant.
+ *
+ * @param {import('@deepseek-ai/cordis').Context} ctx
+ * @param {import('@deepseek-ai/dsh-agent').Agent|undefined} agent
+ * @param {string|undefined} mode
+ * @returns {Promise<object|undefined>} the official compaction service, or `undefined`.
+ */
+async function findOfficialService(ctx, agent, mode) {
   const effectiveMode = (typeof mode === 'string' && mode === COMPACT_MODE_GLOBAL)
     ? COMPACT_MODE_GLOBAL
     : ((mode === undefined) ? (await readRawSetting(ctx, 'compactionMode')) : 'realm')
 
-  // Priority 1 (realm mode only): the agent's OWN realm-scoped context — the
-  // canonical way to reach a per-realm service in modern preset-plane layouts.
   if (effectiveMode !== COMPACT_MODE_GLOBAL
       && agent && agent.ctx !== undefined && agent.ctx !== null) {
     const byRealm = tryGet(agent.ctx)
     if (byRealm !== undefined) return byRealm
   }
-
-  // Priority 2 (always): the host-global lookup (base-bundle layout + a safety
-  // net when the agent context did not hold the service).
   return tryGet(ctx)
+}
+
+/**
+ * Build the BUILTIN backend for this agent: the plugin's own engine, gated by
+ * the `builtinEnabled` setting (default `true`). Returns `undefined` when the
+ * engine is disabled or lacks what it needs (an `agent` handle with a session
+ * and an `llm` service for the summarizer).
+ */
+async function builtinBackend(ctx, agent) {
+  const enabled = (await readRawSetting(ctx, 'builtinEnabled')) ?? true
+  if (!enabled) return undefined
+  if (agent === undefined || agent === null || agent.session === undefined) return undefined
+  const llm = ctx.get('llm')
+  if (llm === undefined || typeof llm.stream !== 'function') return undefined
+  return {
+    kind: 'builtin',
+    compactNow: (ag, signal) => compactNowBuiltin(ctx, ag, signal),
+    compactRegion: (start, end, ag, signal) => compactRegionBuiltin(ctx, start, end, ag, signal),
+  }
 }
 
 /**

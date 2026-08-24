@@ -108,14 +108,19 @@ export function takeForceCompact(sessionId) {
 async function compactEarliestRatio(ctx, agent, signal, ratio, mode) {
   const settings = (await readSettings(ctx)) ?? DEFAULTS
   const session = agent.session
-  // Locate the compaction backend through the agent's realm (preset-isolated)
-  // with a host-global fallback (see `service-resolver.js`).
-  const compaction = await resolveCompaction(ctx, agent, mode)
-  if (compaction === undefined || typeof compaction.compactRegion !== 'function') {
+  // Locate a usable compaction backend: the OFFICIAL `compaction` service
+  // (preferred when reachable) OR this plugin's OWN builtin engine (the
+  // fallback when the service is realm-isolated away — e.g. standard preset).
+  // Both backends expose the SAME `{ compactNow, compactRegion, kind }` shape
+  // so the call site below is agnostic to which one served the request.
+  const backend = await resolveCompaction(ctx, agent, mode)
+  if (backend === undefined || typeof backend.compactRegion !== 'function') {
     const effMode = (mode !== undefined ? mode : settings.compactionMode)
     ctx.logger.warn(
-      `[force-compact] ${session.id}: compaction service unavailable (mode=${effMode}); no compaction performed. ` +
-      `See plugin AGENTS.md §preset-realm-limitation if your preset isolates \`compaction\` in a realm this plugin cannot reach.`
+      `[force-compact] ${session.id}: NO compaction backend available (official service unreachable AND builtin engine ` +
+      `either disabled via \`builtinEnabled=false\` or lacking prerequisites: llm.service/stream or agent.session). ` +
+      `No compaction performed. If you want the builtin fallback, ensure \`builtinEnabled=true\` in the ` +
+      `\`falling-ts-force-compact\` namespace and that the \`llm\` service is mounted.`
     )
     return false
   }
@@ -130,21 +135,21 @@ async function compactEarliestRatio(ctx, agent, signal, ratio, mode) {
     await dbg(ctx, `[force-compact] ${session.id}: no earliest ${ratio} token region to compact (totalTokens=${totalTokens == null ? 'unknown(fallback est)' : totalTokens})`)
     return false
   }
-  await dbg(ctx, `[force-compact] ${session.id}: compacting earliest ${ratio} -> span seqs ${region.start}..${region.end} (totalTokens=${totalTokens})`)
+  await dbg(ctx, `[force-compact] ${session.id}: compacting earliest ${ratio} via ${backend.kind} backend -> span seqs ${region.start}..${region.end} (totalTokens=${totalTokens})`)
   try {
-    const result = await compaction.compactRegion(region.start, region.end, agent, signal)
+    const result = await backend.compactRegion(region.start, region.end, agent, signal)
     if (result === undefined || result === null) {
-      ctx.logger.debug(`[force-compact] ${session.id}: earliest ${ratio} compaction committed nothing`)
+      ctx.logger.debug(`[force-compact] ${session.id}: earliest ${ratio} compaction committed nothing via ${backend.kind}`)
       return false
     }
     ctx.logger.info(
-      `[force-compact] ${session.id}: earliest ${ratio} compaction shadowed ${result.shadowedSeqs.length} nodes `
-      + `(~${result.shadowedTokenCount} tokens)`,
+      `[force-compact] ${session.id}: earliest ${ratio} compaction (${backend.kind}) shadowed ${result.shadowedSeqs?.length ?? '?'} nodes `
+      + `(~${result.shadowedTokenCount ?? '?'} tokens)`,
     )
     return true
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
-    ctx.logger.warn(`[force-compact] ${session.id}: earliest ${ratio} compaction failed — ${message}`)
+    ctx.logger.warn(`[force-compact] ${session.id}: earliest ${ratio} compaction via ${backend.kind} FAILED — ${message}`)
     return false
   }
 }

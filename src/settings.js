@@ -2,7 +2,7 @@
  * dsh-force-compact settings — the "强制压缩配置" (Force-Compact Configuration)
  * surface.
  *
- * Seven user-tunable parameters are registered under the `falling-ts-force-compact`
+ * Nine user-tunable parameters are registered under the `falling-ts-force-compact`
  * settings namespace so the harness settings panel can expose and persist them
  * (the `falling-ts-` prefix prevents collisions with other plugins' keys):
  *
@@ -35,6 +35,23 @@
  *   default the log sits under the shared user `$DSH_HOME` (`~/.dsh/logs/`),
  *   independent of any single session's workspace — keeping the log out of the
  *   official `deepseek-harness` checkout. Any absolute path may override it.
+ * - `compactionMode` (`'realm'` | `'global'`, default `'realm'`): how the
+ *   plugin locates the official `compaction` service (realm-scoped per-agent
+ *   vs host-global). See `COMPACT_MODE_*` constants below.
+ * - `builtinEnabled` (boolean, default `true`): the gate for this plugin's
+ *   own self-contained compaction engine (see `src/builtin-engine.js`). When
+ *   the official `compaction` service is reachable (host-global mount), it is
+ *   always preferred; when unreachable (the standard preset realm-isolates it)
+ *   the plugin falls back to the builtin engine — which runs the full durable
+ *   transaction itself (own `fc-compact/*` event vocabulary, own checkpoint
+ *   `user/message` shadowing a head-anchored span, own shrink gate). Setting
+ *   this to `false` disables that fallback so ONLY the official backend is
+ *   attempted.
+ * - `maxSummaryTokens` (positive integer, default `2400`): the `maxTokens`
+ *   bound applied to the plugin's OWN summarization LLM call — a cap on the
+ *   summary length. Combined with the shrink gate (the summary must be
+ *   strictly smaller than the span it replaces), this prevents runaway
+ *   summarizer outputs from ballooning past the region being condensed.
  *
  * The namespace is registered against the `settings` service when one is
  * mounted. The schema is BUILT BEST-EFFORT through `@deepseek-ai/schemastery`:
@@ -84,7 +101,7 @@ export const COMPACT_MODE_GLOBAL = 'global'
 export const COMPACT_MODES = [COMPACT_MODE_REALM, COMPACT_MODE_GLOBAL]
 
 /**
- * Composition defaults for the seven parameters. These are the `base` layer the
+ * Composition defaults for the nine parameters. These are the `base` layer the
  * settings namespace resolves over, so a field the user has not overridden
  * resolves to these values.
  * @type {Readonly<{
@@ -95,6 +112,9 @@ export const COMPACT_MODES = [COMPACT_MODE_REALM, COMPACT_MODE_GLOBAL]
  *   turnEndForceCompactionEnabled: boolean,
  *   debug: boolean,
  *   logFile: string,
+ *   compactionMode: string,
+ *   builtinEnabled: boolean,
+ *   maxSummaryTokens: number,
  * }>}
  */
 /** Default debug-log destination: the shared user `$DSH_HOME/logs/` dir. */
@@ -109,6 +129,16 @@ export const DEFAULTS = Object.freeze({
   debug: true,
   logFile: DEFAULT_LOG_FILE,
   compactionMode: COMPACT_MODE_REALM,
+  // Built-in compaction engine — ON by default so the plugin's own engine is
+  // always available as the fallback whenever the official `compaction` service
+  // is unreachable from this context (the common standard-preset layout). Set
+  // `false` to strictly use the official backend only.
+  builtinEnabled: true,
+  // Hard ceiling on the summarizer's output tokens (applied as `maxTokens` on
+  // the plugin's own summarization LLM call). Prevents runaway summaries when
+  // the shadowed span is large; the shrink gate independently ensures the
+  // committed summary is smaller than the span it replaces.
+  maxSummaryTokens: 2400,
 })
 
 /**
@@ -124,6 +154,9 @@ export const DEFAULTS = Object.freeze({
  *   turnEndForceCompactionEnabled: boolean,
  *   debug: boolean,
  *   logFile: string,
+ *   compactionMode: string,
+ *   builtinEnabled: boolean,
+ *   maxSummaryTokens: number,
  * } | null>}
  *   the resolved settings, or `null` when the `settings` service is not mounted
  *   (callers should fall back to their composition entry).
@@ -150,6 +183,13 @@ export async function readSettings(ctx) {
     ? value.compactionMode.toLowerCase()
     : DEFAULTS.compactionMode)
   const compactionMode = COMPACT_MODES.includes(rawMode) ? rawMode : DEFAULTS.compactionMode
+  // Builtin-engine gate: absent / non-boolean stored values treat the field as
+  // UNSET (rather than false), preserving the "default on" semantics even
+  // when a legacy settings.yaml predates the field.
+  const builtinEnabled = (typeof value.builtinEnabled === 'boolean'
+    ? value.builtinEnabled
+    : DEFAULTS.builtinEnabled)
+  const maxSummaryTokens = asPositiveInt('maxSummaryTokens', DEFAULTS.maxSummaryTokens)
   return {
     disableThinking,
     autoThresholdTokens,
@@ -159,6 +199,8 @@ export async function readSettings(ctx) {
     debug,
     logFile,
     compactionMode,
+    builtinEnabled,
+    maxSummaryTokens,
   }
 }
 
@@ -244,6 +286,17 @@ export async function buildSchema() {
       // that would escape `buildSchema`'s try/catch and break the WHOLE
       // namespace registration (regressing the settings panel to "loading").
       compactionMode: buildEnumField(z, DEFAULTS.compactionMode),
+      // The builtin engine fallback (see `service-resolver.js`): on by default
+      // so the plugin's own engine takes over whenever the official
+      // `compaction` service is unreachable (standard-preset realm isolation).
+      // Value is coerced at read-time in `readSettings`, so the schema field is
+      // purely UI affordance.
+      builtinEnabled: z.boolean().default(DEFAULTS.builtinEnabled),
+      // Token ceiling applied to the plugin's own summarizer LLM call. Bounds
+      // runaway summaries; combined with the shrink gate (the summary must be
+      // strictly smaller than the span it replaces) this keeps transactions
+      // bounded while ensuring compression is always net-negative.
+      maxSummaryTokens: z.number().step(1).min(256).max(200000).default(DEFAULTS.maxSummaryTokens),
     })
     return schema
   } catch {

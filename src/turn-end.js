@@ -47,18 +47,20 @@ export async function handleAgentStatus(ctx, payload, mode) {
   }
 
   const session = agent.session
-  // Locate the compaction backend through the agent's realm (preset-isolated)
-  // with a host-global fallback (see `service-resolver.js`). At idle the agent
-  // is still live in the registry, so its realm-scoped context still resolves
-  // the instance the `compactNow` idle entry needs.
-  const compaction = await resolveCompaction(ctx, agent, mode)
-  if (compaction === undefined || typeof compaction.compactNow !== 'function') {
+  // Locate a usable compaction backend: the OFFICIAL `compaction` service
+  // (preferred) OR this plugin's OWN builtin engine (fallback when the service
+  // is realm-isolated away — see `service-resolver.js`). At idle the agent is
+  // still live in the registry, so its realm-scoped context still resolves the
+  // official instance when one exists; otherwise the builtin engine takes over.
+  const backend = await resolveCompaction(ctx, agent, mode)
+  if (backend === undefined || typeof backend.compactNow !== 'function') {
     const effMode = (mode !== undefined ? mode : settings.compactionMode)
     ctx.logger.warn(
-      `[force-compact] ${session.id}: compaction service unavailable at idle (mode=${effMode}). ` +
-      `If your agent preset isolates the \`compaction\` service into a realm this plugin cannot reach, ` +
-      `move the \`compaction-basic\` row OUTSIDE the preset's \`compaction\` group \`isolate\` (see plugin AGENTS.md §preset-realm-limitation), ` +
-      `or configure a global-scope backend.`
+      `[force-compact] ${session.id}: NO compaction backend available at idle (mode=${effMode}). ` +
+      `Either the official \`compaction\` service is realm-isolated (standard preset) AND ` +
+      `\`builtinEnabled=false\`, OR the builtin engine is missing a prerequisite ` +
+      `(needs \`agent.session\` and the \`llm\` service). Enable \`builtinEnabled=true\` in the ` +
+      `\`falling-ts-force-compact\` namespace to restore the fallback.`
     )
     return
   }
@@ -69,17 +71,17 @@ export async function handleAgentStatus(ctx, payload, mode) {
   // its own).
   const controller = new AbortController()
   try {
-    const result = await compaction.compactNow(agent, controller.signal)
+    const result = await backend.compactNow(agent, controller.signal)
     if (result === undefined || result === null) {
-      ctx.logger.debug(`[force-compact] ${session.id}: idle compaction committed nothing`)
+      ctx.logger.debug(`[force-compact] ${session.id}: idle compaction via ${backend.kind} committed nothing`)
       return
     }
     ctx.logger.info(
-      `[force-compact] ${session.id}: idle compaction shadowed ${result.shadowedSeqs.length} nodes `
-      + `(~${result.shadowedTokenCount} tokens)`,
+      `[force-compact] ${session.id}: idle compaction (${backend.kind}) shadowed ${result.shadowedSeqs?.length ?? '?'} nodes `
+      + `(~${result.shadowedTokenCount ?? '?'} tokens)`,
     )
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
-    ctx.logger.warn(`[force-compact] ${session.id}: idle compaction failed — ${message}`)
+    ctx.logger.warn(`[force-compact] ${session.id}: idle compaction via ${backend.kind} FAILED — ${message}`)
   }
 }

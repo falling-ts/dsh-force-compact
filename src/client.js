@@ -41,6 +41,19 @@ window.__ModuleLoader__.load({
       forceEarliestRatioHint: "/force-compact 忙碌排队后按总 tokens 的该比例从头截断（0.01–1，默认 0.5）。",
       turnEndForceCompaction: "回合结束强制压缩",
       turnEndForceCompactionHint: "为 true 时，agent 转入 idle（一轮结束）时执行一轮结束压缩。",
+      debug: "详细日志（debug）",
+      debugHint: "为 true 时，每次模型请求/步骤的关键观察行都会写入 logFile（默认 ~/.dsh/logs/dsh-force-compact.log）。生产环境可设为 false 减少噪音。",
+      logFile: "日志文件路径",
+      logFileHint: "详细日志的目标文件路径（leading ~ 展开为用户家目录）。修改后下次启动生效。",
+      logFilePlaceholder: "~/.dsh/logs/dsh-force-compact.log",
+      compactionMode: "压缩服务解析模式",
+      compactionModeHint: "realm：优先从当前 Agent 域查找 compaction 服务，再回落全局。global：直接使用全局 compaction 服务（需后端已挂到 root realm）。",
+      modeRealm: "realm（域优先）",
+      modeGlobal: "global（全局）",
+      builtinEnabled: "内置压缩引擎",
+      builtinEnabledHint: "官方 compaction 服务不可达时（例如标准 preset 将其隔离进 isolate 组），启用插件自研的内置压缩引擎作为后备。默认开启。设为 false 严格只走官方。",
+      maxSummaryTokens: "摘要最大 tokens",
+      maxSummaryTokensHint: "插件自身摘要 LLM 调用的 maxTokens 上限（默认 2400，256–200000），防止摘要长度失控；收缩门禁另行保证提交的摘要比被遮蔽区间小。",
       unavailable: "设置不可用",
       loading: "加载中…",
       notWritable: "（当前为只读/内存模式，改动仅本进程生效）",
@@ -60,6 +73,19 @@ window.__ModuleLoader__.load({
       forceEarliestRatioHint: "After a busy /force-compact queues, truncate from the head to this ratio of total tokens (0.01–1, default 0.5).",
       turnEndForceCompaction: "Force-compaction at turn end",
       turnEndForceCompactionHint: "When true, run a turn-end compaction when the agent becomes idle.",
+      debug: "Verbose logging (debug)",
+      debugHint: "When true, per-request/step observation lines are appended to logFile (default ~/.dsh/logs/dsh-force-compact.log). Turn off in production to reduce noise.",
+      logFile: "Log file path",
+      logFileHint: "Destination for verbose logs (leading ~ expands to the user home). Takes effect on the next restart.",
+      logFilePlaceholder: "~/.dsh/logs/dsh-force-compact.log",
+      compactionMode: "Compaction-service resolution mode",
+      compactionModeHint: "realm: locate the compaction service in the current Agent's realm first, falling back to global. global: use the global compaction service directly (requires the backend to be mounted at the root realm).",
+      modeRealm: "realm (realm-first)",
+      modeGlobal: "global (global)",
+      builtinEnabled: "Built-in compaction engine",
+      builtinEnabledHint: "Fallback to this plugin's own self-contained engine when the official compaction service is unreachable (e.g. standard-preset realm isolation). Defaults on. Set false to strictly use only the official backend.",
+      maxSummaryTokens: "Max summary tokens",
+      maxSummaryTokensHint: "maxTokens ceiling on the plugin's own summarization LLM call (default 2400, range 256–200000). Prevents runaway summaries; the shrink gate separately guarantees the committed summary is smaller than the span it replaces.",
       unavailable: "Settings unavailable",
       loading: "Loading…",
       notWritable: "(read-only / memory mode; changes are process-local)",
@@ -155,10 +181,81 @@ window.__ModuleLoader__.load({
           h("span", { style: switchKnob(on, hovered, disabled) })));
     }
 
+    /**
+     * 字符串草稿编辑：类似 useDraftNumber，但针对自由文本（这里是 logFile 路径）。
+     * 途中随便打都不写回；失焦/回车时才一次性写回（trim 后空串视为清空）。
+     * @returns [draftValue, handlers]
+     */
+    function useDraftText(key, currentValue, update) {
+      const [buf, setBuf] = React.useState(currentValue === undefined ? "" : String(currentValue));
+      const focusedRef = React.useRef(false);
+      React.useEffect(() => {
+        if (!focusedRef.current) {
+          setBuf(currentValue === undefined ? "" : String(currentValue));
+        }
+      }, [currentValue]);
+      const commit = () => {
+        focusedRef.current = false;
+        const trimmed = buf.trim();
+        if (trimmed === "") { update(key, undefined); setBuf(""); return; }
+        update(key, trimmed);
+      };
+      const handlers = {
+        onFocus: () => { focusedRef.current = true; },
+        onChange: (e) => setBuf(e.target.value),
+        onBlur: commit,
+        onKeyDown: (e) => { if (e.key === "Enter") { e.currentTarget.blur(); } },
+      };
+      return [buf, handlers];
+    }
+
     /** 比例范围常量：自动/强制压缩最早比例均 0.01–1。 */
     const RATIO_MIN = 0.01;
     const RATIO_MAX = 1;
 
+
+    /**
+     * 两选项分段控制器（segmented control）：两个 pill 按钮左右排列，选中项
+     * 反白高亮、未选中呈浅灰边框。用于 compactionMode（realm / global）。
+     * @param props - { value, options: [{id,label}], onChange(id) }
+     */
+    function SegmentedPicker(props) {
+      const { value, options, onChange, disabled } = props;
+      const selected = (id) => value === id;
+      const btnBase = {
+        appearance: "none", border: "none", padding: 0, background: "none",
+        cursor: disabled ? "default" : "pointer", fontSize: 12.5, lineHeight: 1.4,
+      };
+      const pills = options.map((o) => {
+        const sel = selected(o.id);
+        const style = {
+          ...btnBase,
+          padding: "5px 12px",
+          borderRadius: 999,
+          border: sel ? "1px solid rgba(47,107,255,0.7)" : "1px solid rgba(0,0,0,0.18)",
+          background: sel ? "linear-gradient(90deg,#2f6bff 0%,#3d8bff 100%)" : "transparent",
+          color: sel ? "#ffffff" : "rgba(0,0,0,0.65)",
+          boxShadow: sel ? "0 0 8px rgba(47,107,255,0.35)" : "none",
+          opacity: disabled ? 0.5 : 1,
+          transition: "color .18s ease, background .18s ease, border-color .18s ease, box-shadow .18s ease",
+          minWidth: 84,
+          textAlign: "center",
+          whiteSpace: "nowrap",
+        };
+        return h("button", {
+          type: "button",
+          key: o.id,
+          role: "radio",
+          "aria-checked": sel,
+          disabled: disabled,
+          style,
+          onClick: () => { if (!disabled) onChange(o.id); },
+          onKeyDown: (e) => { if (e.key === "Enter" && !disabled) { e.preventDefault(); onChange(o.id); } },
+          tabIndex: sel ? 0 : -1,
+        }, o.label);
+      });
+      return h("div", { role: "radiogroup", style: { display: "inline-flex", gap: 8 } }, pills);
+    }
 
     /**
      * 数字草稿编辑：用本地 buffer 缓存输入，途中随便打（含空串、小数点、负号）
@@ -340,6 +437,16 @@ window.__ModuleLoader__.load({
       const [thBuf, thHandlers] = useDraftNumber("autoThresholdTokens", valOrUndef("autoThresholdTokens"), thOpt, update);
       const arSlider = useDragRatio("autoEarliestRatio", valOrUndef("autoEarliestRatio"), update);
       const frSlider = useDragRatio("forceEarliestRatio", valOrUndef("forceEarliestRatio"), update);
+      // 新增三项的可观察源（同样放在顶部无条件调用，保持 hooks 顺序稳定）。
+      const lfOpt = { placeholder: t("logFilePlaceholder") };
+      const [lfBuf, lfHandlers] = useDraftText("logFile", valOrUndef("logFile"), update);
+      // maxSummaryTokens: 数字框，256–200000，默认 2400。
+      const msOpt = { step: 16, min: 256, max: 200000 };
+      const [msBuf, msHandlers] = useDraftNumber("maxSummaryTokens", valOrUndef("maxSummaryTokens"), msOpt, update);
+      const modeOptions = [
+        { id: "realm", label: t("modeRealm") },
+        { id: "global", label: t("modeGlobal") },
+      ];
 
       const phStyle = { color: hintColor, fontSize: 13, lineHeight: 1.6, margin: "4px 0 0" };
       if (snap.status === "unavailable") {
@@ -402,6 +509,33 @@ window.__ModuleLoader__.load({
           h("span", { style: { gridColumn: "1 / 4", color: hintColor, fontSize: 12, lineHeight: 1.55 } }, t(hintKey)));
       }
 
+      // logFile 文字行：左 label · 中 textarea-ish input · 下排 hint。
+      const textRowBase = { display: "grid", gridTemplateColumns: "172px 220px minmax(0,1fr)", columnGap: 16, rowGap: 5, padding: "13px 0", borderBottom: "1px solid " + divider, alignItems: "center" };
+      function textRow(labelKey, hintKey, buf, handlers, opts, isLast) {
+        const base = { ...textRowBase, ...(isLast ? { borderBottom: "none" } : {}) };
+        return h("div", { style: base },
+          h("span", { style: labelStyle }, t(labelKey)),
+          h("input", {
+            type: "text",
+            value: buf,
+            disabled: disabled,
+            placeholder: opts.placeholder || "",
+            style: { ...inputStyle, width: 200, textAlign: "left", fontFamily: "var(--mono-font, monospace)", fontSize: 12.5 },
+            ...handlers,
+          }),
+          h("span", { style: { gridColumn: "1 / 3", gridRow: 3, color: hintColor, fontSize: 12, lineHeight: 1.55 } }, t(hintKey)));
+      }
+      // compactionMode 行：左 label · 中 SegmentedPicker(realm|global) · 下排 hint。
+      function modeRow(isLast) {
+        const base = { display: "grid", gridTemplateColumns: "172px 260px minmax(0,1fr)", columnGap: 16, rowGap: 5, padding: "13px 0", borderBottom: "1px solid " + divider, alignItems: "center" };
+        const b2 = { ...base, ...(isLast ? { borderBottom: "none" } : {}) };
+        const modeValue = valOrUndef("compactionMode");
+        return h("div", { style: b2 },
+          h("span", { style: labelStyle }, t("compactionMode")),
+          h("span", { style: { display: "inline-flex", alignItems: "center" } },
+            h(SegmentedPicker, { value: modeValue, options: modeOptions, onChange: (id) => update("compactionMode", id), disabled: disabled })),
+          h("span", { style: { gridColumn: "1 / 3", gridRow: 3, color: hintColor, fontSize: 12, lineHeight: 1.55 } }, t("compactionModeHint")));
+      }
       return h("div", { style: wrapStyle },
           h("h2", { style: titleStyle }, t("nav")),
           h("p", { style: introStyle }, t("intro")),
@@ -410,7 +544,12 @@ window.__ModuleLoader__.load({
             numberRow("autoThresholdTokens", "autoThresholdTokens", "autoThresholdTokensHint", thBuf, thHandlers, thOpt, false),
             ratioRow("autoEarliestRatio", "autoEarliestRatioHint", arSlider, false),
             ratioRow("forceEarliestRatio", "forceEarliestRatioHint", frSlider, false),
-            booleanRow("turnEndForceCompactionEnabled", "turnEndForceCompaction", "turnEndForceCompactionHint", true)),
+            booleanRow("turnEndForceCompactionEnabled", "turnEndForceCompaction", "turnEndForceCompactionHint", false),
+            booleanRow("debug", "debug", "debugHint", false),
+            textRow("logFile", "logFileHint", lfBuf, lfHandlers, lfOpt, false),
+            modeRow(false),
+            booleanRow("builtinEnabled", "builtinEnabled", "builtinEnabledHint", false),
+            numberRow("maxSummaryTokens", "maxSummaryTokens", "maxSummaryTokensHint", msBuf, msHandlers, msOpt, true)),
           disabled ? h("p", { style: disabledHintStyle }, t("notWritable")) : null);
     }
 

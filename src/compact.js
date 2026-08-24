@@ -1,37 +1,43 @@
 /**
- * dsh-force-compact's compaction orchestrator. Selects a region with its own
- * policy, runs its own LLM summarizer as a pre-commit preview + shrink gate,
- * then delegates the durable surface mutation to the `compaction` service's
- * `compactRegion` (read live via `ctx.get('compaction')`) — which is the
- * authoritative summarizer and commits the summary node.
+ * dsh-force-compact's session-flush compaction orchestrator.
+ *
+ * On the awaited `session/flush` checkpoint: gate on the session's total
+ * estimated context reaching `autoThresholdTokens`; select the compactable
+ * region with the plugin's own head-anchored policy (`selectRegion`);
+ * then DELEGATE THE DURABLE MUTATION TO WHICHEVER BACKEND IS AVAILABLE —
+ * the official `compaction` service when reachable (preferred) or this
+ * plugin's OWN builtin engine when it isn't (fallback). Both backends
+ * perform their OWN preview summarization + shrink gate internally, so this
+ * caller no longer re-implements a redundant preview.
  *
  * @module @falling-ts/dsh-force-compact/compact
  */
 
 import { resolveConfig } from './config.js'
 import { selectRegion } from './region.js'
-import { summarize } from './summarizer.js'
 import { readSettings, DEFAULTS } from './settings.js'
 import { dbg } from './request-guard.js'
 import { resolveCompaction } from './service-resolver.js'
 
-/** Characters per token, mirroring the official token meter's coarse estimate. */
+/** Characters per token, mirroring the token meter's coarse estimate. */
 const CHARS_PER_TOKEN = 4
 
 /**
  * Compact a session's useful history at a durability checkpoint.
  *
- * Flow: select the region with the plugin's own policy → project the region's
- * messages → run the plugin's own LLM summarizer as a pre-commit preview +
- * shrink gate → delegate the durable surface mutation to the `compaction`
- * service's `compactRegion` (the authoritative summarizer, read live via
- * `ctx.get('compaction')`).
+ * Flow: gate on threshold → select the region with the plugin's own policy →
+ * locate the available backend (official-preferred, builtin-fallback) →
+ * delegate the durable `compactRegion` call (each backend performs its own
+ * summarization and shrink gate internally).
  *
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @param {import('@deepseek-ai/dsh-agent').Agent} agent
  * @param {AbortController} controller
  * @param {string|undefined} mode the `compactionMode` setting (passed by the caller); undefined re-reads live.
- * @returns {Promise<object | null>} the compaction result, or `null` when nothing was worth compacting.
+ * @returns {Promise<object | null>} the compaction result (shape depends on the backend;
+ *   the builtin engine returns `{ kind:'builtin', compactionId, startSeq, summarySeq,
+ *   endSeq, summary, shadowedRange, shadowedSeqs, shadowedTokenCount }`), or `null`
+ *   when nothing was worth compacting or no backend was available.
  */
 export async function compactSession(ctx, agent, controller, mode) {
   const session = agent.session
@@ -47,7 +53,7 @@ export async function compactSession(ctx, agent, controller, mode) {
   // estimated total context reaches the configured threshold. Below it, the
   // checkpoint is skipped so short sessions are never force-compacted.
   const sessionTokens = estimateSessionTokens(session)
-  void dbg(ctx, `[force-compact] ${session.id}: session/flush checkpoint fired — session ~${sessionTokens} tokens (threshold ${settings.autoThresholdTokens}), disableThinking=${settings.disableThinking}`)
+  void dbg(ctx, `[force-compact] ${session.id}: session/flush checkpoint fired — session ~${sessionTokens} tokens (threshold ${settings.autoThresholdTokens})`)
   if (sessionTokens < settings.autoThresholdTokens) {
     ctx.logger.debug(`[force-compact] ${session.id}: context ~${sessionTokens} tokens below threshold ${settings.autoThresholdTokens}; skipping`)
     return null
@@ -59,47 +65,37 @@ export async function compactSession(ctx, agent, controller, mode) {
     return null
   }
 
-  const messages = projectRegionMessages(session, region.start, region.end)
-  if (messages.length === 0) {
-    ctx.logger.debug(`[force-compact] ${session.id}: region has no surface messages; skipping`)
-    return null
-  }
-
-  // Pre-commit preview + shrink gate: run the plugin's own LLM summarizer and
-  // skip when the preview is not a genuine shrink. The durable mutation is
-  // delegated to `compactRegion`, which is the authoritative summarizer.
-  // The "disable thinking" setting maps to a per-request `reasoningEffort: 'off'`.
-  const extra = settings.disableThinking ? { reasoningEffort: 'off' } : undefined
-  const preview = await summarize(ctx, config, agent, messages, controller.signal, extra)
-  if (preview === null) {
-    ctx.logger.debug(`[force-compact] ${session.id}: no summarization target; skipping`)
-    return null
-  }
-  const shadowedTokens = estimateTokens(messages)
-  const summaryTokens = estimateBlocks(preview.summary)
-  if (summaryTokens >= shadowedTokens) {
-    ctx.logger.debug(`[force-compact] ${session.id}: preview ~${summaryTokens} tokens not smaller than shadowed ~${shadowedTokens}; skipping`)
-    return null
-  }
-
-  // The compaction backend is provided by the preset plane, mounted PER AGENT
-  // REALM (the standard preset isolates `compaction`), so locate it through the
-  // agent's own context with a host-global fallback (see `service-resolver.js`).
-  // When it is not available the checkpoint skips rather than failing the
-  // awaited checkpoint.
-  const compaction = await resolveCompaction(ctx, agent, mode)
-  if (compaction === undefined || typeof compaction.compactRegion !== 'function') {
+  // Locate a usable compaction backend: the OFFICIAL `compaction` service
+  // (preferred) OR this plugin's OWN builtin engine (fallback). Each performs
+  // its own summarization + shrink gate internally, so no redundant preview
+  // is needed here.
+  const backend = await resolveCompaction(ctx, agent, mode)
+  if (backend === undefined || typeof backend.compactRegion !== 'function') {
     const effMode = (mode !== undefined ? mode : settings.compactionMode)
     ctx.logger.warn(
-      `[force-compact] ${session.id}: compaction service unavailable at checkpoint (mode=${effMode}); skipping. ` +
-      `See plugin AGENTS.md §preset-realm-limitation if your preset isolates \`compaction\`.`
+      `[force-compact] ${session.id}: NO compaction backend available at checkpoint (mode=${effMode}). ` +
+      `Enable \`builtinEnabled=true\` in the \`falling-ts-force-compact\` namespace to activate the ` +
+      `plugin's own engine as a fallback (it needs the \`llm\` service + \`agent.session\` present).`
     )
     return null
   }
-  const result = await compaction.compactRegion(region.start, region.end, agent, controller.signal)
+
+  void dbg(ctx, `[force-compact] ${session.id}: checkpoint compaction via ${backend.kind} over seq ${region.start}..${region.end}`)
+  let result
+  try {
+    result = await backend.compactRegion(region.start, region.end, agent, controller.signal)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    ctx.logger.warn(`[force-compact] ${session.id}: checkpoint compaction via ${backend.kind} FAILED — ${message}`)
+    return null
+  }
+  if (result === undefined || result === null) {
+    ctx.logger.debug(`[force-compact] ${session.id}: checkpoint compaction via ${backend.kind} committed nothing`)
+    return null
+  }
   ctx.logger.info(
-    `[force-compact] ${session.id}: shadowed ${result.shadowedSeqs.length} nodes `
-    + `(seqs ${result.shadowedRange.start}-${result.shadowedRange.end}, ~${result.shadowedTokenCount} tokens)`,
+    `[force-compact] ${session.id}: checkpoint compaction (${backend.kind}) shadowed ` +
+    `${(result.shadowedSeqs && result.shadowedSeqs.length) ?? '?'} nodes (~${result.shadowedTokenCount ?? '?'} tokens)`,
   )
   return result
 }
@@ -107,8 +103,8 @@ export async function compactSession(ctx, agent, controller, mode) {
 /**
  * Coarse token estimate for a session's whole surface content (user +
  * assistant + tool-result messages). Used only for the automatic compaction
- * trigger gate — the authoritative token accounting happens inside
- * `compactRegion`.
+ * trigger GATE — the authoritative token accounting happens inside the
+ * backend's `compactRegion`.
  * @param {import('@deepseek-ai/dsh-session').Session} session
  * @returns {number}
  */
@@ -121,56 +117,6 @@ function estimateSessionTokens(session) {
     else if (event.type === 'tool/result') content = event.data.message !== undefined ? event.data.message.content : undefined
     if (content === undefined) continue
     for (const block of content || []) {
-      if (block && typeof block.text === 'string') chars += block.text.length
-    }
-  }
-  return Math.ceil(chars / CHARS_PER_TOKEN)
-}
-
-/** Coarse token estimate for a set of content blocks. */
-function estimateBlocks(blocks) {
-  let chars = 0
-  for (const block of blocks || []) {
-    if (block && typeof block.text === 'string') chars += block.text.length
-  }
-  return Math.ceil(chars / CHARS_PER_TOKEN)
-}
-
-/**
- * Project the region's surface events to LLM messages. A simplified projection
- * sufficient for the shrink gate; the authoritative replay happens inside
- * `compactRegion`.
- * @param {import('@deepseek-ai/dsh-session').Session} session
- * @param {number} start
- * @param {number} end
- * @returns {Array<{role: string, content: Array, source?: object}>}
- */
-function projectRegionMessages(session, start, end) {
-  const messages = []
-  for (const event of session.events) {
-    if (event.seq < start || event.seq > end) continue
-    if (event.type === 'user/message') {
-      messages.push({ role: 'user', content: event.data.content, source: event.data.source })
-    } else if (event.type === 'assistant/message') {
-      messages.push({ role: 'assistant', content: event.data.message.content })
-    } else if (event.type === 'tool/result') {
-      const message = event.data.message
-      if (message !== undefined) messages.push({ role: 'user', content: message.content, source: message.source })
-    }
-  }
-  return messages
-}
-
-/**
- * Coarse token estimate for a set of messages, mirroring the token meter's
- * character-based heuristic.
- * @param {Array<{content: Array}>} messages
- * @returns {number}
- */
-function estimateTokens(messages) {
-  let chars = 0
-  for (const message of messages) {
-    for (const block of message.content || []) {
       if (block && typeof block.text === 'string') chars += block.text.length
     }
   }
