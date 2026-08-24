@@ -57,6 +57,30 @@ dsh web --patch dsh-force-compact/cordis.patch.yml
 The layer inserts the `force-compact` function plugin into the current
 composition without changing shipped defaults.
 
+## Settings (强制压缩配置)
+
+When the `settings` service is mounted (the web bundle always mounts it via
+`@deepseek-ai/dsh-settings-file`), the plugin registers a `force-compact`
+settings namespace so two parameters are user-tunable from
+`$DSH_HOME/settings.yaml`:
+
+| key | type | default | effect |
+| --- | --- | --- | --- |
+| `disableThinking` | `boolean` | `true` | when `true`, the plugin's summarization request carries `reasoningEffort: 'off'`, which the LLM adapter maps to `thinking: { type: 'disabled' }` — the provider's thinking/reasoning is switched off for the compaction summarization call. |
+| `autoThresholdTokens` | `number` | `120000` | the automatic compaction trigger threshold in tokens. Compaction runs only when the session's estimated total context is **at least** this many tokens; below it, the checkpoint is skipped. |
+
+Example `$DSH_HOME/settings.yaml`:
+
+```yaml
+force-compact:
+  disableThinking: true
+  autoThresholdTokens: 120000
+```
+
+When the `settings` service is absent, the plugin falls back to these same
+defaults and still compacts normally — the settings namespace is optional, never
+a hard dependency.
+
 ## Behavior notes
 
 - **Hard dependency:** the `compaction` service. Without it the plugin does
@@ -64,6 +88,8 @@ composition without changing shipped defaults.
 - **Optional dependency:** the `agents` service. If a flush fires after the
   session's Agent is already unregistered, the plugin logs
   `no live agent … — skipping` and skips that checkpoint.
+- **Optional dependency:** the `settings` service. When absent, the two
+  parameters resolve to their defaults.
 - **Signal:** the compaction is fire-and-forget at the checkpoint; a fresh
   `AbortController` is minted per flush.
 
@@ -76,5 +102,7 @@ composition without changing shipped defaults.
   ordering matters to you.
 - The plugin's own summarizer is a **pre-commit preview + shrink gate**; the
   durable summary content is the `compaction` service's authoritative one.
-- No client/browser UI is registered; the plugin is Host-only and observable
-  only through `[force-compact]` log lines and the durable log.
+- No client/browser UI is registered; the plugin is Host-only. The two
+  parameters are tunable through the `force-compact` settings namespace (a
+  future dynamic client plugin may read it to expose a settings page), and the
+  plugin is observable through `[force-compact]` log lines and the durable log.

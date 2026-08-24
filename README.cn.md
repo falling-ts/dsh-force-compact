@@ -52,11 +52,34 @@ dsh web --patch dsh-force-compact/cordis.patch.yml
 该层把 `force-compact` 函数插件插入当前组合（composition），不改动默认发布
 配置。
 
+## 设置（强制压缩配置）
+
+当 `settings` 服务已挂载（web bundle 通过 `@deepseek-ai/dsh-settings-file` 始终
+挂载它）时，插件会注册 `force-compact` 设置命名空间，使两个参数可从
+`$DSH_HOME/settings.yaml` 配置：
+
+| 键 | 类型 | 默认值 | 作用 |
+| --- | --- | --- | --- |
+| `disableThinking` | `boolean` | `true` | 为 `true` 时，插件的摘要请求携带 `reasoningEffort: 'off'`，LLM 适配器将其映射为 `thinking: { type: 'disabled' }`——即压缩摘要调用时关闭提供方的思考/推理。 |
+| `autoThresholdTokens` | `number` | `120000` | 自动压缩触发阈值（单位 tokens）。仅当会话估算总上下文**达到或超过**该值时才压缩；低于该值时跳过该检查点。 |
+
+`$DSH_HOME/settings.yaml` 示例：
+
+```yaml
+force-compact:
+  disableThinking: true
+  autoThresholdTokens: 120000
+```
+
+当 `settings` 服务不存在时，插件回退到同样的默认值，压缩照常进行——设置命名空间
+是可选的，绝非硬依赖。
+
 ## 行为说明
 
 - **硬依赖：** `compaction` 服务。没有它插件不做任何事。
 - **可选依赖：** `agents` 服务。若某次 flush 触发时会话的 `Agent` 已被注销，
   插件会打印 `no live agent … — skipping` 并跳过该检查点。
+- **可选依赖：** `settings` 服务。不存在时，两个参数回退到默认值。
 - **信号（signal）：** 压缩在检查点上是 fire-and-forget；每次 flush 新建一个
   `AbortController`。
 
@@ -68,5 +91,6 @@ dsh web --patch dsh-force-compact/cordis.patch.yml
   `Agent`）。
 - 插件自己的摘要器是**预提交预览 + 收缩门禁**；持久摘要内容由 `compaction`
   服务权威生成。
-- 不注册任何 client/browser UI；插件是纯 Host 插件，只能通过
-  `[force-compact]` 日志行与持久日志观察。
+- 不注册任何 client/browser UI；插件是纯 Host 插件。两个参数可通过
+  `force-compact` 设置命名空间调参（未来某个动态 client 插件可读取它来提供
+  设置页面），并可通过 `[force-compact]` 日志行与持久日志观察。

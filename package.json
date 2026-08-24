@@ -1,7 +1,7 @@
 {
   "name": "@falling-ts/dsh-force-compact",
   "version": "0.1.0",
-  "description": "DSH Cordis plugin: compact a session's useful history at each session/flush durability checkpoint (Host-only, pure listener).",
+  "description": "DSH Cordis plugin: compact a session's useful history at each session/flush durability checkpoint (Host-only, pure listener). Exposes a \"强制压缩配置\" settings namespace (disableThinking, autoThresholdTokens).",
   "type": "module",
   "main": "./src/index.js",
   "exports": {
@@ -21,6 +21,7 @@
     "cordis",
     "compaction",
     "auto-compact",
-    "session"
+    "session",
+    "settings"
   ]
 }

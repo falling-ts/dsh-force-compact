@@ -35,9 +35,10 @@ export const COMPACTION_INSTRUCTION = [
  * @param {import('@deepseek-ai/dsh-agent').Agent} agent
  * @param {import('@deepseek-ai/dsh-llm').Message[]} messages the replayed region messages (without the directive).
  * @param {AbortSignal} signal
+ * @param {{ reasoningEffort?: 'off' | 'low' | 'high' | 'max' }} [extra] optional generation overrides.
  * @returns {Promise<{summary: Array, provider: string, model: string, maxTokens?: number} | null>} the condensed checkpoint, or `null` when no target can be resolved or the stream yields no text.
  */
-export async function summarize(ctx, config, agent, messages, signal) {
+export async function summarize(ctx, config, agent, messages, signal, extra) {
   const target = resolveTarget(agent)
   if (target === undefined) return null
 
@@ -51,6 +52,12 @@ export async function summarize(ctx, config, agent, messages, signal) {
     messages: request,
     maxTokens: config.maxSummaryTokens,
     signal,
+  }
+  // The force-compact "disable thinking" setting maps to a per-request
+  // `reasoningEffort: 'off'`, which the adapter turns into
+  // `thinking: { type: 'disabled' }` (provider thinking off for the call).
+  if (extra !== undefined && typeof extra.reasoningEffort === 'string') {
+    options.reasoningEffort = extra.reasoningEffort
   }
   if (agent.session !== undefined) options.sessionId = agent.session.id
   const purpose = agent.options && agent.options.purpose

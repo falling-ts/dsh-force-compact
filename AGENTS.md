@@ -3,7 +3,11 @@
 本规则适用于 `dsh-force-compact/`，并补充[集合约定](../AGENTS.md)。
 
 - 插件唯一的持久效果是 `compaction` 服务追加到会话日志的摘要节点；插件不引入其他状态。不要引入 timer、内存态存储或 client UI——保持它是 `session/flush` 上的纯 Host 监听器。
-- `compaction` 是硬依赖（`inject` + `ctx.compaction`）。`agents` 是可选依赖（`ctx.get('agents')`，对 `undefined` 做守卫）；缺少 Agent 是记录日志后跳过，而非错误。
+- `compaction` 是硬依赖（`inject` + `ctx.compaction`）。`agents` 是可选依赖（`ctx.get('agents')`，对 `undefined` 做守卫）；缺少 Agent 是记录日志后跳过，而非错误。`settings` 也是可选依赖（`ctx.get('settings')`，对 `undefined` 做守卫）；缺少 `settings` 服务时两个参数回退到默认值，压缩照常进行。
+- **强制压缩配置（`force-compact` 设置命名空间）：** 当 `settings` 服务挂载时，`apply` 注册 `force-compact` 命名空间（`src/settings.js`），两个参数可从 `$DSH_HOME/settings.yaml` 配置：
+  - `disableThinking`（`boolean`，默认 `true`）——为 `true` 时摘要请求携带 `reasoningEffort: 'off'`（适配器映射为 `thinking: { type: 'disabled' }`），即压缩摘要调用时关闭思考。
+  - `autoThresholdTokens`（`number`，默认 `120000`）——自动压缩触发阈值；仅当会话估算总上下文 ≥ 该值时才压缩，低于则跳过。
+  - 命名空间注册在 `ctx.effect` 中完成（`apply` 启动时一次性异步执行）；`registerNamespace` 在 `settings` 缺失时是 no-op，绝不阻塞 `session/flush` 监听器的注册。
 - 监听器是异步且被依赖的：`session/flush` 是被等待（awaited）的 `parallel` 检查点，因此压缩必须在监听器返回前完成。不要把它拆成 fire-and-forget，除非显式说明持久性保证。
 - 每次 flush 新建一个 `AbortController`（被等待的检查点覆盖其生命周期）；把它的 `signal` 传给摘要器与 `compactRegion`。
 - 压缩实现位于 `src/`：

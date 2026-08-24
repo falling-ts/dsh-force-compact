@@ -10,6 +10,7 @@
 import { resolveConfig } from './config.js'
 import { selectRegion } from './region.js'
 import { summarize } from './summarizer.js'
+import { readSettings, DEFAULTS } from './settings.js'
 
 /** Characters per token, mirroring the official token meter's coarse estimate. */
 const CHARS_PER_TOKEN = 4
@@ -30,6 +31,22 @@ const CHARS_PER_TOKEN = 4
 export async function compactSession(ctx, agent, controller) {
   const session = agent.session
   const config = resolveConfig()
+
+  // The "强制压缩配置" (force-compact configuration) settings: the automatic
+  // compaction trigger threshold and whether to disable thinking for the
+  // summarization call. Falls back to composition defaults when the `settings`
+  // service is not mounted.
+  const settings = (await readSettings(ctx)) ?? DEFAULTS
+
+  // Automatic compaction trigger gate: only compact when the session's
+  // estimated total context reaches the configured threshold. Below it, the
+  // checkpoint is skipped so short sessions are never force-compacted.
+  const sessionTokens = estimateSessionTokens(session)
+  if (sessionTokens < settings.autoThresholdTokens) {
+    ctx.logger.debug(`[force-compact] ${session.id}: context ~${sessionTokens} tokens below threshold ${settings.autoThresholdTokens}; skipping`)
+    return null
+  }
+
   const region = selectRegion(session, config)
   if (region === null) {
     ctx.logger.debug(`[force-compact] ${session.id}: no compactable region; skipping`)
@@ -45,7 +62,9 @@ export async function compactSession(ctx, agent, controller) {
   // Pre-commit preview + shrink gate: run the plugin's own LLM summarizer and
   // skip when the preview is not a genuine shrink. The durable mutation is
   // delegated to `compactRegion`, which is the authoritative summarizer.
-  const preview = await summarize(ctx, config, agent, messages, controller.signal)
+  // The "disable thinking" setting maps to a per-request `reasoningEffort: 'off'`.
+  const extra = settings.disableThinking ? { reasoningEffort: 'off' } : undefined
+  const preview = await summarize(ctx, config, agent, messages, controller.signal, extra)
   if (preview === null) {
     ctx.logger.debug(`[force-compact] ${session.id}: no summarization target; skipping`)
     return null
@@ -63,6 +82,29 @@ export async function compactSession(ctx, agent, controller) {
     + `(seqs ${result.shadowedRange.start}-${result.shadowedRange.end}, ~${result.shadowedTokenCount} tokens)`,
   )
   return result
+}
+
+/**
+ * Coarse token estimate for a session's whole surface content (user +
+ * assistant + tool-result messages). Used only for the automatic compaction
+ * trigger gate — the authoritative token accounting happens inside
+ * `compactRegion`.
+ * @param {import('@deepseek-ai/dsh-session').Session} session
+ * @returns {number}
+ */
+function estimateSessionTokens(session) {
+  let chars = 0
+  for (const event of session.events) {
+    let content
+    if (event.type === 'user/message') content = event.data.content
+    else if (event.type === 'assistant/message') content = event.data.message.content
+    else if (event.type === 'tool/result') content = event.data.message !== undefined ? event.data.message.content : undefined
+    if (content === undefined) continue
+    for (const block of content || []) {
+      if (block && typeof block.text === 'string') chars += block.text.length
+    }
+  }
+  return Math.ceil(chars / CHARS_PER_TOKEN)
 }
 
 /** Coarse token estimate for a set of content blocks. */
