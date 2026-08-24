@@ -8,29 +8,28 @@
   - **`agent/request`**（围绕冻结调用配置的 Waterfall）——`disableThinking` 为 `true` 时，返回的 `LlmCallConfig` 携带 `reasoningEffort: 'off'`（适配器映射为 `thinking: { type: 'disabled' }`），即**每次模型请求**都关闭思考。监听器 `await next()` 取得机器本会使用的配置，再返回替换值；**不得**在缺少 `next()` 时短路（必须调用 `next()`）。
   - **`agent/pre-step`**（每个模型步骤前的 Waterfall）——通过 `tokenMeter.measure(session).totalTokens` 读取会话上下文总 tokens；当其**≥ `autoThresholdTokens`** 时，返回 `{ kind: 'reject' }` **不发起模型请求**，并从头压缩最早 `autoEarliestRatio` 的对话（`compactRegion`）；低于阈值时调用 `next()` 让请求继续。强制压缩失败（无安全区间 / 已活跃）时降级为 `next()`，绝不阻塞请求。
   - 两个参数都**每次请求**通过同步 `settings.get('falling-ts-force-compact')` 读取，因此 `settings.yaml` 的改动在下一次请求即生效。
-- **`/force-compact` 斜杠命令（`commands` 服务，可选依赖）：** 通过 `/` 选择执行，其 handler **不发送模型请求**，因此可对**繁忙**的 Agent 生效（`src/command.js`）。handler 逻辑：
-  - 直接调用 `ctx.compaction.compactRegion(start, end, agent, invocation.signal)` 压缩会话总 tokens 的最早 `forceEarliestRatio`（从头截断）——`compactRegion` 是 current-turn owner，Agent 空闲或繁忙均可执行。
-  - 若 `compactRegion` 抛出（已有并发压缩活跃 / 无安全区间），调用 `queueForceCompact(session.id)` **插入一个 JS 内存标记**（process-local `Map`，无持久态、无 timer），返回 "将在下一个模型步骤强制压缩"。
+- **`/force-compact` 斜杠命令（`commands` 服务，可选依赖）：** 通过 `/` 选择执行，其 handler **不发送模型请求**。Agent **空闲**时经 `compactNow`（owner `null`，空闲手动入口）立即压缩（引擎自身区间选择）；**繁忙**时 `compactNow` 被拒绝，handler 排队一个强制标记（`src/command.js`）。handler 逻辑：
+  - 直接调用 `ctx.compaction.compactNow(agent, invocation.signal)`（owner `null`，空闲手动入口）压缩会话——空闲时立即生效，使用引擎自身的区间选择。
+  - 若 `compactNow` 抛出（Agent 繁忙 / 无安全区间），调用 `queueForceCompact(session.id)` **插入一个 JS 内存标记**（process-local `Map`，无持久态、无 timer），返回 "将在下一个模型步骤强制压缩"。
   - 该标记由 `agent/pre-step` 钩子（`takeForceCompact`）在**下一个模型步骤**读取并**立即消费**：读到强制标记则**跳过 token 阈值门禁**、压缩最早 `forceEarliestRatio`（`compactRegion`），并返回 `{ kind: 'reject' }` **不再请求模型**——即"再请求钩子中如果读取到强制命令, 立马执行压缩, 不再请求模型"。
 - **强制压缩配置（`falling-ts-force-compact` 设置命名空间）：** 当 `settings` 服务挂载时，`apply` 注册 `falling-ts-force-compact` 命名空间（`src/settings.js`；`falling-ts-` 前缀防止与其他插件的配置键冲突），两个参数可从 `$DSH_HOME/settings.yaml` 配置：
   - `disableThinking`（`boolean`，默认 `true`）——为 `true` 时**每次模型请求**（以及插件自己的摘要调用）携带 `reasoningEffort: 'off'`（适配器映射为 `thinking: { type: 'disabled' }`），即关闭思考。
   - `autoThresholdTokens`（`number`，默认 `80000`）——强制压缩触发阈值；`agent/pre-step` 仅在会话总上下文 tokens ≥ 该值时强制压缩，低于则跳过。
   - `autoEarliestRatio`（`number` 0.01..1，默认 `0.3`）——**自动压缩最早对话比例**：`agent/pre-step` 阈值门禁触发时，按 `tokenMeter` 测量的会话总 tokens 的该比例，从头累计 tokens 至预算后截断（末端对齐 `user/message` 边界），压缩该区间。
-  - `forceEarliestRatio`（`number` 0.01..1，默认 `0.5`）——**强制压缩最早对话比例**：`/force-compact` 命令（直接压缩；抛出时由下一个模型步骤消费标记重试）按总 tokens 的该比例从头截断压缩。
-  - `turnEndForceCompactionEnabled`（`boolean`，默认 `true`）——**是否开启一轮结束强制压缩**：为 `true` 时，agent 转入 `idle`（所有轮次结束，含子代理，下一次人为对话之前）时强制执行一轮结束压缩。
-  - `turnEndCompactionRatio`（`number` 0.01..1，默认 `0.4`）——**一轮结束强制压缩比例**：agent 转入 `idle` 时，按总 tokens 的该比例从头截断压缩。
+  - `forceEarliestRatio`（`number` 0.01..1，默认 `0.5`）——**强制压缩最早对话比例**：`/force-compact` 命令在 Agent **繁忙**时排队强制标记，由 `agent/pre-step` 钩子（`compactRegion`）在下一个模型步骤按总 tokens 的该比例从头截断压缩（命令本身在空闲时经 `compactNow` 用引擎自身区间选择压缩，不使用该比例）。
+  - `turnEndForceCompactionEnabled`（`boolean`，默认 `true`）——**是否开启一轮结束强制压缩**：为 `true` 时，agent 转入 `idle`（所有轮次结束，含子代理，下一次人为对话之前）时经 `compactNow`（引擎自身区间选择）强制执行一轮结束压缩。
   - 命名空间注册在 `ctx.effect` 中完成（`apply` 启动时一次性异步执行）；`registerNamespace` 在 `settings` 缺失时是 no-op，绝不阻塞 `agent/*` / `session/flush` 监听器的注册。
-- **一轮结束强制压缩（`agent/status` 上的 `idle` 监听器，`src/turn-end.js`）：** 监听 `agent/status`；当 agent 转入 `idle`（无 driver 活动——所有轮次结束，含子代理，下一次人为对话之前）且 `turnEndForceCompactionEnabled` 为 `true` 时，按 `tokenMeter` 测量的会话总 tokens 的 `turnEndCompactionRatio` 比例从头截断压缩（`compactRegion`）。`agent/status` 监听器不携带 turn signal，故每次 `idle` 新建一个 `AbortController`。压缩失败（已活跃 / 无安全区间）仅记录日志，绝不阻塞。
+- **一轮结束强制压缩（`agent/status` 上的 `idle` 监听器，`src/turn-end.js`）：** 监听 `agent/status`；当 agent 转入 `idle`（无 driver 活动——所有轮次结束，含子代理，下一次人为对话之前）且 `turnEndForceCompactionEnabled` 为 `true` 时，经 `compactNow`（owner `null`，空闲手动入口）压缩会话——使用引擎自身的区间选择（空闲路径无法选择自定义 token 比例，故无一轮结束比例参数）。`agent/status` 监听器不携带 turn signal，故每次 `idle` 新建一个 `AbortController`。压缩失败（已活跃 / 无安全区间）仅记录日志，绝不阻塞。
 - 监听器是异步且被依赖的：`session/flush` 是被等待（awaited）的 `parallel` 检查点，因此压缩必须在监听器返回前完成。不要把它拆成 fire-and-forget，除非显式说明持久性保证。
 - 每次 flush 新建一个 `AbortController`（被等待的检查点覆盖其生命周期）；把它的 `signal` 传给摘要器与 `compactRegion`。
 - 压缩实现位于 `src/`：
   - `src/config.js` —— 可调参数（固定常量，非 cordis `Config` 字段）。
-  - `src/region.js` —— 插件自己的 head-anchored 区间选择：`selectRegion`（按 surface 节点数保留最近尾段，检查点路径用）与 `selectEarliestByTokens`（按 `tokenMeter` 测量的总 tokens 的 `ratio` 比例从头累计至预算后截断，末端对齐 `user/message` 边界，供 `agent/pre-step` / `idle` / `/force-compact` 使用）。
+  - `src/region.js` —— 插件自己的 head-anchored 区间选择：`selectRegion`（按 surface 节点数保留最近尾段，检查点路径用）与 `selectEarliestByTokens`（按 `tokenMeter` 测量的总 tokens 的 `ratio` 比例从头累计至预算后截断，末端对齐 `user/message` 边界，供 `agent/pre-step` 使用；`idle` / `/force-compact` 路径改用 `compactNow` 的引擎自身区间选择）。
   - `src/summarizer.js` —— 插件自己的一次性 LLM 摘要器（回放区间，追加压缩指令，通过 `ctx.llm` 流式生成）。
   - `src/compact.js` —— 检查点编排器：选区间 → 投影区间消息 → 运行预览 + 收缩门禁 → 把持久变更委托给 `ctx.compaction.compactRegion(start, end, agent, signal)`。
   - `src/request-guard.js` —— 每次请求的门禁：`agent/request` 关闭思考（`reasoningEffort: 'off'`）+ `agent/pre-step` 阈值门禁（`autoEarliestRatio` 从头压缩）+ `/force-compact` 的 process-local 强制标记（`queueForceCompact` / `takeForceCompact`）。
-  - `src/command.js` —— `/force-compact` 斜杠命令（`commands` 服务，可选依赖）：直接压缩最早 `forceEarliestRatio`；`compactRegion` 抛出时插入 JS 内存标记。
-  - `src/turn-end.js` —— 一轮结束强制压缩：`agent/status` 上的 `idle` 监听器，按总 tokens 的 `turnEndCompactionRatio` 比例从头截断压缩。
+  - `src/command.js` —— `/force-compact` 斜杠命令（`commands` 服务，可选依赖）：空闲时经 `compactNow` 压缩；繁忙时插入 JS 内存标记。
+  - `src/turn-end.js` —— 一轮结束强制压缩：`agent/status` 上的 `idle` 监听器，经 `compactNow`（引擎自身区间选择）压缩。
   - `src/index.js` —— Cordis 函数插件入口（`name` / `inject` / `apply`），注册 `agent/request` / `agent/pre-step` / `agent/status` / `session/flush` 四个监听器、设置命名空间与 `/force-compact` 命令。
 - 插件自己的摘要器是**预提交预览 + 收缩门禁**：它在提交前验证压缩是否值得。持久摘要内容由 `compaction` 服务权威生成（`compactRegion` 重新摘要并提交）。不要在持久路径上重复摘要。
 - Monorepo 集成会把它包进 `src/index.ts`，并新增一个真实组合（REAL-composition）测试：启动仅测试用的 `cordis.yml` 并断言持久的摘要节点；本独立产物是 plain JS，无构建步骤。

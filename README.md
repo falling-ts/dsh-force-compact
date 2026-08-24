@@ -38,29 +38,33 @@ requirement), plus the durability checkpoint:
   caller proceeds, so the summary is durable.
 - **`/force-compact`** — a slash command (selected from the `/` list) that
   force-compacts the agent's session. Its handler runs **without sending the
-  line to the model**, so it can act on a **busy** agent. It directly compacts the
-  **earliest `forceEarliestRatio`** of the conversation's tokens via
-  `ctx.compaction.compactRegion` (a current-turn owner, so it works whether the
-  agent is idle or mid-turn). If `compactRegion` throws (a concurrent compaction
-  is already active / no safe range), it inserts a **process-local force flag**
-  (a JS memory record — no durable state, no timer) that the `agent/pre-step`
-  hook reads at the next model step. When the flag is present, that step
-  **skips the token threshold**, force-compacts the earliest `forceEarliestRatio`,
-  and returns `{ kind: 'reject' }` so the model request is **not** made.
+  line to the model**. When the agent is **idle** it compacts immediately through
+  the engine's idle manual entry (`compactNow`, owner `null`, the engine's own
+  range selection); when **busy** `compactNow` is rejected and the handler
+  inserts a **process-local force flag** (a JS memory record — no durable state,
+  no timer) that the `agent/pre-step` hook reads at the next model step. When
+  the flag is present, that step **skips the token threshold**, force-compacts
+  the earliest `forceEarliestRatio` (via `compactRegion`, the current-turn owner
+  that works mid-turn), and returns `{ kind: 'reject' }` so the model request
+  is **not** made.
 
 Supporting modules:
 
 - **`src/request-guard.js`** — the per-request guard: `agent/request`
   thinking-off + `agent/pre-step` threshold gate + forced compaction + the
   `/force-compact` process-local force flag.
-- **`src/command.js`** — the `/force-compact` slash command: directly compacts
-  the earliest `forceEarliestRatio`; when `compactRegion` throws it queues the
-  force flag for the next model step.
+- **`src/command.js`** — the `/force-compact` slash command: compacts
+  immediately through `compactNow` when the agent is idle; when `compactNow`
+  throws (busy) it queues the force flag for the next model step.
+- **`src/turn-end.js`** — the turn-end forced compaction: an `agent/status`
+  listener that compacts through `compactNow` when the agent transitions to
+  `idle` and `turnEndForceCompactionEnabled` is on.
 - **`src/region.js`** — the plugin's own head-anchored region selection:
   `selectRegion` (checkpoint path: retain a recent tail by surface-node count,
   end on a `user/message` boundary) and `selectEarliestByTokens` (used by
-  `agent/pre-step` / `idle` / `/force-compact`: accumulate tokens from the head
-  to a ratio budget, snap the end to a `user/message` boundary).
+  `agent/pre-step`: accumulate tokens from the head to a ratio budget, snap the
+  end to a `user/message` boundary). The `idle` and `/force-compact` paths use
+  `compactNow`'s engine range selection instead.
 - **`src/summarizer.js`** — the plugin's own one-shot LLM summarizer: replays
   the region's messages, appends a compaction directive as the final user
   message, streams through `ctx.llm`, and returns the condensed checkpoint.
@@ -79,6 +83,11 @@ agent/pre-step(payload, next)             # before each model step
         no  -> next()                      # let the model request proceed
         yes -> compactRegion(earliest autoEarliestRatio, signal)  # force compact
               return { kind: "reject" }    # NO model request this step
+
+agent/status({ agent, status })           # agent lifecycle transition
+    status === "idle" && turnEndForceCompactionEnabled?
+        yes -> compactNow(agent, freshSignal)   # turn-end compaction (idle)
+        no  -> skip
 
 session/flush(session)                    # durability checkpoint
     agents.get(session.id)                -> live Agent (skip if absent)
@@ -114,7 +123,7 @@ composition without changing shipped defaults.
 
 When the `settings` service is mounted (the web bundle always mounts it via
 `@deepseek-ai/dsh-settings-file`), the plugin registers the
-`falling-ts-force-compact` settings namespace so six parameters are user-tunable
+`falling-ts-force-compact` settings namespace so five parameters are user-tunable
 from `$DSH_HOME/settings.yaml` (the `falling-ts-` prefix prevents collisions
 with other plugins' keys):
 
@@ -123,9 +132,8 @@ with other plugins' keys):
 | `disableThinking` | `boolean` | `true` | when `true`, **every model request** carries `reasoningEffort: 'off'`, which the LLM adapter maps to `thinking: { type: 'disabled' }` — the provider's thinking/reasoning is switched off for the request. Also applies to the plugin's own summarization calls. |
 | `autoThresholdTokens` | `number` | `80000` | the forced-compaction trigger threshold in tokens. **Before a model request**, the session's total context tokens (via `tokenMeter`) are measured; when they are **>= this value**, the request is rejected and a forced compaction runs instead. The `session/flush` checkpoint path also uses this threshold as its trigger gate. |
 | `autoEarliestRatio` | `number` | `0.3` | **auto compact-earliest-conversation ratio** — the fraction of the session's **total tokens** (via `tokenMeter`) the `agent/pre-step` threshold gate compacts from the **head**. Walks surface events from the head, accumulating per-event token estimates until the budget (`totalTokens * ratio`) is met, then snaps the span end to the next `user/message` boundary. |
-| `forceEarliestRatio` | `number` | `0.5` | **force compact-earliest-conversation ratio** — the fraction of the session's **total tokens** the `/force-compact` command compacts from the **head** (compacts directly; when `compactRegion` throws, queued for the next model step). |
-| `turnEndForceCompactionEnabled` | `boolean` | `true` | **enable turn-end force compaction** — when `true`, a forced compaction runs when the agent transitions to `idle` (all turns done, including sub-agents, before the next human turn). |
-| `turnEndCompactionRatio` | `number` | `0.4` | **turn-end force compaction ratio** — the fraction of the session's **total tokens** the turn-end forced compaction compacts from the **head** when the agent goes `idle`. |
+| `forceEarliestRatio` | `number` | `0.5` | **force compact-earliest-conversation ratio** — the fraction of the session's **total tokens** the `agent/pre-step` hook compacts from the **head** when a `/force-compact` force flag is present (the command itself compacts through `compactNow`'s engine range selection when idle, and queues the force flag when busy). |
+| `turnEndForceCompactionEnabled` | `boolean` | `true` | **enable turn-end force compaction** — when `true`, a forced compaction runs when the agent transitions to `idle` (all turns done, including sub-agents, before the next human turn) through `compactNow` (the engine's idle manual entry, whose range selection is the engine's own — there is no turn-end ratio parameter). |
 
 Example `$DSH_HOME/settings.yaml`:
 
@@ -136,7 +144,6 @@ falling-ts-force-compact:
   autoEarliestRatio: 0.3
   forceEarliestRatio: 0.5
   turnEndForceCompactionEnabled: true
-  turnEndCompactionRatio: 0.4
 ```
 
 When the `settings` service is absent, the plugin falls back to these same
@@ -155,7 +162,7 @@ a hard dependency.
 - **Optional dependency:** the `settings` service. When absent, the parameters
   resolve to their defaults (`disableThinking: true`, `autoThresholdTokens:
   80000`, `autoEarliestRatio: 0.3`, `forceEarliestRatio: 0.5`,
-  `turnEndForceCompactionEnabled: true`, `turnEndCompactionRatio: 0.4`).
+  `turnEndForceCompactionEnabled: true`).
 - **Optional dependency:** the `tokenMeter` service. Used by the `agent/pre-step`
   threshold gate; when absent, the gate falls back to a coarse character-based
   estimate of the session's surface content.
@@ -163,7 +170,8 @@ a hard dependency.
   (synchronous `settings.get('falling-ts-force-compact')`), so a `settings.yaml`
   edit is picked up on the next request without a restart.
 - **Signal:** the `agent/*` Waterfalls forward the current turn's signal; the
-  `session/flush` checkpoint mints a fresh `AbortController` per flush.
+  `session/flush` checkpoint and the `agent/status` idle listener each mint a
+  fresh `AbortController`.
 
 ## Known limitations
 
@@ -178,8 +186,12 @@ a hard dependency.
   threshold is reached, then relies on the loop retrying against the shrunken
   context. If `compactRegion` finds no safe range (e.g. nothing useful left to
   compact), the request proceeds as-is rather than looping.
-- No client/browser UI is registered; the plugin is Host-only. The two
-  parameters are tunable through the `falling-ts-force-compact` settings
-  namespace (a future dynamic client plugin may read it to expose a settings
-  page), and the plugin is observable through `[force-compact]` log lines and
-  the durable log.
+- The `idle` and `/force-compact` paths use `compactNow` (the engine's idle
+  manual entry), whose range selection is the engine's own (`retainTokens`-based)
+  rather than a plugin-tunable ratio. The plugin-tunable ratios
+  (`autoEarliestRatio`, `forceEarliestRatio`) are honored by the `agent/pre-step`
+  hook (the current-turn owner `compactRegion`).
+- No client/browser UI is registered; the plugin is Host-only. The parameters
+  are tunable through the `falling-ts-force-compact` settings namespace (a
+  future dynamic client plugin may read it to expose a settings page), and the
+  plugin is observable through `[force-compact]` log lines and the durable log.

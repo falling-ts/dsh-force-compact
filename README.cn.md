@@ -29,21 +29,30 @@
 - **`session/flush`** —— 一个被等待（awaited）的 `parallel` 持久化检查点。检查点
   会等待所有监听器完成，因此压缩在调用方继续之前就已结束，摘要保证落盘。
 - **`/force-compact`** —— 通过 `/` 选择执行的斜杠命令，强制压缩该 Agent 的会话
-  上下文。其 handler **不发送模型请求**，因此可对**繁忙**的 Agent 生效：直接通过
-  `ctx.compaction.compactRegion` 从头压缩最早 `forceEarliestRatio`；若 `compactRegion` 抛出则**插入一个 process-local 强制标记**（JS
-  内存记录，无持久态、无 timer），由 `agent/pre-step` 钩子在下一个模型步骤读取。
-  读到强制标记时，该步骤**跳过 token 阈值门禁**、从头压缩最早 `forceEarliestRatio`，并返回
-  `{ kind: 'reject' }` **不再请求模型**。
+  上下文。其 handler **不发送模型请求**：Agent **空闲**时经 `compactNow`
+  （owner `null`，空闲手动入口，引擎自身区间选择）立即压缩；**繁忙**时
+  `compactNow` 被拒绝，handler **插入一个 process-local 强制标记**（JS 内存记录，
+  无持久态、无 timer），由 `agent/pre-step` 钩子在下一个模型步骤读取。
+  读到强制标记时，该步骤**跳过 token 阈值门禁**、从头压缩最早
+  `forceEarliestRatio`（`compactRegion`，current-turn owner，可在 mid-turn 执行），
+  并返回 `{ kind: 'reject' }` **不再请求模型**。
+- **`agent/status`** —— agent 生命周期迁移监听器。当 agent 转入 `idle`
+  （所有轮次结束，含子代理，下一次人为对话之前）且 `turnEndForceCompactionEnabled`
+  为 `true` 时，经 `compactNow`（owner `null`，空闲手动入口）压缩会话——使用
+  引擎自身的区间选择（空闲路径无法选择自定义 token 比例，故无一轮结束比例参数）。
 
 支撑模块：
 
 - **`src/request-guard.js`** —— 每次请求的门禁：`agent/request` 关闭思考 +
   `agent/pre-step` 阈值门禁 + 强制压缩 + `/force-compact` 的 process-local 强制标记。
-- **`src/command.js`** —— `/force-compact` 斜杠命令（直接压缩最早 `forceEarliestRatio`；`compactRegion` 抛出时插入
-  强制标记，待下一个模型步骤消费）。
-- **`src/region.js`** —— 插件自己的 head-anchored 区间选择：`selectRegion`（检查点路径）与 `selectEarliestByTokens`（供
-  `agent/pre-step` / `idle` / `/force-compact` 使用）：前者按 surface 节点数保留最近尾段，且都把区间末端对齐到 `user/message` 边界（始终
-  是一个平衡边界）。
+- **`src/command.js`** —— `/force-compact` 斜杠命令：Agent 空闲时经 `compactNow`
+  压缩；繁忙时插入强制标记，待下一个模型步骤消费。
+- **`src/turn-end.js`** —— 一轮结束强制压缩：`agent/status` 上的 `idle` 监听器，
+  经 `compactNow`（引擎自身区间选择）压缩。
+- **`src/region.js`** —— 插件自己的 head-anchored 区间选择：`selectRegion`（检查点
+  路径）与 `selectEarliestByTokens`（供 `agent/pre-step` 使用）：前者按 surface
+  节点数保留最近尾段，且都把区间末端对齐到 `user/message` 边界（始终是一个平衡
+  边界）。`idle` / `/force-compact` 路径改用 `compactNow` 的引擎自身区间选择。
 - **`src/summarizer.js`** —— 插件自己的一次性 LLM 摘要器：回放区间消息，把压缩
   指令作为最后一条 user 消息追加，通过 `ctx.llm` 流式生成，返回浓缩后的检查点。
 - **`src/compact.js`** —— 检查点编排器：选区间 → 投影区间消息 → 运行预览 + 收缩
@@ -60,6 +69,11 @@ agent/pre-step(payload, next)             # 每个模型步骤之前
         否  -> next()                      # 让模型请求继续
         是  -> compactRegion(earliest autoEarliestRatio, signal)   # 强制压缩
               return { kind: "reject" }    # 本次步骤不请求模型
+
+agent/status({ agent, status })           # agent 生命周期迁移
+    status === "idle" && turnEndForceCompactionEnabled?
+        是  -> compactNow(agent, freshSignal)   # 一轮结束压缩（空闲）
+        否  -> 跳过
 
 session/flush(session)                    # 持久化检查点
     agents.get(session.id)                -> 实时 Agent（不存在则跳过）
@@ -94,7 +108,7 @@ dsh web --patch dsh-force-compact/cordis.patch.yml
 ## 设置（强制压缩配置）
 
 当 `settings` 服务已挂载（web bundle 通过 `@deepseek-ai/dsh-settings-file` 始终
-挂载它）时，插件会注册 `falling-ts-force-compact` 设置命名空间，使六个参数可从
+挂载它）时，插件会注册 `falling-ts-force-compact` 设置命名空间，使五个参数可从
 `$DSH_HOME/settings.yaml` 配置（`falling-ts-` 前缀用于防止与其他插件的键冲突）：
 
 | 键 | 类型 | 默认值 | 作用 |
@@ -102,9 +116,8 @@ dsh web --patch dsh-force-compact/cordis.patch.yml
 | `disableThinking` | `boolean` | `true` | 为 `true` 时，**每次模型请求**都携带 `reasoningEffort: 'off'`，LLM 适配器将其映射为 `thinking: { type: 'disabled' }`——即请求时关闭提供方的思考/推理。同样作用于插件自己的摘要调用。 |
 | `autoThresholdTokens` | `number` | `80000` | 强制压缩触发阈值（单位 tokens）。**在请求模型前**，通过 `tokenMeter` 测量会话上下文总 tokens 数；当其**达到或超过**该值时，**不请求模型**，而是强制执行一次强制压缩。`session/flush` 检查点路径也把它作为触发门禁。 |
 | `autoEarliestRatio` | `number` | `0.3` | **自动压缩最早对话比例**——`agent/pre-step` 阈值门禁触发时，按 `tokenMeter` 测量的会话总 tokens 的该比例，从头累计 tokens 至预算（`totalTokens * ratio`）后截断（末端对齐 `user/message` 边界），压缩该区间。 |
-| `forceEarliestRatio` | `number` | `0.5` | **强制压缩最早对话比例**——`/force-compact` 命令按会话总 tokens 的该比例从头截断压缩（直接压缩；`compactRegion` 抛出时排队到下一个模型步骤）。 |
-| `turnEndForceCompactionEnabled` | `boolean` | `true` | **是否开启一轮结束强制压缩**——为 `true` 时，agent 转入 `idle`（所有轮次结束，含子代理，下一次人为对话之前）时强制执行一轮结束压缩。 |
-| `turnEndCompactionRatio` | `number` | `0.4` | **一轮结束强制压缩比例**——agent 转入 `idle` 时，按会话总 tokens 的该比例从头截断压缩。 |
+| `forceEarliestRatio` | `number` | `0.5` | **强制压缩最早对话比例**——`/force-compact` 命令在 Agent **繁忙**时排队强制标记，由 `agent/pre-step` 钩子（`compactRegion`）在下一个模型步骤按会话总 tokens 的该比例从头截断压缩（命令本身在空闲时经 `compactNow` 用引擎自身区间选择压缩，不使用该比例）。 |
+| `turnEndForceCompactionEnabled` | `boolean` | `true` | **是否开启一轮结束强制压缩**——为 `true` 时，agent 转入 `idle`（所有轮次结束，含子代理，下一次人为对话之前）时经 `compactNow`（引擎自身区间选择）强制执行一轮结束压缩。 |
 
 `$DSH_HOME/settings.yaml` 示例：
 
@@ -115,7 +128,6 @@ falling-ts-force-compact:
   autoEarliestRatio: 0.3
   forceEarliestRatio: 0.5
   turnEndForceCompactionEnabled: true
-  turnEndCompactionRatio: 0.4
 ```
 
 当 `settings` 服务不存在时，插件回退到同样的默认值，压缩照常进行——设置命名空间
@@ -130,15 +142,14 @@ falling-ts-force-compact:
   该检查点。`agent/*` Waterfall 的 payload 直接携带 `Agent`，无需 `agents` 查找。
 - **可选依赖：** `settings` 服务。不存在时，参数回退到默认值（`disableThinking:
   true`、`autoThresholdTokens: 80000`、`autoEarliestRatio: 0.3`、
-  `forceEarliestRatio: 0.5`、`turnEndForceCompactionEnabled: true`、
-  `turnEndCompactionRatio: 0.4`）。
+  `forceEarliestRatio: 0.5`、`turnEndForceCompactionEnabled: true`）。
 - **可选依赖：** `tokenMeter` 服务。供 `agent/pre-step` 阈值门禁使用；不存在时，
   门禁回退到对会话 surface 内容的粗略字符估算。
 - **每次请求读取设置：** 两个参数都**每次模型请求**读取
   （同步 `settings.get('falling-ts-force-compact')`），因此 `settings.yaml` 的改动在下一次
   请求即生效，无需重启。
 - **信号（signal）：** `agent/*` Waterfall 转发当前 turn 的 signal；
-  `session/flush` 检查点每次 flush 新建一个 `AbortController`。
+  `session/flush` 检查点与 `agent/status` idle 监听器各新建一个 `AbortController`。
 
 ## 已知限制
 
@@ -151,6 +162,10 @@ falling-ts-force-compact:
 - 强制压缩门禁在达到阈值时**拒绝所提议的模型步骤**，随后依赖循环以更小的
   上下文重试。若 `compactRegion` 找不到安全区间（例如已无可压缩的有用内容），
   则让请求按原样继续，而非循环。
-- 不注册任何 client/browser UI；插件是纯 Host 插件。两个参数可通过
+- `idle` 与 `/force-compact` 路径使用 `compactNow`（引擎的空闲手动入口），其
+  区间选择是引擎自身的（基于 `retainTokens`），而非插件可调比例。插件可调比例
+  （`autoEarliestRatio`、`forceEarliestRatio`）由 `agent/pre-step` 钩子
+  （current-turn owner `compactRegion`）遵守。
+- 不注册任何 client/browser UI；插件是纯 Host 插件。参数可通过
   `falling-ts-force-compact` 设置命名空间调参（未来某个动态 client 插件可读取它
   来提供设置页面），并可通过 `[force-compact]` 日志行与持久日志观察。

@@ -2,7 +2,7 @@
  * dsh-force-compact settings — the "强制压缩配置" (Force-Compact Configuration)
  * surface.
  *
- * Six user-tunable parameters are registered under the `falling-ts-force-compact`
+ * Five user-tunable parameters are registered under the `falling-ts-force-compact`
  * settings namespace so the harness settings panel can expose and persist them
  * (the `falling-ts-` prefix prevents collisions with other plugins' keys):
  *
@@ -21,10 +21,10 @@
  *   session's surface history the `/force-compact` command compacts from the
  *   **head**.
  * - `turnEndForceCompactionEnabled` (boolean, default `true`): whether a turn-end
- *   forced compaction runs at each turn's end.
- * - `turnEndCompactionRatio` (number 0.01..1, default `0.4`): the fraction of the
- *   session's surface history the turn-end forced compaction compacts from the
- *   **head**.
+ *   forced compaction runs when the agent transitions to `idle` — compaction
+ *   goes through the engine's idle manual entry (`compactNow`), which uses its
+ *   own range selection (the idle path cannot select a custom token fraction,
+ *   so there is no turn-end ratio parameter).
  *
  * The namespace is registered against the `settings` service when one is
  * mounted. The schema is built through `@deepseek-ai/schemastery` (a
@@ -56,7 +56,6 @@ export const NS = 'falling-ts-force-compact'
  *   autoEarliestRatio: number,
  *   forceEarliestRatio: number,
  *   turnEndForceCompactionEnabled: boolean,
- *   turnEndCompactionRatio: number,
  * }>}
  */
 export const DEFAULTS = Object.freeze({
@@ -65,7 +64,6 @@ export const DEFAULTS = Object.freeze({
   autoEarliestRatio: 0.3,
   forceEarliestRatio: 0.5,
   turnEndForceCompactionEnabled: true,
-  turnEndCompactionRatio: 0.4,
 })
 
 /**
@@ -79,7 +77,6 @@ export const DEFAULTS = Object.freeze({
  *   autoEarliestRatio: number,
  *   forceEarliestRatio: number,
  *   turnEndForceCompactionEnabled: boolean,
- *   turnEndCompactionRatio: number,
  * } | null>}
  *   the resolved settings, or `null` when the `settings` service is not mounted
  *   (callers should fall back to their composition entry).
@@ -100,14 +97,12 @@ export async function readSettings(ctx) {
   const autoEarliestRatio = asRatio('autoEarliestRatio', DEFAULTS.autoEarliestRatio)
   const forceEarliestRatio = asRatio('forceEarliestRatio', DEFAULTS.forceEarliestRatio)
   const turnEndForceCompactionEnabled = asBool('turnEndForceCompactionEnabled', DEFAULTS.turnEndForceCompactionEnabled)
-  const turnEndCompactionRatio = asRatio('turnEndCompactionRatio', DEFAULTS.turnEndCompactionRatio)
   return {
     disableThinking,
     autoThresholdTokens,
     autoEarliestRatio,
     forceEarliestRatio,
     turnEndForceCompactionEnabled,
-    turnEndCompactionRatio,
   }
 }
 
@@ -131,7 +126,6 @@ export async function buildSchema() {
       autoEarliestRatio: z.number().step(0.01).min(0.01).max(1).default(DEFAULTS.autoEarliestRatio),
       forceEarliestRatio: z.number().step(0.01).min(0.01).max(1).default(DEFAULTS.forceEarliestRatio),
       turnEndForceCompactionEnabled: z.boolean().default(DEFAULTS.turnEndForceCompactionEnabled),
-      turnEndCompactionRatio: z.number().step(0.01).min(0.01).max(1).default(DEFAULTS.turnEndCompactionRatio),
     })
     return schema
   } catch {
