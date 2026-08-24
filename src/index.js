@@ -222,13 +222,43 @@ export function apply(ctx) {
   })
 
   // Register the `/force-compact` slash command (idle → compact now; busy →
-  // queue a force flag the `agent/pre-step` hook consumes). No-op when the
-  // `commands` service is absent.
-  guard('/force-compact command', () => {
-    ctx.effect(() => {
-      if (registerCommand(ctx)) ctx.logger.debug('[force-compact] registered /force-compact command')
-    }, 'force-compact: /force-compact command')
-  })
+  // queue a force flag the `agent/pre-step` hook consumes). NO-OP at boot when
+  // the `commands` service is not mounted YET (typical: the service arrives
+  // with the preset plane shortly after this plugin's boot-time effect runs).
+  // Mirrors the settings-namespace lazy-install pattern: attempt at boot, then
+  // re-attempt at the top of EVERY guarded listener (`agent/request`,
+  // `agent/pre-step`, etc.) until it settles. A successful registration is
+  // idempotent (registering the same-name twice is a no-op at worst), but we
+  // settle on the first success so subsequent listeners pay only a boolean
+  // check. A permanent absence (deployment genuinely lacks `commands`) leaves
+  // the listeners trying on each event until they give up — that is intentional
+  // degradation: the rest of the plugin continues working, the command simply
+  // remains unregistered.
+  const commandState = { settled: false, warnedAbsent: false }
+  const maybeRegisterCommand = () => {
+    if (commandState.settled) return
+    if (typeof registerCommand !== 'function') return
+    const ok = (() => {
+      try { return registerCommand(ctx) === true }
+      catch (error) {
+        const message = error instanceof Error ? (error.stack || error.message) : String(error)
+        if (!commandState.warnedAbsent) {
+          commandState.warnedAbsent = true
+          ctx.logger.warn(`[force-compact] /force-compact command registration THREW — ${message}`)
+        }
+        return false
+      }
+    })()
+    if (ok) {
+      commandState.settled = true
+      ctx.logger.info('[force-compact] /force-compact command registered (deferred)')
+    }
+  }
+  // NOTE: no boot-time invocation here. At `apply` execution the `commands`
+  // service is guaranteed absent (preset plane hasn't mounted yet), so a
+  // boot attempt would only emit a misleading "MISSING" diagnostic. Instead,
+  // EVERY guarded listener invokes `maybeRegisterCommand()` as its first
+  // action; the first successful attempt settles the latch permanently.
 
   // Hook the core model request: when "disable thinking" is on, every model
   // request carries reasoningEffort: 'off'. Reading the settings here (per
@@ -238,6 +268,7 @@ export function apply(ctx) {
   guard('agent/request listener', () => ctx.on('agent/request', async (payload, next) => {
     maybeInstallDebugSink()
     maybeRegisterSettingsNamespace()
+    maybeRegisterCommand()
     const config = await next()
     if (!payload || config === undefined) return config
     if (!(await thinkingDisabled(ctx))) {
@@ -264,6 +295,7 @@ export function apply(ctx) {
   guard('agent/pre-step listener', () => ctx.on('agent/pre-step', async (payload, next) => {
     maybeInstallDebugSink()
     maybeRegisterSettingsNamespace()
+    maybeRegisterCommand()
     const agent = payload && payload.agent
     const signal = payload && payload.signal
     if (agent !== undefined && agent !== null && (signal === undefined || !signal.aborted)) {
@@ -307,6 +339,9 @@ export function apply(ctx) {
   ctx.logger.info('[force-compact][diagnostic] apply END (all registrations attempted)')
 
   guard('session/flush listener', () => ctx.on('session/flush', async (session) => {
+    maybeInstallDebugSink()
+    maybeRegisterSettingsNamespace()
+    maybeRegisterCommand()
     const agents = ctx.get('agents')
     if (agents === undefined) return
     const agent = agents.get(session.id)

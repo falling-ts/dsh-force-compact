@@ -19,14 +19,21 @@ import { readRawSetting } from './settings.js'
 
 /**
  * Register the global `/force-compact` command. A no-op when the `commands`
- * service is not mounted.
+ * service is not mounted AT THIS MOMENT (typical during the window between
+ * plugin boot and the agent-presets plane activating — the caller retries
+ * on each guarded listener invocation, so a transient absence self-heals).
  * @param {import('@deepseek-ai/cordis').Context} ctx
- * @returns {boolean} whether the command was registered.
+ * @returns {boolean} whether the command was registered this call.
  */
 export function registerCommand(ctx) {
   const commands = ctx.get('commands')
   if (commands === undefined || typeof commands.register !== 'function') {
-    ctx.logger.debug('[force-compact] commands service unavailable; /force-compact not registered')
+    // Silent on purpose: a transient miss during the boot→preset-plane window
+    // is expected; the deferred-registration loop in index.js retries until
+    // `commands` appears. If the service is PERMANENTLY absent (rare — e.g. a
+    // stripped-down composition) the operator sees the symptom (slash-command
+    // picker empty) and can diagnose directly rather than chasing hundreds of
+    // boot-miss log lines.
     return false
   }
 
