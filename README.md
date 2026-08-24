@@ -116,10 +116,10 @@ with other plugins' keys):
 | --- | --- | --- | --- |
 | `disableThinking` | `boolean` | `true` | when `true`, **every model request** carries `reasoningEffort: 'off'`, which the LLM adapter maps to `thinking: { type: 'disabled' }` — the provider's thinking/reasoning is switched off for the request. Also applies to the plugin's own summarization calls. |
 | `autoThresholdTokens` | `number` | `80000` | the forced-compaction trigger threshold in tokens. **Before a model request**, the session's total context tokens (via `tokenMeter`) are measured; when they are **>= this value**, the request is rejected and a forced compaction runs instead. The `session/flush` checkpoint path also uses this threshold as its trigger gate. |
-| `autoEarliestRatio` | `number` | `0.3` | **auto compact-earliest-conversation ratio** — the fraction of the session's surface history the `agent/pre-step` threshold gate compacts from the **head** (the oldest `autoEarliestRatio` of the conversation) when it fires. |
-| `forceEarliestRatio` | `number` | `0.5` | **force compact-earliest-conversation ratio** — the fraction of the conversation the `/force-compact` command compacts from the **head** (idle → compact now; busy → queued for the next model step). |
-| `turnEndForceCompactionEnabled` | `boolean` | `true` | **enable turn-end force compaction** — when `true`, a turn-end forced compaction runs at each `turn/end`. |
-| `turnEndCompactionRatio` | `number` | `0.4` | **turn-end force compaction ratio** — the fraction of the conversation the turn-end forced compaction compacts from the **head**. |
+| `autoEarliestRatio` | `number` | `0.3` | **auto compact-earliest-conversation ratio** — the fraction of the session's **total tokens** (via `tokenMeter`) the `agent/pre-step` threshold gate compacts from the **head**. Walks surface events from the head, accumulating per-event token estimates until the budget (`totalTokens * ratio`) is met, then snaps the span end to the next `user/message` boundary. |
+| `forceEarliestRatio` | `number` | `0.5` | **force compact-earliest-conversation ratio** — the fraction of the session's **total tokens** the `/force-compact` command compacts from the **head** (idle → compact now; busy → queued for the next model step). |
+| `turnEndForceCompactionEnabled` | `boolean` | `true` | **enable turn-end force compaction** — when `true`, a forced compaction runs when the agent transitions to `idle` (all turns done, including sub-agents, before the next human turn). |
+| `turnEndCompactionRatio` | `number` | `0.4` | **turn-end force compaction ratio** — the fraction of the session's **total tokens** the turn-end forced compaction compacts from the **head** when the agent goes `idle`. |
 
 Example `$DSH_HOME/settings.yaml`:
 

@@ -12,7 +12,7 @@
  */
 
 import { queueForceCompact } from './request-guard.js'
-import { selectEarliestRatio } from './region.js'
+import { selectEarliestByTokens } from './region.js'
 import { readSettings, DEFAULTS } from './settings.js'
 
 /**
@@ -46,13 +46,17 @@ export function registerCommand(ctx) {
         return { kind: 'error', text: 'compaction service unavailable' }
       }
 
-      // Compact the earliest `forceEarliestRatio` of the conversation via
-      // `compactRegion`. When the agent is busy the compaction is rejected
+      // Compact the earliest `forceEarliestRatio` of the conversation's **tokens**
+      // via `compactRegion`. When the agent is busy the compaction is rejected
       // (throws a ManualCompactionError) — in that case queue the force flag so
       // the next model step force-compacts instead of requesting the model.
-      const region = selectEarliestRatio(session, settings.forceEarliestRatio)
+      const meter = ctx.get('tokenMeter')
+      const totalTokens = meter !== undefined && typeof meter.measure === 'function'
+        ? meter.measure(session).totalTokens
+        : undefined
+      const region = selectEarliestByTokens(session, settings.forceEarliestRatio, totalTokens)
       if (region === null) {
-        return { kind: 'success', text: `no earliest ${settings.forceEarliestRatio} region to compact` }
+        return { kind: 'success', text: `no earliest ${settings.forceEarliestRatio} token region to compact` }
       }
       try {
         const result = await compaction.compactRegion(

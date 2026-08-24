@@ -54,37 +54,111 @@ function userMessageEventSeqs(session) {
 }
 
 /**
- * Select the **earliest** `ratio` fraction of the session's surface history as a
- * head-anchored region to compact — the "earliest conversation ratio" knob.
+ * Select the **earliest** `ratio` fraction of the session's **tokens** as a
+ * head-anchored region to compact — the "earliest conversation token ratio" knob.
  *
- * The span starts at the first surface node and covers the oldest
- * `Math.max(1, Math.round(total * ratio))` nodes, then snaps the span's **end**
+ * Unlike a node-count-based selector, this measures the actual token content:
+ * it walks surface events from the head, accumulating per-event token estimates
+ * (4 chars/token heuristic), until the accumulated tokens reach
+ * `totalTokens * ratio`. The span covers every surface node from the first
+ * through the node that crosses the token budget, then snaps the span's **end**
  * forward to the next `user/message` boundary (so the compacted span ends at a
  * balanced, tool-call-safe point). Returns `null` when there is not enough
  * surface history to compact.
  *
  * @param {import('@deepseek-ai/dsh-session').Session} session
  * @param {number} ratio a fraction in (0, 1].
+ * @param {number} [totalTokens] the session's total context tokens (from
+ *   `tokenMeter.measure` or a character-based fallback); when omitted, the
+ *   function estimates the total itself.
  * @returns {{start: number, end: number} | null} the head-anchored span to compact, or `null`.
  */
-export function selectEarliestRatio(session, ratio) {
+export function selectEarliestByTokens(session, ratio, totalTokens) {
   const nodes = session.surface.nodes
   const total = nodes.length
   if (total < 2) return null
 
-  const compactCount = Math.max(1, Math.round(total * ratio))
+  // Estimate the session's total tokens (surface content only).
+  const surfaceTokens = totalTokens !== undefined
+    ? totalTokens
+    : estimateSurfaceTokens(session)
+  const budget = Math.max(1, Math.round(surfaceTokens * ratio))
+
   const userMessageSeqs = userMessageEventSeqs(session)
 
-  // The span covers nodes[0..compactCount-1]; snap its end (nodes[compactCount-1])
-  // forward to the next `user/message` boundary so the span ends balanced.
-  let endIdx = compactCount - 1
+  // Walk surface events from the head, accumulating tokens until the budget
+  // is reached. The span end is the last node whose cumulative tokens first
+  // meet or exceed the budget.
+  let accumulated = 0
+  let endIdx = 0
+  for (let i = 0; i < total; i++) {
+    const seq = nodes[i]
+    accumulated += estimateEventTokens(session, seq)
+    endIdx = i
+    if (accumulated >= budget) break
+  }
+
+  // Snap the span's end forward to the next `user/message` boundary so the
+  // compacted span ends balanced.
   while (endIdx + 1 < total && !userMessageSeqs.has(nodes[endIdx])) {
     endIdx += 1
   }
-  // The end must land on a `user/message` boundary (balanced) and be past the
-  // first node (a one-node span is not worth compacting).
   if (!userMessageSeqs.has(nodes[endIdx])) return null
   if (endIdx < 1) return null
 
   return { start: nodes[0], end: nodes[endIdx] }
+}
+
+/**
+ * Estimate the token count of a single session event's surface content
+ * (user/message, assistant/message, tool/result). Log-only events contribute 0.
+ * @param {import('@deepseek-ai/dsh-session').Session} session
+ * @param {number} seq the event's seq.
+ * @returns {number}
+ */
+function estimateEventTokens(session, seq) {
+  const event = session.events[seq]
+  if (event === undefined) return 0
+  let chars = 0
+  if (event.type === 'user/message') {
+    for (const block of event.data.content || []) {
+      if (block && typeof block.text === 'string') chars += block.text.length
+    }
+  } else if (event.type === 'assistant/message') {
+    const content = event.data.message && event.data.message.content
+    if (content) {
+      for (const block of content) {
+        if (block && typeof block.text === 'string') chars += block.text.length
+      }
+    }
+  } else if (event.type === 'tool/result') {
+    const message = event.data.message
+    if (message && message.content) {
+      for (const block of message.content) {
+        if (block && typeof block.text === 'string') chars += block.text.length
+      }
+    }
+  }
+  return Math.ceil(chars / 4)
+}
+
+/**
+ * Estimate the total token count of a session's surface content (user +
+ * assistant + tool-result messages), using a 4-chars-per-token heuristic.
+ * @param {import('@deepseek-ai/dsh-session').Session} session
+ * @returns {number}
+ */
+function estimateSurfaceTokens(session) {
+  let chars = 0
+  for (const event of session.events) {
+    let content
+    if (event.type === 'user/message') content = event.data.content
+    else if (event.type === 'assistant/message') content = event.data.message && event.data.message.content
+    else if (event.type === 'tool/result') content = event.data.message && event.data.message.content
+    if (content === undefined) continue
+    for (const block of content || []) {
+      if (block && typeof block.text === 'string') chars += block.text.length
+    }
+  }
+  return Math.ceil(chars / 4)
 }

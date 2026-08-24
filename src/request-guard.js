@@ -26,7 +26,7 @@
  */
 
 import { readSettings, DEFAULTS } from './settings.js'
-import { selectEarliestRatio } from './region.js'
+import { selectEarliestByTokens } from './region.js'
 import { compactRegion } from './compact.js'
 
 /**
@@ -127,17 +127,19 @@ async function compactAgentNow(ctx, agent, signal) {
 }
 
 /**
- * Compact the **earliest** `ratio` fraction of a session's surface history via
- * `compactRegion` (the "earliest conversation ratio" knob). Selects the head-
- * anchored span with `selectEarliestRatio` and delegates the durable mutation to
- * `ctx.compaction.compactRegion(start, end, agent, signal)`, forwarding the
- * signal (and `reasoningEffort: 'off'` when `disableThinking` is set). Resolves
- * `true` when a compaction was committed, `false` otherwise (missing service, no
- * compactable span, or a thrown error) — it never throws.
+ * Compact the **earliest** `ratio` fraction of a session's **tokens** via
+ * `compactRegion` (the "earliest conversation token ratio" knob). Measures the
+ * session's total context tokens (via `tokenMeter` or a character-based
+ * fallback), computes the token budget (`totalTokens * ratio`), selects the
+ * head-anchored span with `selectEarliestByTokens`, and delegates the durable
+ * mutation to `ctx.compaction.compactRegion(start, end, agent, signal)`,
+ * forwarding the signal (and `reasoningEffort: 'off'` when `disableThinking`
+ * is set). Resolves `true` when a compaction was committed, `false` otherwise
+ * (missing service, no compactable span, or a thrown error) — it never throws.
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @param {import('@deepseek-ai/dsh-agent').Agent} agent
  * @param {AbortSignal|undefined} signal the current turn's signal (forwarded to compaction).
- * @param {number} ratio a fraction in (0, 1] of the surface history to compact from the head.
+ * @param {number} ratio a fraction in (0, 1] of the session's tokens to compact from the head.
  * @returns {Promise<boolean>} whether a compaction was committed.
  */
 async function compactEarliestRatio(ctx, agent, signal, ratio) {
@@ -148,9 +150,15 @@ async function compactEarliestRatio(ctx, agent, signal, ratio) {
     ctx.logger.warn(`[force-compact] ${session.id}: compaction service unavailable; no compaction performed`)
     return false
   }
-  const region = selectEarliestRatio(session, ratio)
+  // Measure the session's total context tokens (authoritative when tokenMeter is
+  // mounted; character-based fallback otherwise).
+  const meter = ctx.get('tokenMeter')
+  const totalTokens = meter !== undefined && typeof meter.measure === 'function'
+    ? meter.measure(session).totalTokens
+    : undefined
+  const region = selectEarliestByTokens(session, ratio, totalTokens)
   if (region === null) {
-    ctx.logger.debug(`[force-compact] ${session.id}: no earliest ${ratio} region to compact`)
+    ctx.logger.debug(`[force-compact] ${session.id}: no earliest ${ratio} token region to compact`)
     return false
   }
   const disableThinking = settings.disableThinking === true

@@ -101,10 +101,10 @@ dsh web --patch dsh-force-compact/cordis.patch.yml
 | --- | --- | --- | --- |
 | `disableThinking` | `boolean` | `true` | 为 `true` 时，**每次模型请求**都携带 `reasoningEffort: 'off'`，LLM 适配器将其映射为 `thinking: { type: 'disabled' }`——即请求时关闭提供方的思考/推理。同样作用于插件自己的摘要调用。 |
 | `autoThresholdTokens` | `number` | `80000` | 强制压缩触发阈值（单位 tokens）。**在请求模型前**，通过 `tokenMeter` 测量会话上下文总 tokens 数；当其**达到或超过**该值时，**不请求模型**，而是强制执行一次强制压缩。`session/flush` 检查点路径也把它作为触发门禁。 |
-| `autoEarliestRatio` | `number` | `0.3` | **自动压缩最早对话比例**——`agent/pre-step` 阈值门禁触发时，从头压缩会话 surface 历史的该比例（最早 `autoEarliestRatio` 的对话）。 |
-| `forceEarliestRatio` | `number` | `0.5` | **强制压缩最早对话比例**——`/force-compact` 命令从头压缩的对话比例（空闲→立即压缩；繁忙→排队到下一个模型步骤）。 |
-| `turnEndForceCompactionEnabled` | `boolean` | `true` | **是否开启一轮结束强制压缩**——为 `true` 时，每次 `turn/end` 后强制执行一轮结束压缩。 |
-| `turnEndCompactionRatio` | `number` | `0.4` | **一轮结束强制压缩比例**——一轮结束强制压缩从头压缩的对话比例。 |
+| `autoEarliestRatio` | `number` | `0.3` | **自动压缩最早对话比例**——`agent/pre-step` 阈值门禁触发时，按 `tokenMeter` 测量的会话总 tokens 的该比例，从头累计 tokens 至预算（`totalTokens * ratio`）后截断（末端对齐 `user/message` 边界），压缩该区间。 |
+| `forceEarliestRatio` | `number` | `0.5` | **强制压缩最早对话比例**——`/force-compact` 命令按会话总 tokens 的该比例从头截断压缩（空闲→立即压缩；繁忙→排队到下一个模型步骤）。 |
+| `turnEndForceCompactionEnabled` | `boolean` | `true` | **是否开启一轮结束强制压缩**——为 `true` 时，agent 转入 `idle`（所有轮次结束，含子代理，下一次人为对话之前）时强制执行一轮结束压缩。 |
+| `turnEndCompactionRatio` | `number` | `0.4` | **一轮结束强制压缩比例**——agent 转入 `idle` 时，按会话总 tokens 的该比例从头截断压缩。 |
 
 `$DSH_HOME/settings.yaml` 示例：
 
