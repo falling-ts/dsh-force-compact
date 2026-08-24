@@ -1,7 +1,8 @@
-# Opt-in overlay: mount the Session Auto-Compact function plugin over the
+# Opt-in layer: mount the Session Auto-Compact function plugin over the
 # current composition without changing shipped defaults.
 #
-#   dsh web --patch dsh-compact/cordis.yml
+#   dsh plugin --profile web add github:falling-ts/dsh-compact   # install
+#   dsh web --patch dsh-compact/cordis.patch.yml                 # dev overlay
 #
 # The plugin auto-compacts a session's useful history into a summary node at
 # every session durability checkpoint (session/flush).

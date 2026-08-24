@@ -31,12 +31,22 @@ session/flush(session)
 
 ## Install
 
+As an installable bundle (recommended):
+
 ```sh
-# From a local copy or git:
-dsh web --patch dsh-compact/cordis.yml
+# from git:
+dsh plugin --profile web add github:falling-ts/dsh-compact
+# from a local checkout:
+dsh plugin --profile web add ./dsh-compact
 ```
 
-The overlay inserts the `auto-compact` function plugin into the current
+or, from a local checkout, as a `--patch` overlay without installing:
+
+```sh
+dsh web --patch dsh-compact/cordis.patch.yml
+```
+
+The layer inserts the `auto-compact` function plugin into the current
 composition without changing shipped defaults.
 
 ## Behavior notes

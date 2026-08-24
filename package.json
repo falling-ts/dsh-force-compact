@@ -4,13 +4,18 @@
   "version": "0.1.0",
   "type": "module",
   "main": "index.js",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
   "exports": {
     ".": "./index.js",
     "./package.json": "./package.json"
   },
   "files": [
     "index.js",
-    "cordis.yml",
+    "cordis.patch.yml",
     "README.md",
     "README.cn.md"
   ],

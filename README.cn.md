@@ -28,13 +28,23 @@ session/flush(session)
 
 ## 安装
 
+作为可安装 bundle（推荐）：
+
 ```sh
-# 从本地副本或 git：
-dsh web --patch dsh-compact/cordis.yml
+# 从 git：
+dsh plugin --profile web add github:falling-ts/dsh-compact
+# 从本地检出：
+dsh plugin --profile web add ./dsh-compact
 ```
 
-该 overlay 把 `auto-compact` 函数插件插入当前组合（composition），不改动默认
-发布配置。
+或从本地检出，以 `--patch` overlay 挂载（不安装）：
+
+```sh
+dsh web --patch dsh-compact/cordis.patch.yml
+```
+
+该层把 `auto-compact` 函数插件插入当前组合（composition），不改动默认发布
+配置。
 
 ## 行为说明
 
