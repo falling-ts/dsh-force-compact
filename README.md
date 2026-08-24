@@ -3,38 +3,74 @@
 English | [中文](README.cn.md)
 
 `@falling-ts/dsh-force-compact` is a DSH **Cordis function plugin** that
-compacts a session's useful history at every session durability checkpoint
-(`session/flush`). It owns its region-selection policy and LLM summarizer, then
-delegates the durable surface mutation to the `compaction` service.
+**hooks the core model-request seam**. On every model request it reads the
+"强制压缩配置" (force-compact) settings and:
+
+- disables **thinking/reasoning** on the request when `disableThinking` is on,
+  and
+- **force-compacts** the session's context (instead of calling the model) when
+  the session's total context tokens reach `autoThresholdTokens`.
+
+It additionally compacts useful history at every session durability checkpoint
+(`session/flush`), owning its region-selection policy and LLM summarizer and
+delegating the durable surface mutation to the `compaction` service.
 
 ## How it works
 
-- Listens to **`session/flush`** — an awaited `parallel` durability checkpoint.
-  Because the checkpoint awaits every listener, the compaction finishes before
-  the caller proceeds, so the summary is durable.
-- Resolves the session's live `Agent` via the `agents` service.
-- **`src/region.js`** — the plugin's own head-anchored region selection: retain
-  a recent tail (by surface-node count) and end the span on a `user/message`
-  boundary (always a balanced boundary).
+The plugin hooks the official model-request Waterfalls so the decision is made
+**right before a model request is made** (the "hook the core model request"
+requirement), plus the durability checkpoint:
+
+- **`agent/request`** — a Waterfall around the frozen call configuration. When
+  `disableThinking` is on, the returned `LlmCallConfig` carries
+  `reasoningEffort: 'off'`, which the LLM adapter maps to
+  `thinking: { type: 'disabled' }`. Every model request in the process is
+  therefore sent with thinking disabled. The settings are read here (per
+  request), so a `settings.yaml` edit is picked up on the next request.
+- **`agent/pre-step`** — a Waterfall before each model step. It reads the
+  session's **total context tokens** through the `tokenMeter` service. When the
+  total is **>= `autoThresholdTokens`**, it returns `{ kind: 'reject' }` so the
+  model request is **not** made, and runs a **forced compaction** via
+  `ctx.compaction.compactNow` (which condenses the useful history and lets the
+  loop retry with a smaller context).
+- **`session/flush`** — an awaited `parallel` durability checkpoint. Because
+  the checkpoint awaits every listener, the compaction finishes before the
+  caller proceeds, so the summary is durable.
+
+Supporting modules:
+
+- **`src/request-guard.js`** — the per-request guard: `agent/request`
+  thinking-off + `agent/pre-step` threshold gate + forced compaction.
+- **`src/region.js`** — the plugin's own head-anchored region selection (used by
+  the checkpoint path): retain a recent tail (by surface-node count) and end
+  the span on a `user/message` boundary (always a balanced boundary).
 - **`src/summarizer.js`** — the plugin's own one-shot LLM summarizer: replays
   the region's messages, appends a compaction directive as the final user
   message, streams through `ctx.llm`, and returns the condensed checkpoint.
-- **`src/compact.js`** — the orchestrator: select region → project region
-  messages → run the preview + shrink gate → delegate the durable mutation to
-  **`ctx.compaction.compactRegion(start, end, agent, signal)`**, which is the
-  authoritative summarizer.
+- **`src/compact.js`** — the checkpoint orchestrator: select region → project
+  region messages → run the preview + shrink gate → delegate the durable
+  mutation to **`ctx.compaction.compactRegion(start, end, agent, signal)`**,
+  which is the authoritative summarizer.
 
 ```
-session/flush(session)
-   └─ session.id
-   └─ agents.get(session.id)          → live Agent (skip if absent)
-   └─ src/compact.js
-        ├─ region.select(session)     → {start, end} or null (skip)
-        ├─ projectRegionMessages()    → region messages
-        ├─ summarizer.summarize()     → preview + shrink gate
-        └─ compaction.compactRegion(start, end, agent, signal)
-             ├─ null  → no-op (nothing useful to compact)
-             └─ result → compacted the span into one summary node
+agent/request(payload, next)              # every model request
+    settings.get("force-compact") -> disableThinking?
+        return { ...config, reasoningEffort: "off" }   # thinking off
+
+agent/pre-step(payload, next)             # before each model step
+    tokenMeter.measure(session).totalTokens >= autoThresholdTokens?
+        no  -> next()                      # let the model request proceed
+        yes -> compaction.compactNow(agent, signal)   # force compact
+              return { kind: "reject" }    # NO model request this step
+
+session/flush(session)                    # durability checkpoint
+    agents.get(session.id)                -> live Agent (skip if absent)
+    region.select(session)                -> {start, end} or null (skip)
+    projectRegionMessages()               -> region messages
+    summarizer.summarize()                -> preview + shrink gate
+    compaction.compactRegion(start, end, agent, signal)
+        null   -> no-op (nothing useful to compact)
+        result -> compacted the span into one summary node
 ```
 
 ## Install
@@ -66,8 +102,8 @@ settings namespace so two parameters are user-tunable from
 
 | key | type | default | effect |
 | --- | --- | --- | --- |
-| `disableThinking` | `boolean` | `true` | when `true`, the plugin's summarization request carries `reasoningEffort: 'off'`, which the LLM adapter maps to `thinking: { type: 'disabled' }` — the provider's thinking/reasoning is switched off for the compaction summarization call. |
-| `autoThresholdTokens` | `number` | `120000` | the automatic compaction trigger threshold in tokens. Compaction runs only when the session's estimated total context is **at least** this many tokens; below it, the checkpoint is skipped. |
+| `disableThinking` | `boolean` | `true` | when `true`, **every model request** carries `reasoningEffort: 'off'`, which the LLM adapter maps to `thinking: { type: 'disabled' }` — the provider's thinking/reasoning is switched off for the request. Also applies to the plugin's own summarization calls. |
+| `autoThresholdTokens` | `number` | `120000` | the forced-compaction trigger threshold in tokens. **Before a model request**, the session's total context tokens (via `tokenMeter`) are measured; when they are **>= this value**, the request is rejected and a forced compaction runs instead. The `session/flush` checkpoint path also uses this threshold as its trigger gate. |
 
 Example `$DSH_HOME/settings.yaml`:
 
@@ -84,14 +120,23 @@ a hard dependency.
 ## Behavior notes
 
 - **Hard dependency:** the `compaction` service. Without it the plugin does
-  nothing.
-- **Optional dependency:** the `agents` service. If a flush fires after the
-  session's Agent is already unregistered, the plugin logs
-  `no live agent … — skipping` and skips that checkpoint.
+  nothing (the forced-compaction path falls through and lets the request
+  proceed).
+- **Optional dependency:** the `agents` service. Used only by the `session/flush`
+  checkpoint path; if a flush fires after the Agent is unregistered, the plugin
+  logs `no live agent … — skipping` and skips that checkpoint. The `agent/*`
+  Waterfalls receive the `Agent` in their payload and need no `agents` lookup.
 - **Optional dependency:** the `settings` service. When absent, the two
-  parameters resolve to their defaults.
-- **Signal:** the compaction is fire-and-forget at the checkpoint; a fresh
-  `AbortController` is minted per flush.
+  parameters resolve to their defaults (`disableThinking: true`,
+  `autoThresholdTokens: 120000`).
+- **Optional dependency:** the `tokenMeter` service. Used by the `agent/pre-step`
+  threshold gate; when absent, the gate falls back to a coarse character-based
+  estimate of the session's surface content.
+- **Per-request settings read:** both parameters are read **per model request**
+  (synchronous `settings.get('force-compact')`), so a `settings.yaml` edit is
+  picked up on the next request without a restart.
+- **Signal:** the `agent/*` Waterfalls forward the current turn's signal; the
+  `session/flush` checkpoint mints a fresh `AbortController` per flush.
 
 ## Known limitations
 
@@ -102,6 +147,10 @@ a hard dependency.
   ordering matters to you.
 - The plugin's own summarizer is a **pre-commit preview + shrink gate**; the
   durable summary content is the `compaction` service's authoritative one.
+- The forced-compaction gate **rejects the proposed model step** when the
+  threshold is reached, then relies on the loop retrying against the shrunken
+  context. If `compactNow` finds no safe range (e.g. nothing useful left to
+  compact), the request proceeds as-is rather than looping.
 - No client/browser UI is registered; the plugin is Host-only. The two
   parameters are tunable through the `force-compact` settings namespace (a
   future dynamic client plugin may read it to expose a settings page), and the

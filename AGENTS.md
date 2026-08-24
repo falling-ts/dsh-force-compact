@@ -2,20 +2,25 @@
 
 本规则适用于 `dsh-force-compact/`，并补充[集合约定](../AGENTS.md)。
 
-- 插件唯一的持久效果是 `compaction` 服务追加到会话日志的摘要节点；插件不引入其他状态。不要引入 timer、内存态存储或 client UI——保持它是 `session/flush` 上的纯 Host 监听器。
-- `compaction` 是硬依赖（`inject` + `ctx.compaction`）。`agents` 是可选依赖（`ctx.get('agents')`，对 `undefined` 做守卫）；缺少 Agent 是记录日志后跳过，而非错误。`settings` 也是可选依赖（`ctx.get('settings')`，对 `undefined` 做守卫）；缺少 `settings` 服务时两个参数回退到默认值，压缩照常进行。
+- 插件唯一的持久效果是 `compaction` 服务追加到会话日志的摘要节点；插件不引入其他状态。不要引入 timer、内存态存储或 client UI——保持它是**核心模型请求缝**（`agent/request` / `agent/pre-step`）与 `session/flush` 上的纯 Host 监听器。
+- `compaction` 是硬依赖（`inject` + `ctx.compaction`）。`agents`、`settings`、`tokenMeter` 都是可选依赖（`ctx.get(...)`，对 `undefined` 做守卫）：`agents` 仅供 `session/flush` 路径（缺少 Agent 是记录日志后跳过）；缺少 `settings` 时两个参数回退到默认值；缺少 `tokenMeter` 时阈值门禁回退到粗略字符估算。
+- **钩住核心模型请求（`agent/request` / `agent/pre-step`）：** 插件的核心行为是钩住官方模型请求缝，**每次请求模型前**读取设置：
+  - **`agent/request`**（围绕冻结调用配置的 Waterfall）——`disableThinking` 为 `true` 时，返回的 `LlmCallConfig` 携带 `reasoningEffort: 'off'`（适配器映射为 `thinking: { type: 'disabled' }`），即**每次模型请求**都关闭思考。监听器 `await next()` 取得机器本会使用的配置，再返回替换值；**不得**在缺少 `next()` 时短路（必须调用 `next()`）。
+  - **`agent/pre-step`**（每个模型步骤前的 Waterfall）——通过 `tokenMeter.measure(session).totalTokens` 读取会话上下文总 tokens；当其**≥ `autoThresholdTokens`** 时，返回 `{ kind: 'reject' }` **不发起模型请求**，并通过 `ctx.compaction.compactNow(agent, signal)` 执行**强制压缩**；低于阈值时调用 `next()` 让请求继续。强制压缩失败（无安全区间 / 已活跃）时降级为 `next()`，绝不阻塞请求。
+  - 两个参数都**每次请求**通过同步 `settings.get('force-compact')` 读取，因此 `settings.yaml` 的改动在下一次请求即生效。
 - **强制压缩配置（`force-compact` 设置命名空间）：** 当 `settings` 服务挂载时，`apply` 注册 `force-compact` 命名空间（`src/settings.js`），两个参数可从 `$DSH_HOME/settings.yaml` 配置：
-  - `disableThinking`（`boolean`，默认 `true`）——为 `true` 时摘要请求携带 `reasoningEffort: 'off'`（适配器映射为 `thinking: { type: 'disabled' }`），即压缩摘要调用时关闭思考。
-  - `autoThresholdTokens`（`number`，默认 `120000`）——自动压缩触发阈值；仅当会话估算总上下文 ≥ 该值时才压缩，低于则跳过。
-  - 命名空间注册在 `ctx.effect` 中完成（`apply` 启动时一次性异步执行）；`registerNamespace` 在 `settings` 缺失时是 no-op，绝不阻塞 `session/flush` 监听器的注册。
+  - `disableThinking`（`boolean`，默认 `true`）——为 `true` 时**每次模型请求**（以及插件自己的摘要调用）携带 `reasoningEffort: 'off'`（适配器映射为 `thinking: { type: 'disabled' }`），即关闭思考。
+  - `autoThresholdTokens`（`number`，默认 `120000`）——强制压缩触发阈值；`agent/pre-step` 仅在会话总上下文 tokens ≥ 该值时强制压缩，低于则跳过。
+  - 命名空间注册在 `ctx.effect` 中完成（`apply` 启动时一次性异步执行）；`registerNamespace` 在 `settings` 缺失时是 no-op，绝不阻塞 `agent/*` / `session/flush` 监听器的注册。
 - 监听器是异步且被依赖的：`session/flush` 是被等待（awaited）的 `parallel` 检查点，因此压缩必须在监听器返回前完成。不要把它拆成 fire-and-forget，除非显式说明持久性保证。
 - 每次 flush 新建一个 `AbortController`（被等待的检查点覆盖其生命周期）；把它的 `signal` 传给摘要器与 `compactRegion`。
 - 压缩实现位于 `src/`：
   - `src/config.js` —— 可调参数（固定常量，非 cordis `Config` 字段）。
   - `src/region.js` —— 插件自己的 head-anchored 区间选择（按 surface 节点数保留最近尾段；把区间末端对齐到 `user/message` 边界，使委托的 `compactRegion` 不会因未配对的工具调用而拒绝）。
   - `src/summarizer.js` —— 插件自己的一次性 LLM 摘要器（回放区间，追加压缩指令，通过 `ctx.llm` 流式生成）。
-  - `src/compact.js` —— 编排器：选区间 → 投影区间消息 → 运行预览 + 收缩门禁 → 把持久变更委托给 `ctx.compaction.compactRegion(start, end, agent, signal)`。
-  - `src/index.js` —— Cordis 函数插件入口（`name` / `inject` / `apply`）。
+  - `src/compact.js` —— 检查点编排器：选区间 → 投影区间消息 → 运行预览 + 收缩门禁 → 把持久变更委托给 `ctx.compaction.compactRegion(start, end, agent, signal)`。
+  - `src/request-guard.js` —— 每次请求的门禁：`agent/request` 关闭思考（`reasoningEffort: 'off'`）+ `agent/pre-step` 阈值门禁 + 强制压缩（`compactNow`）。
+  - `src/index.js` —— Cordis 函数插件入口（`name` / `inject` / `apply`），注册 `agent/request` / `agent/pre-step` / `session/flush` 三个监听器与设置命名空间。
 - 插件自己的摘要器是**预提交预览 + 收缩门禁**：它在提交前验证压缩是否值得。持久摘要内容由 `compaction` 服务权威生成（`compactRegion` 重新摘要并提交）。不要在持久路径上重复摘要。
 - Monorepo 集成会把它包进 `src/index.ts`，并新增一个真实组合（REAL-composition）测试：启动仅测试用的 `cordis.yml` 并断言持久的摘要节点；本独立产物是 plain JS，无构建步骤。
 
