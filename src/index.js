@@ -26,6 +26,7 @@
  * - `compact.js`      — the checkpoint orchestrator: region → preview → delegate to `compactRegion`.
  * - `settings.js`     — the `falling-ts-force-compact` settings namespace (the two parameters).
  * - `request-guard.js`— the per-request guard: threshold gate + forced compaction + thinking-off.
+ * - `command.js`      — the `/force-compact` slash command (idle → compact now; busy → queue a force flag).
  *
  * @module @falling-ts/dsh-force-compact
  */
@@ -33,6 +34,7 @@
 import { compactSession } from './compact.js'
 import { registerNamespace } from './settings.js'
 import { forceCompactIfNeeded, thinkingDisabled } from './request-guard.js'
+import { registerCommand } from './command.js'
 
 /** @type {string} the function plugin's display name. */
 export const name = 'force-compact'
@@ -59,6 +61,13 @@ export function apply(ctx) {
     const registered = await registerNamespace(ctx)
     if (registered) ctx.logger.debug('[force-compact] registered settings namespace "falling-ts-force-compact"')
   }, 'falling-ts-force-compact: settings namespace')
+
+  // Register the `/force-compact` slash command (idle → compact now; busy →
+  // queue a force flag the `agent/pre-step` hook consumes). No-op when the
+  // `commands` service is absent.
+  ctx.effect(() => {
+    if (registerCommand(ctx)) ctx.logger.debug('[force-compact] registered /force-compact command')
+  }, 'force-compact: /force-compact command')
 
   // Hook the core model request: when "disable thinking" is on, every model
   // request carries reasoningEffort: 'off'. Reading the settings here (per

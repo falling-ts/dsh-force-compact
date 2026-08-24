@@ -28,11 +28,19 @@
   上下文重试）。
 - **`session/flush`** —— 一个被等待（awaited）的 `parallel` 持久化检查点。检查点
   会等待所有监听器完成，因此压缩在调用方继续之前就已结束，摘要保证落盘。
+- **`/force-compact`** —— 通过 `/` 选择执行的斜杠命令，强制压缩该 Agent 的会话
+  上下文。其 handler **不发送模型请求**，因此可对**繁忙**的 Agent 生效：空闲时
+  立即压缩；Agent 正在处理（繁忙）时，**插入一个 process-local 强制标记**（JS
+  内存记录，无持久态、无 timer），由 `agent/pre-step` 钩子在下一个模型步骤读取。
+  读到强制标记时，该步骤**跳过 token 阈值门禁**、立即强制压缩，并返回
+  `{ kind: 'reject' }` **不再请求模型**。
 
 支撑模块：
 
 - **`src/request-guard.js`** —— 每次请求的门禁：`agent/request` 关闭思考 +
-  `agent/pre-step` 阈值门禁 + 强制压缩。
+  `agent/pre-step` 阈值门禁 + 强制压缩 + `/force-compact` 的 process-local 强制标记。
+- **`src/command.js`** —— `/force-compact` 斜杠命令（空闲直接压缩；繁忙时插入
+  强制标记，待下一个模型步骤消费）。
 - **`src/region.js`** —— 插件自己的 head-anchored 区间选择（供检查点路径使用）：
   按 surface 节点数保留最近尾段，并把区间末端对齐到 `user/message` 边界（始终
   是一个平衡边界）。

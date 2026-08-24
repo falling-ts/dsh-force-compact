@@ -1,7 +1,7 @@
 {
   "name": "@falling-ts/dsh-force-compact",
   "version": "0.1.0",
-  "description": "DSH Cordis plugin: hooks the core model-request seam (agent/pre-step + agent/request) to force-compact a session's context and disable thinking per the \"强制压缩配置\" settings namespace (disableThinking, autoThresholdTokens). Also compacts at each session/flush durability checkpoint. Host-only, pure listener.",
+  "description": "DSH Cordis plugin: hooks the core model-request seam (agent/pre-step + agent/request) to force-compact a session's context and disable thinking per the \"强制压缩配置\" settings namespace (disableThinking, autoThresholdTokens). Exposes a /force-compact slash command (busy agent → queue a force flag consumed at the next model step). Also compacts at each session/flush durability checkpoint. Host-only, pure listener.",
   "type": "module",
   "main": "./src/index.js",
   "exports": {
@@ -27,6 +27,7 @@
     "thinking",
     "reasoningEffort",
     "agent/pre-step",
-    "agent/request"
+    "agent/request",
+    "slash-command"
   ]
 }

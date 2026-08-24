@@ -36,11 +36,22 @@ requirement), plus the durability checkpoint:
 - **`session/flush`** — an awaited `parallel` durability checkpoint. Because
   the checkpoint awaits every listener, the compaction finishes before the
   caller proceeds, so the summary is durable.
+- **`/force-compact`** — a slash command (selected from the `/` list) that
+  force-compacts the agent's session. Its handler runs **without sending the
+  line to the model**, so it can act on a **busy** agent: when idle it compacts
+  immediately; when the agent is mid-turn it inserts a **process-local force
+  flag** (a JS memory record — no durable state, no timer) that the
+  `agent/pre-step` hook reads at the next model step. When the flag is present,
+  that step **skips the token threshold**, force-compacts immediately, and
+  returns `{ kind: 'reject' }` so the model request is **not** made.
 
 Supporting modules:
 
 - **`src/request-guard.js`** — the per-request guard: `agent/request`
-  thinking-off + `agent/pre-step` threshold gate + forced compaction.
+  thinking-off + `agent/pre-step` threshold gate + forced compaction + the
+  `/force-compact` process-local force flag.
+- **`src/command.js`** — the `/force-compact` slash command (idle → compact
+  now; busy → queue the force flag for the next model step).
 - **`src/region.js`** — the plugin's own head-anchored region selection (used by
   the checkpoint path): retain a recent tail (by surface-node count) and end
   the span on a `user/message` boundary (always a balanced boundary).
