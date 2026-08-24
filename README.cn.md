@@ -2,7 +2,7 @@
 
 [English](README.md) | 中文
 
-`@deepseek-ai/dsh-compact` 是一个 DSH **Cordis 函数插件**，在每次会话
+`@falling-ts/dsh-compact` 是一个 DSH **Cordis 函数插件**，在每次会话
 持久化检查点（`session/flush`）时，把该会话中有用的历史自动压缩为一个摘要
 节点。当会话的缓冲事件即将落盘时，插件把可压缩的区间做摘要，使持久日志保持
 精简。

@@ -13,7 +13,7 @@
  * (nothing useful to compact), so repeated flushes are harmless, and the
  * service prevents concurrent compaction of the same session.
  *
- * @module @deepseek-ai/dsh-compact
+ * @module @falling-ts/dsh-compact
  */
 
 /** Cordis function-plugin name. */

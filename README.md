@@ -2,7 +2,7 @@
 
 English | [中文](README.cn.md)
 
-`@deepseek-ai/dsh-compact` is a DSH **Cordis function plugin** that
+`@falling-ts/dsh-compact` is a DSH **Cordis function plugin** that
 automatically compacts a session's useful history into a single summary node at
 every session durability checkpoint. When a session's buffered events are about
 to reach durable storage, the plugin summarizes the compactable span so the

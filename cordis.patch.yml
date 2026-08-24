@@ -9,4 +9,4 @@
 
 - insert:
     - id: auto-compact
-      name: '@deepseek-ai/dsh-compact'
+      name: '@falling-ts/dsh-compact'

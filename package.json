@@ -1,5 +1,5 @@
 {
-  "name": "@deepseek-ai/dsh-compact",
+  "name": "@falling-ts/dsh-compact",
   "description": "Automatically compact a session's useful history into a summary node at every session durability checkpoint",
   "version": "0.1.0",
   "type": "module",
