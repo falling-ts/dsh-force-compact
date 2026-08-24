@@ -2,8 +2,9 @@
  * dsh-force-compact settings — the "强制压缩配置" (Force-Compact Configuration)
  * surface.
  *
- * Two user-tunable parameters are registered under the `force-compact`
- * settings namespace so the harness settings panel can expose and persist them:
+ * Two user-tunable parameters are registered under the `falling-ts-force-compact`
+ * settings namespace so the harness settings panel can expose and persist them
+ * (the `falling-ts-` prefix prevents collisions with other plugins' keys):
  *
  * - `disableThinking` (boolean, default `true`): when true, the plugin's
  *   compaction summarization request carries `reasoningEffort: 'off'`, which
@@ -24,8 +25,15 @@
  * @module @falling-ts/dsh-force-compact/settings
  */
 
-/** The settings namespace id for the force-compact configuration. */
-export const NS = 'force-compact'
+/**
+ * The settings namespace id for the force-compact configuration.
+ *
+ * Prefixed `falling-ts-` so it cannot collide with another plugin's
+ * `force-compact` namespace — the `falling-ts` vendor prefix is shared by
+ * every setting key this project owns. It is the top-level key in
+ * `$DSH_HOME/settings.yaml`.
+ */
+export const NS = 'falling-ts-force-compact'
 
 /**
  * Composition defaults for the two parameters. These are the `base` layer the
@@ -61,7 +69,7 @@ export async function readSettings(ctx) {
 }
 
 /**
- * Build the force-compact settings schema through `@deepseek-ai/schemastery`.
+ * Build the `falling-ts-force-compact` settings schema through `@deepseek-ai/schemastery`.
  *
  * @returns {Promise<((section: unknown) => unknown) & { toJSON: () => unknown } | null>}
  *   the schemastery schema (a callable validator with a `toJSON`), or `null`
@@ -83,7 +91,7 @@ export async function buildSchema() {
 }
 
 /**
- * Register the `force-compact` settings namespace when a `settings` service is
+ * Register the `falling-ts-force-compact` settings namespace when a `settings` service is
  * mounted. Idempotent for the calling fiber; safe to call once in `apply`.
  *
  * @param {import('@deepseek-ai/cordis').Context} ctx

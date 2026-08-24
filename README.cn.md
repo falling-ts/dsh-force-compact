@@ -3,7 +3,7 @@
 [English](README.md) | 中文
 
 `@falling-ts/dsh-force-compact` 是一个 DSH **Cordis 函数插件**，**钩住官方的核心
-模型请求**。每次请求模型前都会读取"强制压缩配置"（`force-compact`）设置：
+模型请求**。每次请求模型前都会读取"强制压缩配置"（`falling-ts-force-compact`）设置：
 
 - 当 `disableThinking` 开启时，在**请求参数中强制关闭思考/推理**；
 - 当会话上下文总 tokens 数**达到** `autoThresholdTokens` 时，**不请求模型**，
@@ -44,7 +44,7 @@
 
 ```
 agent/request(payload, next)              # 每次模型请求
-    settings.get("force-compact") -> disableThinking?
+    settings.get("falling-ts-force-compact") -> disableThinking?
         return { ...config, reasoningEffort: "off" }   # 关闭思考
 
 agent/pre-step(payload, next)             # 每个模型步骤之前
@@ -86,8 +86,8 @@ dsh web --patch dsh-force-compact/cordis.patch.yml
 ## 设置（强制压缩配置）
 
 当 `settings` 服务已挂载（web bundle 通过 `@deepseek-ai/dsh-settings-file` 始终
-挂载它）时，插件会注册 `force-compact` 设置命名空间，使两个参数可从
-`$DSH_HOME/settings.yaml` 配置：
+挂载它）时，插件会注册 `falling-ts-force-compact` 设置命名空间，使两个参数可从
+`$DSH_HOME/settings.yaml` 配置（`falling-ts-` 前缀用于防止与其他插件的键冲突）：
 
 | 键 | 类型 | 默认值 | 作用 |
 | --- | --- | --- | --- |
@@ -97,7 +97,7 @@ dsh web --patch dsh-force-compact/cordis.patch.yml
 `$DSH_HOME/settings.yaml` 示例：
 
 ```yaml
-force-compact:
+falling-ts-force-compact:
   disableThinking: true
   autoThresholdTokens: 120000
 ```
@@ -117,7 +117,7 @@ force-compact:
 - **可选依赖：** `tokenMeter` 服务。供 `agent/pre-step` 阈值门禁使用；不存在时，
   门禁回退到对会话 surface 内容的粗略字符估算。
 - **每次请求读取设置：** 两个参数都**每次模型请求**读取
-  （同步 `settings.get('force-compact')`），因此 `settings.yaml` 的改动在下一次
+  （同步 `settings.get('falling-ts-force-compact')`），因此 `settings.yaml` 的改动在下一次
   请求即生效，无需重启。
 - **信号（signal）：** `agent/*` Waterfall 转发当前 turn 的 signal；
   `session/flush` 检查点每次 flush 新建一个 `AbortController`。
@@ -134,5 +134,5 @@ force-compact:
   上下文重试。若 `compactNow` 找不到安全区间（例如已无可压缩的有用内容），
   则让请求按原样继续，而非循环。
 - 不注册任何 client/browser UI；插件是纯 Host 插件。两个参数可通过
-  `force-compact` 设置命名空间调参（未来某个动态 client 插件可读取它来提供
-  设置页面），并可通过 `[force-compact]` 日志行与持久日志观察。
+  `falling-ts-force-compact` 设置命名空间调参（未来某个动态 client 插件可读取它
+  来提供设置页面），并可通过 `[force-compact]` 日志行与持久日志观察。

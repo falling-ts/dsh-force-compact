@@ -4,7 +4,7 @@ English | [中文](README.cn.md)
 
 `@falling-ts/dsh-force-compact` is a DSH **Cordis function plugin** that
 **hooks the core model-request seam**. On every model request it reads the
-"强制压缩配置" (force-compact) settings and:
+"强制压缩配置" (`falling-ts-force-compact`) settings and:
 
 - disables **thinking/reasoning** on the request when `disableThinking` is on,
   and
@@ -54,7 +54,7 @@ Supporting modules:
 
 ```
 agent/request(payload, next)              # every model request
-    settings.get("force-compact") -> disableThinking?
+    settings.get("falling-ts-force-compact") -> disableThinking?
         return { ...config, reasoningEffort: "off" }   # thinking off
 
 agent/pre-step(payload, next)             # before each model step
@@ -96,9 +96,10 @@ composition without changing shipped defaults.
 ## Settings (强制压缩配置)
 
 When the `settings` service is mounted (the web bundle always mounts it via
-`@deepseek-ai/dsh-settings-file`), the plugin registers a `force-compact`
-settings namespace so two parameters are user-tunable from
-`$DSH_HOME/settings.yaml`:
+`@deepseek-ai/dsh-settings-file`), the plugin registers the
+`falling-ts-force-compact` settings namespace so two parameters are user-tunable
+from `$DSH_HOME/settings.yaml` (the `falling-ts-` prefix prevents collisions
+with other plugins' keys):
 
 | key | type | default | effect |
 | --- | --- | --- | --- |
@@ -108,7 +109,7 @@ settings namespace so two parameters are user-tunable from
 Example `$DSH_HOME/settings.yaml`:
 
 ```yaml
-force-compact:
+falling-ts-force-compact:
   disableThinking: true
   autoThresholdTokens: 120000
 ```
@@ -133,8 +134,8 @@ a hard dependency.
   threshold gate; when absent, the gate falls back to a coarse character-based
   estimate of the session's surface content.
 - **Per-request settings read:** both parameters are read **per model request**
-  (synchronous `settings.get('force-compact')`), so a `settings.yaml` edit is
-  picked up on the next request without a restart.
+  (synchronous `settings.get('falling-ts-force-compact')`), so a `settings.yaml`
+  edit is picked up on the next request without a restart.
 - **Signal:** the `agent/*` Waterfalls forward the current turn's signal; the
   `session/flush` checkpoint mints a fresh `AbortController` per flush.
 
@@ -152,6 +153,7 @@ a hard dependency.
   context. If `compactNow` finds no safe range (e.g. nothing useful left to
   compact), the request proceeds as-is rather than looping.
 - No client/browser UI is registered; the plugin is Host-only. The two
-  parameters are tunable through the `force-compact` settings namespace (a
-  future dynamic client plugin may read it to expose a settings page), and the
-  plugin is observable through `[force-compact]` log lines and the durable log.
+  parameters are tunable through the `falling-ts-force-compact` settings
+  namespace (a future dynamic client plugin may read it to expose a settings
+  page), and the plugin is observable through `[force-compact]` log lines and
+  the durable log.

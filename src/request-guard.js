@@ -19,7 +19,7 @@
  *   history and lets the loop retry with a smaller context.
  *
  * Both settings are read **per request** through the synchronous
- * `settings.get('force-compact')` so a `settings.yaml` edit is picked up on the
+ * `settings.get('falling-ts-force-compact')` so a `settings.yaml` edit is picked up on the
  * next model request without a restart.
  *
  * @module @falling-ts/dsh-force-compact/request-guard

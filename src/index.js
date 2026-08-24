@@ -24,7 +24,7 @@
  * - `region.js`       — the plugin's own head-anchored region selection.
  * - `summarizer.js`   — the plugin's own one-shot LLM summarizer (preview + shrink gate).
  * - `compact.js`      — the checkpoint orchestrator: region → preview → delegate to `compactRegion`.
- * - `settings.js`     — the `force-compact` settings namespace (the two parameters).
+ * - `settings.js`     — the `falling-ts-force-compact` settings namespace (the two parameters).
  * - `request-guard.js`— the per-request guard: threshold gate + forced compaction + thinking-off.
  *
  * @module @falling-ts/dsh-force-compact
@@ -42,7 +42,7 @@ export const inject = ['compaction']
 
 /**
  * Register the model-request Waterfalls, the `session/flush` listener, and the
- * `force-compact` settings namespace (the "强制压缩配置" surface).
+ * `falling-ts-force-compact` settings namespace (the "强制压缩配置" surface).
  *
  * `compaction` is a hard dependency (`inject`). The `agents`, `settings`, and
  * `tokenMeter` services are optional: each is read with `ctx.get(...)` and
@@ -57,8 +57,8 @@ export function apply(ctx) {
   // `registerNamespace` is a no-op returning `false` when `settings` is absent.
   ctx.effect(async () => {
     const registered = await registerNamespace(ctx)
-    if (registered) ctx.logger.debug('[force-compact] registered settings namespace "force-compact"')
-  }, 'force-compact: settings namespace')
+    if (registered) ctx.logger.debug('[force-compact] registered settings namespace "falling-ts-force-compact"')
+  }, 'falling-ts-force-compact: settings namespace')
 
   // Hook the core model request: when "disable thinking" is on, every model
   // request carries reasoningEffort: 'off'. Reading the settings here (per
