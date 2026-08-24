@@ -1,39 +1,26 @@
 {
-  "name": "@falling-ts/dsh-compact",
-  "description": "Automatically compact a session's useful history into a summary node at every session durability checkpoint",
+  "name": "@falling-ts/dsh-force-compact",
   "version": "0.1.0",
+  "description": "DSH Cordis plugin: compact a session's useful history at each session/flush durability checkpoint (Host-only, pure listener).",
   "type": "module",
-  "main": "index.js",
-  "dsh": {
-    "bundle": {
-      "patch": "./cordis.patch.yml"
-    }
-  },
+  "main": "./src/index.js",
   "exports": {
-    ".": "./index.js",
-    "./package.json": "./package.json"
+    ".": "./src/index.js"
   },
   "files": [
-    "index.js",
-    "cordis.patch.yml",
-    "README.md",
-    "README.cn.md"
+    "src/",
+    "cordis.patch.yml"
   ],
   "license": "MIT",
-  "publishConfig": {
-    "access": "public"
-  },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/falling-ts/dsh-compact.git"
+    "url": "git+https://github.com/falling-ts/dsh-force-compact.git"
   },
   "keywords": [
-    "deepseek-harness",
     "dsh",
     "cordis",
-    "plugin",
     "compaction",
-    "session",
-    "auto-compact"
+    "auto-compact",
+    "session"
   ]
 }

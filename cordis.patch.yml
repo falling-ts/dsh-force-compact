@@ -1,12 +1,13 @@
-# Opt-in layer: mount the Session Auto-Compact function plugin over the
+# Opt-in layer: mount the dsh-force-compact function plugin over the
 # current composition without changing shipped defaults.
 #
-#   dsh plugin --profile web add github:falling-ts/dsh-compact   # install
-#   dsh web --patch dsh-compact/cordis.patch.yml                 # dev overlay
+#   dsh plugin --profile web add github:falling-ts/dsh-force-compact   # install
+#   dsh web --patch dsh-force-compact/cordis.patch.yml                 # dev overlay
 #
-# The plugin auto-compacts a session's useful history into a summary node at
-# every session durability checkpoint (session/flush).
+# The plugin compacts a session's useful history at every session durability
+# checkpoint (session/flush), using its own region policy + LLM summarizer and
+# delegating the durable mutation to the `compaction` service.
 
 - insert:
-    - id: auto-compact
-      name: '@falling-ts/dsh-compact'
+    - id: force-compact
+      name: '@falling-ts/dsh-force-compact'
