@@ -60,8 +60,11 @@ export async function summarize(ctx, config, agent, messages, signal, extra) {
     options.reasoningEffort = extra.reasoningEffort
   }
   if (agent.session !== undefined) options.sessionId = agent.session.id
-  const purpose = agent.options && agent.options.purpose
-  if (typeof purpose === 'string' && purpose.length > 0) options.purpose = purpose
+  // This one-shot call IS the compaction preview: tag it with the closed-union
+  // `purpose` the LLM service understands (adapters may map it to
+  // purpose-specific generation policy). The agent's free-form purpose string
+  // is NOT a valid `GenerateOptions.purpose` value.
+  options.purpose = 'compaction'
 
   const llm = ctx.get('llm')
   if (llm === undefined || typeof llm.stream !== 'function') return null

@@ -22,14 +22,8 @@ export const MIN_COMPACTABLE_NODES = 4
 export const MAX_SUMMARY_TOKENS = 16384
 
 /**
- * Retry budget for the summarization call when the provider route is transiently
- * unavailable. Bounded so a flush checkpoint cannot stall unboundedly.
- */
-export const SUMMARIZE_RETRIES = 2
-
-/**
  * Resolve the full config object for a compaction round.
- * @returns {Readonly<{minNodes: number, retainRatio: number, minCompactableNodes: number, maxSummaryTokens: number, summarizeRetries: number}>}
+ * @returns {Readonly<{minNodes: number, retainRatio: number, minCompactableNodes: number, maxSummaryTokens: number}>}
  */
 export function resolveConfig() {
   return Object.freeze({
@@ -37,6 +31,5 @@ export function resolveConfig() {
     retainRatio: RETAIN_RATIO,
     minCompactableNodes: MIN_COMPACTABLE_NODES,
     maxSummaryTokens: MAX_SUMMARY_TOKENS,
-    summarizeRetries: SUMMARIZE_RETRIES,
   })
 }

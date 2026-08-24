@@ -14,9 +14,10 @@
  * - **`agent/pre-step`** (a Waterfall before each model step) — reads the
  *   session's **total context tokens** through the `tokenMeter` service. When
  *   the total is **>= `autoThresholdTokens`**, the guard rejects the proposed
- *   step (so the model request is NOT made) and instead runs a **forced
- *   compaction** via `ctx.compaction.compactNow`, which condenses the useful
- *   history and lets the loop retry with a smaller context.
+ *   step (so the model request is NOT made) and instead compacts the **earliest
+ *   `autoEarliestRatio`** of the conversation's tokens via
+ *   `ctx.compaction.compactRegion`, which condenses the head history and lets
+ *   the loop retry with a smaller context.
  *
  * Both settings are read **per request** through the synchronous
  * `settings.get('falling-ts-force-compact')` so a `settings.yaml` edit is picked up on the
@@ -27,103 +28,38 @@
 
 import { readSettings, DEFAULTS } from './settings.js'
 import { selectEarliestByTokens } from './region.js'
-import { compactRegion } from './compact.js'
 
 /**
- * Process-local "force compact now" flags, one per agent (by `agent.id`). Set
- * by the `/force-compact` command handler when the agent is busy, and consumed
- * (and cleared) by the `agent/pre-step` hook at the next model step. This is the
- * "insert a js memory record" the command needs: it survives across the agent's
- * steps within the process without any durable state or timer.
+ * Process-local "force compact now" flags, one per session (keyed by
+ * `session.id`). Set by the `/force-compact` command handler when the agent is
+ * busy, and consumed (and cleared) by the `agent/pre-step` hook at the next
+ * model step. This is the "insert a js memory record" the command needs: it
+ * survives across the agent's steps within the process without any durable
+ * state or timer.
  * @type {Map<string, true>}
  */
 const pendingForce = new Map()
 
 /**
- * Queue a forced compaction for one agent (the `/force-compact` command). When
- * the agent is idle the command compacts directly; when it is busy it sets this
- * flag so the next model step force-compacts instead of requesting the model.
- * @param {string} agentId
+ * Queue a forced compaction for one session (the `/force-compact` command).
+ * When the agent is idle the command compacts directly; when it is busy it sets
+ * this flag so the next model step force-compacts instead of requesting the
+ * model.
+ * @param {string} sessionId
  */
-export function queueForceCompact(agentId) {
-  if (agentId !== undefined && agentId !== null) pendingForce.set(agentId, true)
+export function queueForceCompact(sessionId) {
+  if (sessionId !== undefined && sessionId !== null) pendingForce.set(sessionId, true)
 }
 
 /**
- * Consume (and clear) any pending forced-compaction flag for one agent.
- * @param {string} agentId
+ * Consume (and clear) any pending forced-compaction flag for one session.
+ * @param {string} sessionId
  * @returns {boolean} whether a force was pending and is now cleared.
  */
-export function takeForceCompact(agentId) {
-  const pending = pendingForce.get(agentId)
-  if (pending) pendingForce.delete(agentId)
+export function takeForceCompact(sessionId) {
+  const pending = pendingForce.get(sessionId)
+  if (pending) pendingForce.delete(sessionId)
   return pending === true
-}
-
-/**
- * Force-compact the session before a model request, when the session's total
- * context has reached the configured threshold.
- *
- * Called from the `agent/pre-step` Waterfall. Returns `true` when the step was
- * rejected (a forced compaction ran) and `false` when the guard left the step
- * to proceed (no compaction was needed, or none could be made).
- *
- * @param {import('@deepseek-ai/cordis').Context} ctx
- * @param {import('@deepseek-ai/dsh-agent').Agent} agent
- * @param {AbortSignal} signal the current turn's signal (forwarded to compaction).
- * @returns {Promise<boolean>} `true` when the caller should return `{ kind: 'reject' }`.
- */
-/**
- * Run a forced compaction for one agent (via `compaction.compactNow`), passing a
- * `reasoningEffort: 'off'` signal when `disableThinking` is set so the
- * compaction's own summarization call also skips thinking. Resolves `true` when a
- * compaction was committed, `false` when none could be made (missing service, no
- * safe range, or a thrown error) — it never throws, so a failed compaction never
- * blocks the caller.
- * @param {import('@deepseek-ai/cordis').Context} ctx
- * @param {import('@deepseek-ai/dsh-agent').Agent} agent
- * @param {AbortSignal|undefined} signal the current turn's signal (forwarded to compaction).
- * @returns {Promise<boolean>} whether a compaction was committed.
- */
-async function compactAgentNow(ctx, agent, signal) {
-  const settings = (await readSettings(ctx)) ?? DEFAULTS
-  const disableThinking = settings.disableThinking === true
-  const compaction = ctx.get('compaction')
-  const session = agent.session
-  if (compaction === undefined || typeof compaction.compactNow !== 'function') {
-    ctx.logger.warn(`[force-compact] ${session.id}: compaction service unavailable; no compaction performed`)
-    return false
-  }
-  // When the turn's signal is available, wrap it so the compaction's own
-  // summarization also skips thinking (the `reasoningEffort` the compaction reads
-  // off the signal). Otherwise pass a bare `reasoningEffort`-only signal.
-  const compactSignal = signal !== undefined && signal !== null
-    ? {
-      signal,
-      get reasoningEffort() {
-        return disableThinking ? 'off' : undefined
-      },
-    }
-    : { reasoningEffort: disableThinking ? 'off' : undefined }
-  try {
-    const result = await compaction.compactNow(agent, compactSignal)
-    if (result === null) {
-      ctx.logger.debug(`[force-compact] ${session.id}: forced compaction found no safe range`)
-      return false
-    }
-    ctx.logger.info(
-      `[force-compact] ${session.id}: forced compaction shadowed ${result.shadowedSeqs.length} nodes `
-      + `(~${result.shadowedTokenCount} tokens)`,
-    )
-    return true
-  } catch (error) {
-    // A compaction that is already active (a concurrent forced run) or whose
-    // range is unbalanced must not block the caller: resolve `false` and let the
-    // step proceed. Cancellation is forwarded through `signal`.
-    const message = error instanceof Error ? error.message : String(error)
-    ctx.logger.warn(`[force-compact] ${session.id}: forced compaction failed — ${message}`)
-    return false
-  }
 }
 
 /**
@@ -133,9 +69,9 @@ async function compactAgentNow(ctx, agent, signal) {
  * fallback), computes the token budget (`totalTokens * ratio`), selects the
  * head-anchored span with `selectEarliestByTokens`, and delegates the durable
  * mutation to `ctx.compaction.compactRegion(start, end, agent, signal)`,
- * forwarding the signal (and `reasoningEffort: 'off'` when `disableThinking`
- * is set). Resolves `true` when a compaction was committed, `false` otherwise
- * (missing service, no compactable span, or a thrown error) — it never throws.
+ * forwarding the caller's `AbortSignal` for cancellation. Resolves `true` when a
+ * compaction was committed, `false` otherwise (missing service, no compactable
+ * span, or a thrown error) — it never throws.
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @param {import('@deepseek-ai/dsh-agent').Agent} agent
  * @param {AbortSignal|undefined} signal the current turn's signal (forwarded to compaction).
@@ -161,17 +97,8 @@ async function compactEarliestRatio(ctx, agent, signal, ratio) {
     ctx.logger.debug(`[force-compact] ${session.id}: no earliest ${ratio} token region to compact`)
     return false
   }
-  const disableThinking = settings.disableThinking === true
-  const compactSignal = signal !== undefined && signal !== null
-    ? {
-      signal,
-      get reasoningEffort() {
-        return disableThinking ? 'off' : undefined
-      },
-    }
-    : { reasoningEffort: disableThinking ? 'off' : undefined }
   try {
-    const result = await compaction.compactRegion(region.start, region.end, agent, compactSignal)
+    const result = await compaction.compactRegion(region.start, region.end, agent, signal)
     if (result === undefined || result === null) {
       ctx.logger.debug(`[force-compact] ${session.id}: earliest ${ratio} compaction committed nothing`)
       return false

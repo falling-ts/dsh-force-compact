@@ -14,15 +14,15 @@
  *   compaction trigger threshold in tokens. Compaction runs only when the
  *   session's estimated total context is at least this many tokens; below it,
  *   the checkpoint is skipped.
- * - `autoEarliestRatio` (number 0.05..1, default `0.3`): the fraction of the
+ * - `autoEarliestRatio` (number 0.01..1, default `0.3`): the fraction of the
  *   session's surface history the automatic path compacts from the **head**
  *   (the oldest `autoEarliestRatio` of the conversation).
- * - `forceEarliestRatio` (number 0.05..1, default `0.5`): the fraction of the
+ * - `forceEarliestRatio` (number 0.01..1, default `0.5`): the fraction of the
  *   session's surface history the `/force-compact` command compacts from the
  *   **head**.
  * - `turnEndForceCompactionEnabled` (boolean, default `true`): whether a turn-end
  *   forced compaction runs at each turn's end.
- * - `turnEndCompactionRatio` (number 0.05..1, default `0.4`): the fraction of the
+ * - `turnEndCompactionRatio` (number 0.01..1, default `0.4`): the fraction of the
  *   session's surface history the turn-end forced compaction compacts from the
  *   **head**.
  *

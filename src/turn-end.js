@@ -55,15 +55,8 @@ export async function handleAgentStatus(ctx, payload) {
   }
 
   const controller = new AbortController()
-  const disableThinking = settings.disableThinking === true
-  const compactSignal = {
-    signal: controller.signal,
-    get reasoningEffort() {
-      return disableThinking ? 'off' : undefined
-    },
-  }
   try {
-    const result = await compaction.compactRegion(region.start, region.end, agent, compactSignal)
+    const result = await compaction.compactRegion(region.start, region.end, agent, controller.signal)
     if (result === undefined || result === null) {
       ctx.logger.debug(`[force-compact] ${session.id}: idle compaction committed nothing`)
       return

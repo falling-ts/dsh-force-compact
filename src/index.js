@@ -12,7 +12,8 @@
  * - **`agent/pre-step`** (a Waterfall before each model step) — reads the
  *   session's total context tokens; when they reach the `autoThresholdTokens`
  *   threshold the proposed step is rejected (the model request is NOT made)
- *   and a **forced compaction** (`ctx.compaction.compactNow`) runs instead.
+ *   and the **earliest `autoEarliestRatio`** of the conversation's tokens is
+ *   compacted via `ctx.compaction.compactRegion` instead.
  *
  * The plugin also keeps the `session/flush` durability checkpoint: a
  * checkpoint-driven compaction (its own region policy + LLM summarizer,
@@ -78,7 +79,6 @@ export function apply(ctx) {
   ctx.on('agent/request', async (payload, next) => {
     const config = await next()
     if (!payload || config === undefined) return config
-    const agent = payload.agent
     if (!(await thinkingDisabled(ctx))) return config
     if (config.reasoningEffort === 'off') return config
     return { ...config, reasoningEffort: 'off' }

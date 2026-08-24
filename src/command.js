@@ -59,15 +59,7 @@ export function registerCommand(ctx) {
         return { kind: 'success', text: `no earliest ${settings.forceEarliestRatio} token region to compact` }
       }
       try {
-        const result = await compaction.compactRegion(
-          region.start, region.end, agent,
-          {
-            signal: invocation.signal,
-            get reasoningEffort() {
-              return settings.disableThinking ? 'off' : undefined
-            },
-          },
-        )
+        const result = await compaction.compactRegion(region.start, region.end, agent, invocation.signal)
         if (result === undefined || result === null) {
           ctx.logger.debug(`[force-compact] ${session.id}: no safe range to compact`)
           return { kind: 'success', text: 'no compactable range' }

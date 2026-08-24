@@ -30,31 +30,37 @@ requirement), plus the durability checkpoint:
 - **`agent/pre-step`** — a Waterfall before each model step. It reads the
   session's **total context tokens** through the `tokenMeter` service. When the
   total is **>= `autoThresholdTokens`**, it returns `{ kind: 'reject' }` so the
-  model request is **not** made, and runs a **forced compaction** via
-  `ctx.compaction.compactNow` (which condenses the useful history and lets the
-  loop retry with a smaller context).
+  model request is **not** made, and compacts the **earliest `autoEarliestRatio`**
+  of the conversation's tokens via `ctx.compaction.compactRegion` (which condenses
+  that span into one summary node and lets the loop retry with a smaller context).
 - **`session/flush`** — an awaited `parallel` durability checkpoint. Because
   the checkpoint awaits every listener, the compaction finishes before the
   caller proceeds, so the summary is durable.
 - **`/force-compact`** — a slash command (selected from the `/` list) that
   force-compacts the agent's session. Its handler runs **without sending the
-  line to the model**, so it can act on a **busy** agent: when idle it compacts
-  immediately; when the agent is mid-turn it inserts a **process-local force
-  flag** (a JS memory record — no durable state, no timer) that the
-  `agent/pre-step` hook reads at the next model step. When the flag is present,
-  that step **skips the token threshold**, force-compacts immediately, and
-  returns `{ kind: 'reject' }` so the model request is **not** made.
+  line to the model**, so it can act on a **busy** agent. It directly compacts the
+  **earliest `forceEarliestRatio`** of the conversation's tokens via
+  `ctx.compaction.compactRegion` (a current-turn owner, so it works whether the
+  agent is idle or mid-turn). If `compactRegion` throws (a concurrent compaction
+  is already active / no safe range), it inserts a **process-local force flag**
+  (a JS memory record — no durable state, no timer) that the `agent/pre-step`
+  hook reads at the next model step. When the flag is present, that step
+  **skips the token threshold**, force-compacts the earliest `forceEarliestRatio`,
+  and returns `{ kind: 'reject' }` so the model request is **not** made.
 
 Supporting modules:
 
 - **`src/request-guard.js`** — the per-request guard: `agent/request`
   thinking-off + `agent/pre-step` threshold gate + forced compaction + the
   `/force-compact` process-local force flag.
-- **`src/command.js`** — the `/force-compact` slash command (idle → compact
-  now; busy → queue the force flag for the next model step).
-- **`src/region.js`** — the plugin's own head-anchored region selection (used by
-  the checkpoint path): retain a recent tail (by surface-node count) and end
-  the span on a `user/message` boundary (always a balanced boundary).
+- **`src/command.js`** — the `/force-compact` slash command: directly compacts
+  the earliest `forceEarliestRatio`; when `compactRegion` throws it queues the
+  force flag for the next model step.
+- **`src/region.js`** — the plugin's own head-anchored region selection:
+  `selectRegion` (checkpoint path: retain a recent tail by surface-node count,
+  end on a `user/message` boundary) and `selectEarliestByTokens` (used by
+  `agent/pre-step` / `idle` / `/force-compact`: accumulate tokens from the head
+  to a ratio budget, snap the end to a `user/message` boundary).
 - **`src/summarizer.js`** — the plugin's own one-shot LLM summarizer: replays
   the region's messages, appends a compaction directive as the final user
   message, streams through `ctx.llm`, and returns the condensed checkpoint.
@@ -71,12 +77,12 @@ agent/request(payload, next)              # every model request
 agent/pre-step(payload, next)             # before each model step
     tokenMeter.measure(session).totalTokens >= autoThresholdTokens?
         no  -> next()                      # let the model request proceed
-        yes -> compaction.compactNow(agent, signal)   # force compact
+        yes -> compactRegion(earliest autoEarliestRatio, signal)  # force compact
               return { kind: "reject" }    # NO model request this step
 
 session/flush(session)                    # durability checkpoint
     agents.get(session.id)                -> live Agent (skip if absent)
-    region.select(session)                -> {start, end} or null (skip)
+    region.selectRegion(session)          -> {start, end} or null (skip)
     projectRegionMessages()               -> region messages
     summarizer.summarize()                -> preview + shrink gate
     compaction.compactRegion(start, end, agent, signal)
@@ -117,7 +123,7 @@ with other plugins' keys):
 | `disableThinking` | `boolean` | `true` | when `true`, **every model request** carries `reasoningEffort: 'off'`, which the LLM adapter maps to `thinking: { type: 'disabled' }` — the provider's thinking/reasoning is switched off for the request. Also applies to the plugin's own summarization calls. |
 | `autoThresholdTokens` | `number` | `80000` | the forced-compaction trigger threshold in tokens. **Before a model request**, the session's total context tokens (via `tokenMeter`) are measured; when they are **>= this value**, the request is rejected and a forced compaction runs instead. The `session/flush` checkpoint path also uses this threshold as its trigger gate. |
 | `autoEarliestRatio` | `number` | `0.3` | **auto compact-earliest-conversation ratio** — the fraction of the session's **total tokens** (via `tokenMeter`) the `agent/pre-step` threshold gate compacts from the **head**. Walks surface events from the head, accumulating per-event token estimates until the budget (`totalTokens * ratio`) is met, then snaps the span end to the next `user/message` boundary. |
-| `forceEarliestRatio` | `number` | `0.5` | **force compact-earliest-conversation ratio** — the fraction of the session's **total tokens** the `/force-compact` command compacts from the **head** (idle → compact now; busy → queued for the next model step). |
+| `forceEarliestRatio` | `number` | `0.5` | **force compact-earliest-conversation ratio** — the fraction of the session's **total tokens** the `/force-compact` command compacts from the **head** (compacts directly; when `compactRegion` throws, queued for the next model step). |
 | `turnEndForceCompactionEnabled` | `boolean` | `true` | **enable turn-end force compaction** — when `true`, a forced compaction runs when the agent transitions to `idle` (all turns done, including sub-agents, before the next human turn). |
 | `turnEndCompactionRatio` | `number` | `0.4` | **turn-end force compaction ratio** — the fraction of the session's **total tokens** the turn-end forced compaction compacts from the **head** when the agent goes `idle`. |
 
@@ -170,7 +176,7 @@ a hard dependency.
   durable summary content is the `compaction` service's authoritative one.
 - The forced-compaction gate **rejects the proposed model step** when the
   threshold is reached, then relies on the loop retrying against the shrunken
-  context. If `compactNow` finds no safe range (e.g. nothing useful left to
+  context. If `compactRegion` finds no safe range (e.g. nothing useful left to
   compact), the request proceeds as-is rather than looping.
 - No client/browser UI is registered; the plugin is Host-only. The two
   parameters are tunable through the `falling-ts-force-compact` settings
