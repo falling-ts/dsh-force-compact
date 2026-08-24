@@ -108,7 +108,7 @@ composition without changing shipped defaults.
 
 When the `settings` service is mounted (the web bundle always mounts it via
 `@deepseek-ai/dsh-settings-file`), the plugin registers the
-`falling-ts-force-compact` settings namespace so two parameters are user-tunable
+`falling-ts-force-compact` settings namespace so six parameters are user-tunable
 from `$DSH_HOME/settings.yaml` (the `falling-ts-` prefix prevents collisions
 with other plugins' keys):
 
@@ -116,6 +116,10 @@ with other plugins' keys):
 | --- | --- | --- | --- |
 | `disableThinking` | `boolean` | `true` | when `true`, **every model request** carries `reasoningEffort: 'off'`, which the LLM adapter maps to `thinking: { type: 'disabled' }` — the provider's thinking/reasoning is switched off for the request. Also applies to the plugin's own summarization calls. |
 | `autoThresholdTokens` | `number` | `80000` | the forced-compaction trigger threshold in tokens. **Before a model request**, the session's total context tokens (via `tokenMeter`) are measured; when they are **>= this value**, the request is rejected and a forced compaction runs instead. The `session/flush` checkpoint path also uses this threshold as its trigger gate. |
+| `autoEarliestRatio` | `number` | `0.3` | **auto compact-earliest-conversation ratio** — the fraction of the session's surface history the `agent/pre-step` threshold gate compacts from the **head** (the oldest `autoEarliestRatio` of the conversation) when it fires. |
+| `forceEarliestRatio` | `number` | `0.5` | **force compact-earliest-conversation ratio** — the fraction of the conversation the `/force-compact` command compacts from the **head** (idle → compact now; busy → queued for the next model step). |
+| `turnEndForceCompactionEnabled` | `boolean` | `true` | **enable turn-end force compaction** — when `true`, a turn-end forced compaction runs at each `turn/end`. |
+| `turnEndCompactionRatio` | `number` | `0.4` | **turn-end force compaction ratio** — the fraction of the conversation the turn-end forced compaction compacts from the **head**. |
 
 Example `$DSH_HOME/settings.yaml`:
 
@@ -123,6 +127,10 @@ Example `$DSH_HOME/settings.yaml`:
 falling-ts-force-compact:
   disableThinking: true
   autoThresholdTokens: 80000
+  autoEarliestRatio: 0.3
+  forceEarliestRatio: 0.5
+  turnEndForceCompactionEnabled: true
+  turnEndCompactionRatio: 0.4
 ```
 
 When the `settings` service is absent, the plugin falls back to these same
@@ -138,9 +146,10 @@ a hard dependency.
   checkpoint path; if a flush fires after the Agent is unregistered, the plugin
   logs `no live agent … — skipping` and skips that checkpoint. The `agent/*`
   Waterfalls receive the `Agent` in their payload and need no `agents` lookup.
-- **Optional dependency:** the `settings` service. When absent, the two
-  parameters resolve to their defaults (`disableThinking: true`,
-  `autoThresholdTokens: 80000`).
+- **Optional dependency:** the `settings` service. When absent, the parameters
+  resolve to their defaults (`disableThinking: true`, `autoThresholdTokens:
+  80000`, `autoEarliestRatio: 0.3`, `forceEarliestRatio: 0.5`,
+  `turnEndForceCompactionEnabled: true`, `turnEndCompactionRatio: 0.4`).
 - **Optional dependency:** the `tokenMeter` service. Used by the `agent/pre-step`
   threshold gate; when absent, the gate falls back to a coarse character-based
   estimate of the session's surface content.

@@ -12,6 +12,8 @@
  */
 
 import { queueForceCompact } from './request-guard.js'
+import { selectEarliestRatio } from './region.js'
+import { readSettings, DEFAULTS } from './settings.js'
 
 /**
  * Register the global `/force-compact` command. A no-op when the `commands`
@@ -34,21 +36,35 @@ export function registerCommand(ctx) {
       const agent = invocation.agent
       const session = agent.session
       const compaction = ctx.get('compaction')
+      const settings = (await readSettings(ctx)) ?? DEFAULTS
 
       // The compaction service is a hard dependency of this plugin; guard the
       // rare case it is not available so the command settles as an error rather
       // than throwing out of the handler.
-      if (compaction === undefined || typeof compaction.compactNow !== 'function') {
+      if (compaction === undefined || typeof compaction.compactRegion !== 'function') {
         ctx.logger.warn(`[force-compact] ${session.id}: compaction service unavailable`)
         return { kind: 'error', text: 'compaction service unavailable' }
       }
 
-      // Compact now. A busy agent is rejected by `compactNow` (it throws a
-      // ManualCompactionError) — in that case queue the force flag so the next
-      // model step force-compacts instead of requesting the model.
+      // Compact the earliest `forceEarliestRatio` of the conversation via
+      // `compactRegion`. When the agent is busy the compaction is rejected
+      // (throws a ManualCompactionError) — in that case queue the force flag so
+      // the next model step force-compacts instead of requesting the model.
+      const region = selectEarliestRatio(session, settings.forceEarliestRatio)
+      if (region === null) {
+        return { kind: 'success', text: `no earliest ${settings.forceEarliestRatio} region to compact` }
+      }
       try {
-        const result = await compaction.compactNow(agent, invocation.signal)
-        if (result === null) {
+        const result = await compaction.compactRegion(
+          region.start, region.end, agent,
+          {
+            signal: invocation.signal,
+            get reasoningEffort() {
+              return settings.disableThinking ? 'off' : undefined
+            },
+          },
+        )
+        if (result === undefined || result === null) {
           ctx.logger.debug(`[force-compact] ${session.id}: no safe range to compact`)
           return { kind: 'success', text: 'no compactable range' }
         }
@@ -56,7 +72,7 @@ export function registerCommand(ctx) {
           `[force-compact] ${session.id}: /force-compact shadowed ${result.shadowedSeqs.length} nodes `
           + `(~${result.shadowedTokenCount} tokens)`,
         )
-        return { kind: 'success', text: `compacted ~${result.shadowedTokenCount} tokens` }
+        return { kind: 'success', text: `compacted ~${result.shadowedTokenCount} tokens (earliest ${settings.forceEarliestRatio})` }
       } catch (error) {
         // Busy (or otherwise unable) — queue the force flag for the next step.
         queueForceCompact(session.id)

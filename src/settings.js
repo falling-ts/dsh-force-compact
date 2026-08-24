@@ -2,7 +2,7 @@
  * dsh-force-compact settings — the "强制压缩配置" (Force-Compact Configuration)
  * surface.
  *
- * Two user-tunable parameters are registered under the `falling-ts-force-compact`
+ * Six user-tunable parameters are registered under the `falling-ts-force-compact`
  * settings namespace so the harness settings panel can expose and persist them
  * (the `falling-ts-` prefix prevents collisions with other plugins' keys):
  *
@@ -14,6 +14,17 @@
  *   compaction trigger threshold in tokens. Compaction runs only when the
  *   session's estimated total context is at least this many tokens; below it,
  *   the checkpoint is skipped.
+ * - `autoEarliestRatio` (number 0.05..1, default `0.3`): the fraction of the
+ *   session's surface history the automatic path compacts from the **head**
+ *   (the oldest `autoEarliestRatio` of the conversation).
+ * - `forceEarliestRatio` (number 0.05..1, default `0.5`): the fraction of the
+ *   session's surface history the `/force-compact` command compacts from the
+ *   **head**.
+ * - `turnEndForceCompactionEnabled` (boolean, default `true`): whether a turn-end
+ *   forced compaction runs at each turn's end.
+ * - `turnEndCompactionRatio` (number 0.05..1, default `0.4`): the fraction of the
+ *   session's surface history the turn-end forced compaction compacts from the
+ *   **head**.
  *
  * The namespace is registered against the `settings` service when one is
  * mounted. The schema is built through `@deepseek-ai/schemastery` (a
@@ -36,21 +47,40 @@
 export const NS = 'falling-ts-force-compact'
 
 /**
- * Composition defaults for the two parameters. These are the `base` layer the
+ * Composition defaults for the six parameters. These are the `base` layer the
  * settings namespace resolves over, so a field the user has not overridden
  * resolves to these values.
- * @type {Readonly<{disableThinking: boolean, autoThresholdTokens: number}>}
+ * @type {Readonly<{
+ *   disableThinking: boolean,
+ *   autoThresholdTokens: number,
+ *   autoEarliestRatio: number,
+ *   forceEarliestRatio: number,
+ *   turnEndForceCompactionEnabled: boolean,
+ *   turnEndCompactionRatio: number,
+ * }>}
  */
 export const DEFAULTS = Object.freeze({
   disableThinking: true,
   autoThresholdTokens: 80000,
+  autoEarliestRatio: 0.3,
+  forceEarliestRatio: 0.5,
+  turnEndForceCompactionEnabled: true,
+  turnEndCompactionRatio: 0.4,
 })
 
 /**
- * Read the resolved force-compact settings from the `settings` service.
+ * Read the resolved force-compact settings from the `settings` service, applying
+ * the `DEFAULTS` fallback for any field the user has not overridden.
  *
  * @param {import('@deepseek-ai/cordis').Context} ctx
- * @returns {Promise<{disableThinking: boolean, autoThresholdTokens: number} | null>}
+ * @returns {Promise<{
+ *   disableThinking: boolean,
+ *   autoThresholdTokens: number,
+ *   autoEarliestRatio: number,
+ *   forceEarliestRatio: number,
+ *   turnEndForceCompactionEnabled: boolean,
+ *   turnEndCompactionRatio: number,
+ * } | null>}
  *   the resolved settings, or `null` when the `settings` service is not mounted
  *   (callers should fall back to their composition entry).
  */
@@ -59,13 +89,26 @@ export async function readSettings(ctx) {
   if (settings === undefined) return null
   const value = settings.get(NS)
   if (value === undefined) return null
-  const disableThinking = typeof value.disableThinking === 'boolean'
-    ? value.disableThinking
-    : DEFAULTS.disableThinking
-  const autoThresholdTokens = Number.isFinite(value.autoThresholdTokens) && value.autoThresholdTokens > 0
-    ? value.autoThresholdTokens
-    : DEFAULTS.autoThresholdTokens
-  return { disableThinking, autoThresholdTokens }
+  const asBool = (field, fallback) =>
+    (typeof value[field] === 'boolean' ? value[field] : fallback)
+  const asPositiveInt = (field, fallback) =>
+    (Number.isFinite(value[field]) && value[field] > 0 ? value[field] : fallback)
+  const asRatio = (field, fallback) =>
+    (Number.isFinite(value[field]) && value[field] > 0 && value[field] <= 1 ? value[field] : fallback)
+  const disableThinking = asBool('disableThinking', DEFAULTS.disableThinking)
+  const autoThresholdTokens = asPositiveInt('autoThresholdTokens', DEFAULTS.autoThresholdTokens)
+  const autoEarliestRatio = asRatio('autoEarliestRatio', DEFAULTS.autoEarliestRatio)
+  const forceEarliestRatio = asRatio('forceEarliestRatio', DEFAULTS.forceEarliestRatio)
+  const turnEndForceCompactionEnabled = asBool('turnEndForceCompactionEnabled', DEFAULTS.turnEndForceCompactionEnabled)
+  const turnEndCompactionRatio = asRatio('turnEndCompactionRatio', DEFAULTS.turnEndCompactionRatio)
+  return {
+    disableThinking,
+    autoThresholdTokens,
+    autoEarliestRatio,
+    forceEarliestRatio,
+    turnEndForceCompactionEnabled,
+    turnEndCompactionRatio,
+  }
 }
 
 /**
@@ -83,6 +126,12 @@ export async function buildSchema() {
       disableThinking: z.boolean().default(DEFAULTS.disableThinking),
       // `step(1)` constrains to whole numbers (schemastery has no `.int()`).
       autoThresholdTokens: z.number().step(1).min(1).default(DEFAULTS.autoThresholdTokens),
+      // A "ratio" is a fraction of the session's surface history, in (0, 1].
+      // `step(0.01)` keeps values to two decimals (schemastery has no `.int()`).
+      autoEarliestRatio: z.number().step(0.01).min(0.01).max(1).default(DEFAULTS.autoEarliestRatio),
+      forceEarliestRatio: z.number().step(0.01).min(0.01).max(1).default(DEFAULTS.forceEarliestRatio),
+      turnEndForceCompactionEnabled: z.boolean().default(DEFAULTS.turnEndForceCompactionEnabled),
+      turnEndCompactionRatio: z.number().step(0.01).min(0.01).max(1).default(DEFAULTS.turnEndCompactionRatio),
     })
     return schema
   } catch {

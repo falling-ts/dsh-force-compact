@@ -94,13 +94,17 @@ dsh web --patch dsh-force-compact/cordis.patch.yml
 ## 设置（强制压缩配置）
 
 当 `settings` 服务已挂载（web bundle 通过 `@deepseek-ai/dsh-settings-file` 始终
-挂载它）时，插件会注册 `falling-ts-force-compact` 设置命名空间，使两个参数可从
+挂载它）时，插件会注册 `falling-ts-force-compact` 设置命名空间，使六个参数可从
 `$DSH_HOME/settings.yaml` 配置（`falling-ts-` 前缀用于防止与其他插件的键冲突）：
 
 | 键 | 类型 | 默认值 | 作用 |
 | --- | --- | --- | --- |
 | `disableThinking` | `boolean` | `true` | 为 `true` 时，**每次模型请求**都携带 `reasoningEffort: 'off'`，LLM 适配器将其映射为 `thinking: { type: 'disabled' }`——即请求时关闭提供方的思考/推理。同样作用于插件自己的摘要调用。 |
 | `autoThresholdTokens` | `number` | `80000` | 强制压缩触发阈值（单位 tokens）。**在请求模型前**，通过 `tokenMeter` 测量会话上下文总 tokens 数；当其**达到或超过**该值时，**不请求模型**，而是强制执行一次强制压缩。`session/flush` 检查点路径也把它作为触发门禁。 |
+| `autoEarliestRatio` | `number` | `0.3` | **自动压缩最早对话比例**——`agent/pre-step` 阈值门禁触发时，从头压缩会话 surface 历史的该比例（最早 `autoEarliestRatio` 的对话）。 |
+| `forceEarliestRatio` | `number` | `0.5` | **强制压缩最早对话比例**——`/force-compact` 命令从头压缩的对话比例（空闲→立即压缩；繁忙→排队到下一个模型步骤）。 |
+| `turnEndForceCompactionEnabled` | `boolean` | `true` | **是否开启一轮结束强制压缩**——为 `true` 时，每次 `turn/end` 后强制执行一轮结束压缩。 |
+| `turnEndCompactionRatio` | `number` | `0.4` | **一轮结束强制压缩比例**——一轮结束强制压缩从头压缩的对话比例。 |
 
 `$DSH_HOME/settings.yaml` 示例：
 
@@ -108,6 +112,10 @@ dsh web --patch dsh-force-compact/cordis.patch.yml
 falling-ts-force-compact:
   disableThinking: true
   autoThresholdTokens: 80000
+  autoEarliestRatio: 0.3
+  forceEarliestRatio: 0.5
+  turnEndForceCompactionEnabled: true
+  turnEndCompactionRatio: 0.4
 ```
 
 当 `settings` 服务不存在时，插件回退到同样的默认值，压缩照常进行——设置命名空间
@@ -120,8 +128,10 @@ falling-ts-force-compact:
 - **可选依赖：** `agents` 服务。仅供 `session/flush` 检查点路径使用；若某次
   flush 触发时 `Agent` 已被注销，插件打印 `no live agent … — skipping` 并跳过
   该检查点。`agent/*` Waterfall 的 payload 直接携带 `Agent`，无需 `agents` 查找。
-- **可选依赖：** `settings` 服务。不存在时，两个参数回退到默认值
-  （`disableThinking: true`、`autoThresholdTokens: 80000`）。
+- **可选依赖：** `settings` 服务。不存在时，参数回退到默认值（`disableThinking:
+  true`、`autoThresholdTokens: 80000`、`autoEarliestRatio: 0.3`、
+  `forceEarliestRatio: 0.5`、`turnEndForceCompactionEnabled: true`、
+  `turnEndCompactionRatio: 0.4`）。
 - **可选依赖：** `tokenMeter` 服务。供 `agent/pre-step` 阈值门禁使用；不存在时，
   门禁回退到对会话 surface 内容的粗略字符估算。
 - **每次请求读取设置：** 两个参数都**每次模型请求**读取

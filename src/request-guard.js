@@ -26,6 +26,8 @@
  */
 
 import { readSettings, DEFAULTS } from './settings.js'
+import { selectEarliestRatio } from './region.js'
+import { compactRegion } from './compact.js'
 
 /**
  * Process-local "force compact now" flags, one per agent (by `agent.id`). Set
@@ -125,6 +127,60 @@ async function compactAgentNow(ctx, agent, signal) {
 }
 
 /**
+ * Compact the **earliest** `ratio` fraction of a session's surface history via
+ * `compactRegion` (the "earliest conversation ratio" knob). Selects the head-
+ * anchored span with `selectEarliestRatio` and delegates the durable mutation to
+ * `ctx.compaction.compactRegion(start, end, agent, signal)`, forwarding the
+ * signal (and `reasoningEffort: 'off'` when `disableThinking` is set). Resolves
+ * `true` when a compaction was committed, `false` otherwise (missing service, no
+ * compactable span, or a thrown error) — it never throws.
+ * @param {import('@deepseek-ai/cordis').Context} ctx
+ * @param {import('@deepseek-ai/dsh-agent').Agent} agent
+ * @param {AbortSignal|undefined} signal the current turn's signal (forwarded to compaction).
+ * @param {number} ratio a fraction in (0, 1] of the surface history to compact from the head.
+ * @returns {Promise<boolean>} whether a compaction was committed.
+ */
+async function compactEarliestRatio(ctx, agent, signal, ratio) {
+  const settings = (await readSettings(ctx)) ?? DEFAULTS
+  const session = agent.session
+  const compaction = ctx.get('compaction')
+  if (compaction === undefined || typeof compaction.compactRegion !== 'function') {
+    ctx.logger.warn(`[force-compact] ${session.id}: compaction service unavailable; no compaction performed`)
+    return false
+  }
+  const region = selectEarliestRatio(session, ratio)
+  if (region === null) {
+    ctx.logger.debug(`[force-compact] ${session.id}: no earliest ${ratio} region to compact`)
+    return false
+  }
+  const disableThinking = settings.disableThinking === true
+  const compactSignal = signal !== undefined && signal !== null
+    ? {
+      signal,
+      get reasoningEffort() {
+        return disableThinking ? 'off' : undefined
+      },
+    }
+    : { reasoningEffort: disableThinking ? 'off' : undefined }
+  try {
+    const result = await compaction.compactRegion(region.start, region.end, agent, compactSignal)
+    if (result === undefined || result === null) {
+      ctx.logger.debug(`[force-compact] ${session.id}: earliest ${ratio} compaction committed nothing`)
+      return false
+    }
+    ctx.logger.info(
+      `[force-compact] ${session.id}: earliest ${ratio} compaction shadowed ${result.shadowedSeqs.length} nodes `
+      + `(~${result.shadowedTokenCount} tokens)`,
+    )
+    return true
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    ctx.logger.warn(`[force-compact] ${session.id}: earliest ${ratio} compaction failed — ${message}`)
+    return false
+  }
+}
+
+/**
  * The `agent/pre-step` guard. A `/force-compact` command queued a force flag for
  * this agent (`takeForceCompact`) → compact immediately, bypassing the token
  * threshold. Otherwise, measure the session's total context tokens and, when they
@@ -140,10 +196,11 @@ export async function forceCompactIfNeeded(ctx, agent, signal) {
   const session = agent.session
 
   // A `/force-compact` command was issued for this agent while it was busy:
-  // compact now, regardless of the token threshold.
+  // compact now, regardless of the token threshold — the earliest
+  // `forceEarliestRatio` of the conversation.
   if (takeForceCompact(session.id)) {
-    ctx.logger.info(`[force-compact] ${session.id}: /force-compact queued; force-compacting immediately`)
-    return await compactAgentNow(ctx, agent, signal)
+    ctx.logger.info(`[force-compact] ${session.id}: /force-compact queued; force-compacting the earliest ${settings.forceEarliestRatio} immediately`)
+    return await compactEarliestRatio(ctx, agent, signal, settings.forceEarliestRatio)
   }
 
   // Total context tokens for this session — the authoritative measurement the
@@ -156,13 +213,14 @@ export async function forceCompactIfNeeded(ctx, agent, signal) {
     : estimateSessionTokens(session)
   if (total < settings.autoThresholdTokens) return false
 
-  // At or above the threshold: do NOT request the model. Force a compaction
-  // instead; the loop retries the step against the shrunken context.
+  // At or above the threshold: do NOT request the model. Compact the earliest
+  // `autoEarliestRatio` of the conversation instead; the loop retries the step
+  // against the shrunken context.
   ctx.logger.info(
     `[force-compact] ${session.id}: context ~${total} tokens >= threshold ${settings.autoThresholdTokens}; `
-    + 'rejecting the model request and forcing a compaction',
+    + `rejecting the model request and compacting the earliest ${settings.autoEarliestRatio}`,
   )
-  return await compactAgentNow(ctx, agent, signal)
+  return await compactEarliestRatio(ctx, agent, signal, settings.autoEarliestRatio)
 }
 
 /**

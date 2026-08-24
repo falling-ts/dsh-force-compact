@@ -35,6 +35,7 @@ import { compactSession } from './compact.js'
 import { registerNamespace } from './settings.js'
 import { forceCompactIfNeeded, thinkingDisabled } from './request-guard.js'
 import { registerCommand } from './command.js'
+import { handleTurnEnd } from './turn-end.js'
 
 /** @type {string} the function plugin's display name. */
 export const name = 'force-compact'
@@ -101,6 +102,13 @@ export function apply(ctx) {
       }
     }
     return rejected ? { kind: 'reject' } : next()
+  })
+
+  // Turn-end forced compaction: when `turnEndForceCompactionEnabled` is on,
+  // compact the earliest `turnEndCompactionRatio` of the conversation at each
+  // `turn/end`, so the next turn starts from a shrunken context.
+  ctx.on('session/event', (session, event) => {
+    return handleTurnEnd(ctx, session, event)
   })
 
   // Checkpoint-driven compaction: condense useful history at each durability

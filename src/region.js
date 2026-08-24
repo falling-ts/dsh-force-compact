@@ -52,3 +52,39 @@ function userMessageEventSeqs(session) {
   }
   return seqs
 }
+
+/**
+ * Select the **earliest** `ratio` fraction of the session's surface history as a
+ * head-anchored region to compact — the "earliest conversation ratio" knob.
+ *
+ * The span starts at the first surface node and covers the oldest
+ * `Math.max(1, Math.round(total * ratio))` nodes, then snaps the span's **end**
+ * forward to the next `user/message` boundary (so the compacted span ends at a
+ * balanced, tool-call-safe point). Returns `null` when there is not enough
+ * surface history to compact.
+ *
+ * @param {import('@deepseek-ai/dsh-session').Session} session
+ * @param {number} ratio a fraction in (0, 1].
+ * @returns {{start: number, end: number} | null} the head-anchored span to compact, or `null`.
+ */
+export function selectEarliestRatio(session, ratio) {
+  const nodes = session.surface.nodes
+  const total = nodes.length
+  if (total < 2) return null
+
+  const compactCount = Math.max(1, Math.round(total * ratio))
+  const userMessageSeqs = userMessageEventSeqs(session)
+
+  // The span covers nodes[0..compactCount-1]; snap its end (nodes[compactCount-1])
+  // forward to the next `user/message` boundary so the span ends balanced.
+  let endIdx = compactCount - 1
+  while (endIdx + 1 < total && !userMessageSeqs.has(nodes[endIdx])) {
+    endIdx += 1
+  }
+  // The end must land on a `user/message` boundary (balanced) and be past the
+  // first node (a one-node span is not worth compacting).
+  if (!userMessageSeqs.has(nodes[endIdx])) return null
+  if (endIdx < 1) return null
+
+  return { start: nodes[0], end: nodes[endIdx] }
+}
