@@ -12,7 +12,7 @@
     "index.js",
     "cordis.yml",
     "README.md",
-    "README.zh.md"
+    "README.cn.md"
   ],
   "license": "MIT",
   "publishConfig": {

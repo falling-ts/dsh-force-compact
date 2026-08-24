@@ -1,6 +1,6 @@
 # Session Auto-Compact
 
-English | [中文](README.zh.md)
+English | [中文](README.cn.md)
 
 `@deepseek-ai/dsh-compact` is a DSH **Cordis function plugin** that
 automatically compacts a session's useful history into a single summary node at
