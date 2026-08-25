@@ -446,7 +446,10 @@ function __selectRetainingLatestTokensBody(session, retainLatestTokens, measurem
  *
  * It walks surface events from the head, accumulating per-event token estimates
  * (4 chars/token heuristic on flat surface text), until the accumulated tokens
- * reach `budget = min(totalTokens, surfaceTokens)`. This mirrors the legacy
+ * reach the absolute `totalTokens` budget (callers typically pass the char-based
+ * surface estimate; the threshold path passes the projection's
+ * `projectedTokens`-derived residual when a snapshot is available upstream).
+ * This mirrors the legacy
  * ratio-of-total behavior where passing a ratio R is equivalent to passing
  * `totalTokens*R` as the absolute token budget to compact from the head —
  * for callers who lack a real `measure()` snapshot. The span covers every

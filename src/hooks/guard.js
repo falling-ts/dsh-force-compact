@@ -12,8 +12,10 @@
  *   `thinking: { type: 'disabled' }`. Every model request in this process is
  *   therefore sent with thinking/reasoning disabled.
  * - **`agent/pre-step`** (a Waterfall before each model step) — reads the
- *   session's **total context tokens** through the `tokenMeter` service. When
- *   the total is **>= `autoThresholdTokens`**, the guard rejects the proposed
+ *   session's **projected context tokens** through the official
+ *   `contextPressure` projection (`projectedTokens` — the exact figure the
+ *   harness renders in the bottom-right corner, provider-anchored). When
+ *   the reading is **>= `autoThresholdTokens`**, the guard rejects the proposed
  *   step (so the model request is NOT made) and instead retains the **latest
  *   `retainLatestTokens` of the conversation's tokens verbatim** while sending
  *   everything before that cutoff to the `compaction`
@@ -37,6 +39,7 @@ import {
 import { resolveCompaction } from '../engine/backend.js'
 import { publishCompressing, publishDone } from '../core/ui-signal.js'
 import { guardFn, renderCrash, captureThrowSite, appendCrashLine as appendDiag } from '../core/crashnet.js'
+import { getProjectedTokens } from '../core/projected.js'
 
 /**
  * Process-local "force compact now" records, one per session (keyed by
@@ -238,35 +241,49 @@ async function __compactRetainingLatestBody(ctx, agent, signal, mode, sourceComm
     )
     return false
   }
-  // Measure the session's REAL content mass (SURFACE TOKENS ONLY — no usage-
-  // baseline water). `measured.totalTokens` includes a provider-reported usage
-  // baseline that inflates with prior consumption and RESETS after each
-  // compaction, so keying any threshold arithmetic on it produces phantom
-  // "still above threshold" states that never clear; `measured.surfaceTokens`
-  // is the honest, stable mass of what the model actually sees. Defensive:
-  // `measure` might return undefined/a non-object for a malformed session, and
-  // calling it might throw on a transient backend glitch — BOTH must degrade
-  // to `undefined` (caller then falls back to the char estimator) rather than
-  // propagate.
+  // Pressure basis — PROJECTED TOKENS (single definition with the harness UI).
+  // Reads the SAME `projectedTokens` the harness renders in the bottom-right
+  // corner (provider-anchored sample + surface movement since the sample), so
+  // the plugin's arithmetic never drifts from what the user sees.
+  //
+  // Historical note: this path previously keyed off
+  // `tokenMeter.measure().surfaceTokens` — the UNANCHORED meter-node sum —
+  // rejecting `totalTokens` because its usage baseline inflates and resets
+  // after each compaction. `projectedTokens` keeps a provider anchor while
+  // staying responsive to surface churn (compactions drop the figure the
+  // moment a span is shadowed), so the original objection no longer applies.
+  // When the reading is unavailable (fresh session with no usage sample yet,
+  // or a trimmed composition without the projection registry) we fall back to
+  // `surfaceTokens` — the closest same-caliber substitute — before giving up
+  // to the char estimator.
+  let totalTokens = getProjectedTokens(ctx, session)
+  // Measurement snapshot used for NODE-BY-NODE region selection: prefer the
+  // same-caliber `measure()` snapshot when a projection registry is not
+  // driving the basis (or is unavailable), otherwise reuse the meter
+  // snapshot for a consistent caliber across the selection path.
   const meter = ctx.get('tokenMeter')
-  let totalTokens
   let measurement
   if (meter !== undefined && typeof meter.measure === 'function') {
     try {
       const measured = meter.measure(session)
       if (measured !== undefined && measured !== null) {
         measurement = measured
-        totalTokens = (Number.isFinite(measured.surfaceTokens) && measured.surfaceTokens > 0)
-          ? measured.surfaceTokens
-          : undefined
+        if (totalTokens === undefined) {
+          totalTokens = (Number.isFinite(measured.surfaceTokens) && measured.surfaceTokens > 0)
+            ? measured.surfaceTokens
+            : undefined
+        }
       }
     } catch {
-      totalTokens = undefined
+      // leave `totalTokens` as-is (possibly already set from the projection)
     }
   }
   // Region selection: PREFER the same-caliber meter-node selector (prices each
-  // candidate from the very `measure()` snapshot that produced `totalTokens`,
-  // so the budget is always reachable and the boundary well-defined). The
+  // candidate from the very `measure()` snapshot (when that snapshot backs
+  // `totalTokens`) — so the budget is always reachable and the boundary
+  // well-defined). When the basis is the projection-derived `projectedTokens`,
+  // the snapshot is used purely for node-by-node pricing, decoupled from the
+  // scalar basis. The
   // `maxRegionNodes` cap CLAMPS an oversized 0.ratio head-span down to the
   // largest serviceable head-aligned prefix so the builtin engine's replay cap
   // is never tripped and a region is ALWAYS committable on a threshold trip.
@@ -302,7 +319,7 @@ async function __compactRetainingLatestBody(ctx, agent, signal, mode, sourceComm
         return selectEarliestByTokens(session, headBudget, maxRegionNodes)
       })()
   if (region === null) {
-    ctx.logger.debug(`[force-compact] ${session.id}: no region to compact retaining ~${settings.retainLatestTokens} latest tokens (totalTokens=${totalTokens == null ? 'unknown(fallback est)' : totalTokens}${measurement !== undefined ? `, surface nodes=${measurement.nodes?.length}, surfaceTokens=${measurement.surfaceTokens}` : ''})`)
+    ctx.logger.debug(`[force-compact] ${session.id}: no region to compact retaining ~${settings.retainLatestTokens} latest tokens (basis=${totalTokens == null ? 'unknown(fallback est)' : totalTokens}${measurement !== undefined ? `, surface nodes=${measurement.nodes?.length}, surfaceTokens=${typeof measurement.surfaceTokens === 'number' ? measurement.surfaceTokens : '?'}` : ''})`)
     return false
   }
 
@@ -508,40 +525,51 @@ async function __forceCompactIfNeededBody(ctx, agent, signal, mode) {
     return committed
   }
 
-  // Total context tokens for this session — the authoritative measurement the
-  // official `compaction-basic` uses for its pressure gate.
-  const meter = ctx.get('tokenMeter')
-  if (meter === undefined || typeof meter.measure !== 'function') {
-    ctx.logger.debug(`[force-compact] ${session.id}: tokenMeter unavailable — threshold gate skipped, letting the request proceed`)
-    return false
-  }
-  const measurement = meter.measure(session)
-  // AUTHORITATIVE PRESSURE BASIS — SURFACE TOKENS ONLY (no usage-baseline
-  // water). `totalTokens` mixes a provider-reported USAGE baseline (which
-  // inflates on sessions that have already consumed context and RESETS after
-  // every compaction, making any high-water mark anchored on it unreachable
-  // forever) with the live surface content. The real, stable mass of what the
-  // model actually sees is `measurement.surfaceTokens` (the sum of the meter's
-  // per-node surface prices), so ALL threshold arithmetic in this guard now
-  // keys off it exclusively — gates, shrink predictions, and logs alike.
-  // Degraded modes (missing/malformed measurement or non-number
-  // `surfaceTokens`) fall back to the char-based estimator, which approximates
-  // exactly the surface content mass as well.
-  const total = (measurement && typeof measurement.surfaceTokens === 'number' && Number.isFinite(measurement.surfaceTokens)
-    && measurement.surfaceTokens > 0)
-    ? measurement.surfaceTokens
+  // PROJECTED TOKENS — the authoritative pressure basis. Single definition
+  // with the harness UI: reads the SAME `projectedTokens` the harness renders
+  // in the bottom-right corner, so the plugin's threshold arithmetic never
+  // drifts from what the user sees.
+  //
+  // Caliber note (vs the previous `surfaceTokens` basis): the delta term in
+  // `projectedTokens` is estimated at the meter's fixed CHARS_PER_TOKEN=4
+  // density, so heavy-CJK / tool-JSON content is systematically undercounted
+  // compared to the unanchored node sum — a deliberate provider-anchor trade
+  // the meter prefers. Gate thresholds calibrated on the old basis may fire
+  // slightly less often; that is intended, not a regression.
+  const projectedTotal = getProjectedTokens(ctx, session)
+  const total = (typeof projectedTotal === 'number' && Number.isFinite(projectedTotal) && projectedTotal > 0)
+    ? projectedTotal
     : estimateSessionTokens(session)
-  // DIAGNOSTIC: log every measurement facet on the threshold branch so a
-  // divergent total can be attributed (baseline kind/tokens vs surface sum vs
-  // nodes-window sum). Threshold hits are rare events, so unconditional INFO
-  // here is cheap.
-  const diagNodes = Array.isArray(measurement && measurement.nodes) ? measurement.nodes : []
-  const diagWindowSum = diagNodes.reduce((acc, n) => acc + (Number(n.tokens) > 0 ? Number(n.tokens) : 0), 0)
+  // Meter snapshot retained for TWO purposes on the threshold branch: (a) the
+  // node-priced region selection fed to `compactRetainingLatest` below — keeps
+  // the official tool-pairing ledger alignment even when the THRESHOLD BASIS
+  // comes from the projection (scalar basis ≠ node-pricing source, and that
+  // split is deliberate); (b) the diagnostic facets logged on the rare
+  // threshold-hit branch. Defensive:
+  // `measure` might return undefined/a non-object or throw on a transient
+  // glitch — neither may propagate through a gate that decides whether to run
+  // a model step.
+  const meter = ctx.get('tokenMeter')
+  let measurement
+  if (meter !== undefined && typeof meter.measure === 'function') {
+    try {
+      const maybeMeasurement = meter.measure(session)
+      measurement = (maybeMeasurement !== undefined && maybeMeasurement !== null) ? maybeMeasurement : undefined
+    } catch {
+      measurement = undefined
+    }
+  }
+  // DIAGNOSTIC: log every facet on the threshold branch so a divergent total
+  // can be attributed (projection basis vs baseline kind/tokens vs surface sum
+  // vs nodes-window sum). Threshold hits are rare events, so unconditional
+  // DEBUG here is cheap.
+  const diagNodes = (measurement && Array.isArray(measurement.nodes)) ? measurement.nodes : []
+  const diagWindowSum = diagNodes.reduce((acc, n) => acc + (Number(n && n.tokens) > 0 ? Number(n.tokens) : 0), 0)
   if (total >= settings.autoThresholdTokens) {
-    const baseline = measurement && measurement.baseline
+    const baseline = (measurement && measurement.baseline) || undefined
     const estFallback = estimateSessionTokens(session)
     ctx.logger.debug(
-      `[force-compact] ${session.id}: MEASURE-DIAG total=${total} `
+      `[force-compact] ${session.id}: MEASURE-DIAG basis=projectedTokens total=${total} `
       + `baseline=${baseline ? `${baseline?.kind}:${baseline?.tokens}` : 'none'} `
       + `delta=${measurement && typeof measurement.surfaceDeltaTokens === 'number' ? measurement.surfaceDeltaTokens : '?'} `
       + `surfaceTokens=${measurement && typeof measurement.surfaceTokens === 'number' ? measurement.surfaceTokens : '?'} `
@@ -564,7 +592,7 @@ async function __forceCompactIfNeededBody(ctx, agent, signal, mode) {
   // it predicts "cannot cross" precisely in the regime where compaction helps
    // most. Instead we LOG the floor arithmetic (useful attribution data — how
    // much of `total` is baseline vs window vs delta) and ALWAYS fall through to
-   // the attempted compaction. Note that the guard's `total` is now
+   // the attempted compaction. The guard's `total` basis is now the projection's `projectedTokens` (provider-anchored, reacts to surface churn); the meter snapshot beside it is diagnostic-only, so the
    // SURFACE-TOKENS ONLY (no usage-baseline water), so this naive projection is
    // meaningful again; it nonetheless stays INFORMATIONAL — the per-region
    // SHRINK GATE downstream makes the actual decision, and no separate
@@ -578,8 +606,8 @@ async function __forceCompactIfNeededBody(ctx, agent, signal, mode) {
   if (floorWindow.length > 0 && projectedAfterObserved >= settings.autoThresholdTokens) {
     ctx.logger.debug(
       `[force-compact] ${session.id}: PRE-FLIGHT OBSERVATION — total ${total} `
-      + `(usage-baseline ${measurement.baseline ? `${measurement.baseline?.kind}:${measurement.baseline?.tokens}` : 'n/a'} `
-      + `+ surfaceDelta ${measurement.surfaceDeltaTokens != null ? measurement.surfaceDeltaTokens : '?'}); `
+      + `(diagnostic baseline ${measurement && measurement.baseline ? `${measurement.baseline?.kind}:${measurement.baseline?.tokens}` : 'n/a'} `
+      + `+ diagnostic surfaceDelta ${(measurement && measurement.surfaceDeltaTokens != null) ? measurement.surfaceDeltaTokens : '?'}); `
       + `surfaces window = ${windowSumObserved} tokens across ${floorWindow.length} nodes, `
       + `retains ~${settings.retainLatestTokens} → max removable head = ${maxRemovableObserved} tokens; `
       + `naive projected-after ${projectedAfterObserved} is >= threshold ${settings.autoThresholdTokens} `
@@ -597,7 +625,7 @@ async function __forceCompactIfNeededBody(ctx, agent, signal, mode) {
     `[force-compact] ${session.id}: context ~${total} tokens >= threshold ${settings.autoThresholdTokens}; `
     + `rejecting the model request and compacting the head while retaining the latest ~${settings.retainLatestTokens} tokens`,
   )
-  const committed = await compactRetainingLatest(ctx, agent, signal, mode)
+  const committed = await compactRetainingLatest(ctx, agent, signal, mode, measurement)
   if (!committed) {
     // BLANK OUTCOME — nothing shrank, so the NEXT step re-attempts at the same
     // total. That is intentional ("先压缩再说"): a blank result never wedges the

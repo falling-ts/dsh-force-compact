@@ -1053,7 +1053,10 @@ function selectHeadAnchoredRegion(settings, session, measurement, retainOverride
       ? Math.max(0, Math.round(settings.retainLatestTokens))
       : 0)
   // PRIMARY (mirror of the auto path): price from the meter's own per-node
-  // snapshot — the same caliber as the threshold gate's `surfaceTokens`.
+  // snapshot — the node-pricing source shared with the threshold gate's
+  // retained-tail selector (whose SCALAR pressure basis is now the
+  // projection's `projectedTokens`, the exact figure the harness renders in
+  // the bottom-right corner).
   if (measurement !== undefined && Array.isArray(measurement.nodes) && measurement.nodes.length > 1) {
     return selectRetainingLatestTokens(session, retain, measurement)
   }
