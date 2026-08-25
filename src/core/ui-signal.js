@@ -61,31 +61,32 @@ export const PINNED_COLORS = Object.freeze({
 
 /**
  * The 20 WORKING-phase texts. Four-character, plainly-worded verbs describing
- * what the agent is doing right now ("思考中" / "整理中" / …). Colors are
- * unchanged and remain randomly paired with these labels.
+ * what the agent is doing right now ("思考中..." / "整理中..." / …) followed by
+ * a trailing ellipsis. Colors are unchanged and remain randomly paired with
+ * these labels.
  * @readonly
  */
 export const WORKING_TEXTS = Object.freeze([
-  '正在思考',
-  '正在整理',
-  '正在规划',
-  '正在分析',
-  '正在检索',
-  '正在推理',
-  '正在校验',
-  '正在比对',
-  '正在权衡',
-  '正在归纳',
-  '正在总结',
-  '正在撰写',
-  '正在执行',
-  '正在运行',
-  '正在处理',
-  '正在计算',
-  '正在核实',
-  '正在生成',
-  '正在准备',
-  '正在继续',
+  '正在思考...',
+  '正在整理...',
+  '正在规划...',
+  '正在分析...',
+  '正在检索...',
+  '正在推理...',
+  '正在校验...',
+  '正在比对...',
+  '正在权衡...',
+  '正在归纳...',
+  '正在总结...',
+  '正在撰写...',
+  '正在执行...',
+  '正在运行...',
+  '正在处理...',
+  '正在计算...',
+  '正在核实...',
+  '正在生成...',
+  '正在准备...',
+  '正在继续...',
 ])
 
 /**
