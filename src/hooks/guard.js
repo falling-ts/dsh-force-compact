@@ -33,25 +33,24 @@ import { resolveCompaction } from '../engine/backend.js'
 /**
  * The plugin's OWN debug logger — the single, consistent observability channel.
  *
- * Writes one line through the standard `[force-compact]`-marked `ctx.logger`
- * path, but ONLY when the `debug` setting is on (read live, falling back to the
- * composition default `true`). Because the `[force-compact]` marker is what the
- * debug-log exporter filters on, this is the reliable way to get a diagnostic
- * line into `~/.dsw/logs/dsh-force-compact.log`: marked lines land there exactly
- * when `debug === true` and the exporter is installed. The explicit `debug` check
- * also keeps the highest-frequency call sites (once per model request) at zero
- * cost when debug is off.
+ * Emits one line through the standard `[force-compact]`-marked `ctx.logger`
+ * path UNCONDITIONALLY (the hot per-model-request path pays no settings read).
+ * Whether the line actually reaches `~/.dsh/logs/dsh-force-compact.log` is
+ * decided ONCE, centrally, by the debug-log exporter in `core/log.js`: that
+ * exporter is installed only when the `debug` setting is on and writes a line
+ * only when it carries the `[force-compact]` marker. So the `debug` gate lives
+ * exclusively at the export boundary; callers simply emit.
  *
- * `msg` is the full `[force-compact] …` line. Call sites need not re-read the
- * settings themselves.
+ * `msg` is the full `[force-compact] …` line.
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @param {string} msg
- * @returns {Promise<void>}
  */
-export async function dbg(ctx, msg) {
-  const settings = (await readSettings(ctx)) ?? DEFAULTS
-  if (settings.debug !== true) return
-  ctx.logger.debug(msg)
+export function dbg(ctx, msg) {
+  try {
+    ctx.logger.debug(msg)
+  } catch {
+    /* observability must never break the requesting path */
+  }
 }
 
 /**

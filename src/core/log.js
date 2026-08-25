@@ -34,7 +34,7 @@
  * @module @falling-ts/dsh-force-compact/debug-log
  */
 
-import { readSettings, DEFAULTS } from './settings.js'
+import { readSettings, DEFAULTS, NS } from './settings.js'
 
 /** Marker identifying this plugin's own log lines (matches every `ctx.logger.*('[force-compact] …')` call site). */
 const MARKER = '[force-compact]'
@@ -126,8 +126,12 @@ export async function ensureDebugLogger(ctx) {
   debugState.attempted = true
 
   const resolved = (await readSettings(ctx)) ?? { ...DEFAULTS }
+  // Centralize the `debug` gate at the EXPORT boundary: the exporter decides,
+  // per line, whether to persist — reading the live `debug` setting at install
+  // time (and, on the fast path, trusting the cached flag). A `debug === false`
+  // deployment therefore installs nothing and writes nothing: no self-noticing
+  // line, no settings round-trip per emitted line.
   if (resolved.debug !== true) {
-    ctx.logger.debug('[force-compact] debug logging disabled by settings; no lines will be written')
     debugState.installed = true
     return
   }
@@ -144,11 +148,23 @@ export async function ensureDebugLogger(ctx) {
     return
   }
 
+  // Take a SINGLE synchronous snapshot of the `debug` setting on the very first
+  // exported line (cheap `getSync`/`get`, cached forever-after). This makes the
+  // export-boundary gate race-free: `debug === false` deployments persist
+  // NOTHING even for the first line, because the snapshot resolves synchronously
+  // rather than deferring to a background read. Thereafter the cached boolean
+  // drives the gate at zero per-line cost; a mid-process `debug` flip takes
+  // effect on the next exporter reinstall.
+  let debugGate
   const exporter = {
     colors: false,
     levels: { default: 3 },
     export: (message) => {
+      // Final persistence gate lives HERE (the export boundary): a line is
+      // written iff it carries the plugin marker AND the `debug` setting is on.
       if (!shouldInclude(message)) return
+      if (debugGate === undefined) debugGate = syncDebugSettingSnapshot(ctx)
+      if (!debugGate) return
       void writeLine(filePath, renderLine(message))
     },
   }
@@ -169,6 +185,32 @@ export async function ensureDebugLogger(ctx) {
  * Module scope, never exported; reset naturally on a fresh process.
  */
 const debugState = { attempted: false, installed: false }
+
+/**
+ * Synchronously snapshot the live `debug` setting exactly once (module-level
+ * cache), resolving either through the `settings` service's synchronous read
+ * (`getSync`) or its ordinary read (returned synchronously when backed by a
+ * local store). Returns a settled boolean (never throws): missing values fall
+ * back to the composition default. Settling here at the FIRST exported line
+ * keeps the steady-state `export()` path free of any settings round-trip; a
+ * mid-process `debug` flip takes effect on the next exporter reinstall.
+ */
+let cachedDebug
+function syncDebugSettingSnapshot(ctx) {
+  if (cachedDebug !== undefined) return cachedDebug
+  try {
+    const raw = ctx.get?.('settings')
+    let v
+    if (raw != null && typeof raw.getSync === 'function') {
+      v = raw.getSync(NS)?.debug
+    } else if (typeof raw?.get === 'function') {
+      v = raw.get(NS)?.debug
+    }
+    return v !== undefined ? v === true : DEFAULTS.debug
+  } catch {
+    return DEFAULTS.debug
+  }
+}
 
 /**
  * Keep only this plugin's own lines: the first `args` element is the log
