@@ -299,10 +299,21 @@ async function __compactRetainingLatestBody(ctx, agent, signal, mode) {
   // disagree; proceeding would price a STALE span. Refuse the compaction
   // attempt entirely (next step retries on a fresh snapshot) rather than pay
   // for a summarization of the wrong bytes.
+  // NOTE: `measurement.nodes` entries are OBJECTS shaped `{ seq, tokens }`
+  // (per-node pricing), whereas `session.surface.nodes` is the bare SEQUENCE
+  // of surface-node seqs. Compare BY EXTRACTED SEQ, element for element — the
+  // meter snapshot is taken microseconds earlier, so a concurrent append or
+  // replace landing in between shows up here as either a length difference or
+  // a seq divergence at some position. (A naive `element !== surfaceNodes[i]`
+  // comparison is WRONG here: it compares an object to a number and ALWAYS
+  // diverges, refusing every single compaction — the live-observed symptom
+  // "priced=49 vs current=49 nodes" yet REFUSED.)
   const surfaceNodes = (session.surface && Array.isArray(session.surface.nodes)) ? session.surface.nodes : []
   const pricedNodes = (measurement !== undefined && Array.isArray(measurement.nodes)) ? measurement.nodes : null
-  if (pricedNodes !== null && (pricedNodes.length !== surfaceNodes.length
-    || pricedNodes.some((seq, index) => seq !== surfaceNodes[index]?.seq))) {
+  const misaligned = pricedNodes.length !== surfaceNodes.length
+    || pricedNodes.some((node, index) => node === null || typeof node !== 'object'
+      || typeof node.seq !== 'number' || node.seq !== surfaceNodes[index])
+  if (pricedNodes !== null && misaligned) {
     ctx.logger.debug(
       `[force-compact] ${session.id}: token-meter surface does not match the current session surface ` +
       `(priced=${pricedNodes.length} vs current=${surfaceNodes.length} nodes) — REFUSING this compaction ` +
