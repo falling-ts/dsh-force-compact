@@ -94,10 +94,18 @@
  *     silent thereafter).
  *   • FIRES THE LIVE UI STATUS SIDE-CHANNEL (`core/ui-signal.js`) on every
  *     invocation — the "each LLM call start = fresh random working pair"
- *     watermark. The publication is awaited BEFORE `next()`, never touches
- *     `payload` (the deep-frozen seed — untouched per the two-hard-walls
- *     note above), and a failed publication is swallowed INSIDE
- *     `publishRandomWorking`, so it can never stall or reject the stream.
+ *     watermark. Publication is KICKED OFF FIRE-AND-FORGET (a plain
+ *     non-awaited `publishRandomWorking(ctx)` call placed BEFORE the
+ *     synchronous `return next()`) so the listener itself STAYS SYNC and can
+ *     directly hand back the real stream; `publishRandomWorking` swallows all
+ *     of its own rejections internally, so the fire-and-forget form leaks no
+ *     unhandled rejection. It never touches `payload` (the deep-frozen seed —
+ *     untouched per the two-hard-walls note above), so it can never stall or
+ *     corrupt the stream.
+ *   • The listener is DECLARED NON-ASYNC: an `async` listener would wrap
+ *     `next()`'s stream return in a Promise, and the waterfall dispatcher's
+ *     downstream `yield* <promise>` would throw
+ *     `yield* (intermediate value)… is not async iterable` on every call.
  *
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @returns {boolean} whether this call actually performed the (once-only)
@@ -111,25 +119,26 @@ let installed = false
 export function registerLlmStreamHook(ctx) {
   if (installed) return false
   try {
-    ctx.on('llm/stream', async (payload, next) => {
-      // Side channel FIRST, then forward. `payload` is the deep-frozen
-      // GenerateOptions seed — NEVER mutated (see the two-hard-walls note in
-      // the module header: in-place assignment raises `object is not
-      // extensible`, and the base generator binds the seed so a reshaped
-      // clone never reaches the serializer). The publication below touches
-      // NONE of that: it is a pure settings-write on a side channel
-      // (the `liveUi` field of the `falling-ts-force-compact` namespace),
-      // which the client half's `settingsScope.bind` mirror reflects live
-      // so the browser can repaint the conversation area's `TurnStatus`
-      // node. `void payload` documents the deliberate non-use.
+    // CONTRACT: this listener MUST stay SYNCHRONOUS. The `llm/stream`
+    // waterfall expects each layer's RETURN VALUE to BE the (async-iterable)
+    // chunk stream itself, so that downstream layers / the dispatcher can
+    // immediately `yield*` (or `for await`) it. Making the listener `async`
+    // wraps that return in a PROMISE, and the downstream `yield* <promise>`
+    // explodes with `yield* (intermediate value)… is not async iterable` —
+    // exactly the crash observed on every built-in compaction attempt. The
+    // side-channel publication therefore runs FIRE-AND-FORGET (never blocking
+    // the return): `publishRandomWorking` swallows ALL of its own rejections
+    // internally (guaranteed side-effect-free w.r.t. the waterfall), so
+    // kicking it off without awaiting cannot leak an unhandled rejection.
+    // `payload` is the deep-frozen GenerateOptions seed — NEVER mutated (see
+    // the two-hard-walls note in the module header); the publication touches
+    // none of that (pure settings-write on the `liveUi` field, mirrored live
+    // to the browser so it can repaint the `TurnStatus` node). `void payload`
+    // documents the deliberate non-use.
+    ctx.on('llm/stream', (payload, next) => {
       void payload
-      // Awaiting the publication BEFORE `next()` means the browser observes
-      // the fresh working pair AT the request boundary, before the first
-      // chunk flows. The underlying write is a local in-process merge
-      // (sub-millisecond typical); a rejection is swallowed inside the
-      // publisher (guaranteed side-effect-free w.r.t. the waterfall).
-      await publishRandomWorking(ctx)
-      return next()
+      publishRandomWorking(ctx)   // fire-and-forget: sync kick-off, async settle
+      return next()               // synchronous return of the REAL stream
     })
     installed = true
     return true
