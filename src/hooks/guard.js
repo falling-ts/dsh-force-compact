@@ -88,6 +88,88 @@ export function takeForceCompact(sessionId) {
 }
 
 /**
+ * Per-session "compaction gave up" cooldown memo.
+ *
+ * WHY THIS EXISTS (dead-loop prevention): the `agent/pre-step` threshold gate
+ * rejects a model step and attempts a compaction when total context >=
+ * `autoThresholdTokens`. When that compaction comes back UNCOMMITTED — a blank
+ * / empty summary, a shrink-gate reject, a moved range — NOTHING shrank, so the
+ * NEXT step measures the SAME total, hits the SAME gate, and compacts AGAIN.
+ * Left alone this is an unbounded reject-retry storm that LOOKS like a hang.
+ *
+ * RULE: when a threshold-gate compaction yields no committed change, we record
+ * the session's token count AT THAT MOMENT (plus a short diagnostic note). While
+ * the session's total stays at-or-below that mark (+ a small tolerance), we STOP
+ * attempting threshold-gated compaction for that session and simply let requests
+ * proceed — "blank result, no further action." Once the session grows PAST the
+ * mark (genuinely new content accumulates), the cooldown expires automatically,
+ * so a legitimately large future context still triggers a fresh attempt. No
+ * timers, no persistent state — purely process-local, mirroring `pendingForce`.
+ *
+ * BOUNDED: capped to at most {@link MAX_COOLDOWN_ENTRIES} sessions so a long-lived
+ * process with many conversations cannot accumulate unbounded memo state. When
+ * the cap is exceeded, the OLDEST inserted entry is evicted (Map preserves
+ * insertion order, so `keys().next()` is deterministic). Entries self-clear on
+ * expiry/success, keeping steady-state size near zero in normal use.
+ * @type {Map<string, { tokens: number, note: string }>}
+ */
+const compactCooldown = new Map()
+const MAX_COOLDOWN_ENTRIES = 32
+
+/**
+ * How far total tokens may grow above a cooled-down mark before the cooldown
+ * expires and compaction is retried. A tiny absolute floor avoids jitter on
+ * noisy measurements; generous enough that ordinary inter-step noise (a few
+ * hundred tokens of tool output) does not spuriously reset.
+ */
+const COOLDOWN_GROWTH_TOLERANCE = 500
+
+/**
+ * Remember that a threshold-gated compaction came back blank for one session,
+ * capturing its current token count as the "don't retry until it grows past
+ * THIS" high-water mark.
+ * @param {string} sessionId
+ * @param {number} totalTokens the measured total at the moment of the blank result.
+ * @param {string} note why the compaction did not commit (diagnostic only).
+ */
+function markCompactCooldown(sessionId, totalTokens, note) {
+  // Evict oldest-to-newest overflow BEFORE inserting so the new (most recent)
+  // session is always retained; delete-first then re-set keeps Map insertion
+  // order stable (delete + set moves the key to the tail = newest).
+  while (compactCooldown.size >= MAX_COOLDOWN_ENTRIES) {
+    const oldest = compactCooldown.keys().next().value
+    if (oldest === undefined) break
+    compactCooldown.delete(oldest)
+  }
+  compactCooldown.delete(sessionId) // move to tail if already tracked
+  compactCooldown.set(sessionId, { tokens: totalTokens, note })
+}
+
+/**
+ * Check (and, on expiry, CLEAR) a session's compaction cooldown.
+ * @param {string} sessionId
+ * @param {number} totalTokens the current measured total.
+ * @returns {string|undefined} a human-readable note explaining why compaction is
+ *   being skipped, or `undefined` when no cooldown applies (proceed normally).
+ *   Clears the memo once the session has grown beyond mark + tolerance.
+ */
+function consultCompactCooldown(sessionId, totalTokens) {
+  const entry = compactCooldown.get(sessionId)
+  if (entry === undefined) return undefined
+  const grewPast = totalTokens > entry.tokens + COOLDOWN_GROWTH_TOLERANCE
+  if (grewPast) {
+    compactCooldown.delete(sessionId)
+    return undefined
+  }
+  return entry.note
+}
+
+/** Drop a session's cooldown memo (used when a compaction finally succeeds). */
+function clearCompactCooldown(sessionId) {
+  compactCooldown.delete(sessionId)
+}
+
+/**
  * Compact the **earliest** `ratio` fraction of a session's **tokens** via
  * `compactRegion` (the "earliest conversation token ratio" knob). Measures the
  * session's total context tokens (via `tokenMeter` or a character-based
@@ -149,9 +231,12 @@ async function compactEarliestRatio(ctx, agent, signal, ratio, mode) {
       ctx.logger.debug(`[force-compact] ${session.id}: earliest ${ratio} compaction committed nothing via ${backend.kind}`)
       return false
     }
-    // COMMITTED — range shadowed + summary added. Pin GREEN "done"; the next
-    // model step's `llm/stream` watermark replaces it with a fresh random
-    // working pair shortly after (typical cadence < 3 s — no timer).
+    // COMMITTED — range shadowed + summary added. Clear any outstanding
+    // cooldown memo for this session (it demonstrably shrank this time, so a
+    // future threshold hit should attempt fresh, not inherit a stale give-up).
+    clearCompactCooldown(session.id)
+    // Pin GREEN "done"; the next model step's `llm/stream` watermark replaces
+    // it with a fresh random working pair shortly after (cadence < 3 s, no timer).
     await publishDone(ctx)
     ctx.logger.info(
       `[force-compact] ${session.id}: earliest ${ratio} compaction (${backend.kind}) shadowed ${result.shadowedSeqs?.length ?? '?'} nodes `
@@ -207,6 +292,20 @@ export async function forceCompactIfNeeded(ctx, agent, signal, mode) {
     return false
   }
 
+  // DEAD-LOOP GUARD — BLANK-RESULT SHORT-CIRCUIT. If a PRIOR threshold-gated
+  // compaction for this session came back blank/uncommitted and the context has
+  // NOT meaningfully grown since, we STOP attempting and let the request proceed
+  // as-is. Without this, a blank result shrinks nothing, so EVERY subsequent
+  // step re-measures the same total >= threshold, re-compacts, gets another
+  // blank, repeats forever — the "hang". Per requirement: a blank outcome means
+  // no further automatic action. (An explicit `/force-compact` command above
+  // bypasses this guard deliberately — honoring a user's direct request.)
+  const cooldownNote = consultCompactCooldown(session.id, total)
+  if (cooldownNote !== undefined) {
+    await dbg(ctx, `[force-compact] ${session.id}: threshold reached (~${total} tokens) but AUTO compaction previously came back blank/unchanged and context has not grown past the cooldown mark — SKIPPING compaction, letting the request proceed (note: ${cooldownNote}). Will re-arm once the session grows ~${COOLDOWN_GROWTH_TOLERANCE} tokens past the last blank mark.`)
+    return false
+  }
+
   // At or above the threshold: do NOT request the model. Compact the earliest
   // `autoEarliestRatio` of the conversation instead; the loop retries the step
   // against the shrunken context.
@@ -215,7 +314,17 @@ export async function forceCompactIfNeeded(ctx, agent, signal, mode) {
     + `rejecting the model request and compacting the earliest ${settings.autoEarliestRatio}`,
   )
   const committed = await compactEarliestRatio(ctx, agent, signal, settings.autoEarliestRatio, mode)
-  await dbg(ctx, `[force-compact] ${session.id}: threshold-gate compaction ${committed ? 'COMMITTED' : 'did not commit'} — letting the request proceed`)
+  if (!committed) {
+    // BLANK OUTCOME — record a cooldown HIGH-WATER MARK at this token count so
+    // subsequent steps at (roughly) the same total stop hammering. CLEARED
+    // automatically once the session genuinely grows (see
+    // consultCompactCooldown) or a compaction finally commits (see
+    // compactEarliestRatio).
+    markCompactCooldown(session.id, total, 'blank/unchanged summary at threshold')
+    await dbg(ctx, `[force-compact] ${session.id}: threshold-gate compaction came back BLANK — recorded a compaction cooldown at ~${total} tokens (auto-gate will pause here until context grows). Letting the request proceed.`)
+  } else {
+    await dbg(ctx, `[force-compact] ${session.id}: threshold-gate compaction COMMITTED — letting the request proceed`)
+  }
   return committed
 }
 
