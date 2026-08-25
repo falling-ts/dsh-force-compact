@@ -110,23 +110,28 @@ llama.cpp 原生支持关闭推理的两种 wire 形态（`server-common.cpp`）
 **实现**：`src/hooks/wire-rewrite.js` 提供一个 `llm/stream` Waterfall 监听器
 （挂在 `ctx.llm.stream` 前的单一 LLM 出口缝，参见
 `deepseek-harness/packages/llm/llm/src/index.ts` 的 `llm/stream` 事件）。
-每次出 LLM 调用前，钩子按以下规则做**条件追加**：
+每次出 LLM 调用前，钩子按以下规则做**无条件全量追加**（不再有 provider/model
+目标门控——`reasoning_effort:"none"` 在所有已知后端上都无害：真 DeepSeek 容忍
+未知顶层键、llama.cpp/OAI 兼容层直接解析执行），因此一旦 `disableThinking`
+开启就对**每一次**出站调用（业务请求 + 本插件摘要调用）追加，消除"目标识别
+启发式漏判某条 Qwen 路由 → 静默仍思考"的死角：
 
 | 条件 | 行为 |
 |------|------|
-| `disableThinking` 设置为 `true` **且** `isOpenAiCompatibleTarget(provider, model)` 命中 | 在 `next()` 返回的 options 上做**浅拷贝**，追加 `reasoning_effort: 'none'` 后返回，其余字段保持不动（包括原有的 `thinking` 字段——llama.cpp 容忍未知键，真 DeepSeek API 也会因 `thinking` 已存在而忽略此新增字段）。 |
-| `disableThinking` 缺失 / 为 `false` | `return await next()` 原样转发，零开销短路。 |
-| 目标非 OpenAI 兼容（即真 DeepSeek 部署，`provider` 含 `deepseek` 且 `model` 不以 `.gguf` 结尾） | `return await next()` 原样转发，保留 `thinking:{type:'disabled'}` 的正确语义。 |
+| `disableThinking` 设置为 `true` | 在 `next()` 返回的 options 上做**浅拷贝**，追加 `reasoning_effort: 'none'` 后返回；原有 `thinking` 字段保留不动，形成**双层保险**。 |
+| `disableThinking` 缺失 / 为 `false` | `return await next()` 原样转发，零开销短路（不分配、不改写）。 |
 
-**目标识别启发式**（保守，宁可漏判不可误伤）：`isOpenAiCompatibleTarget(provider, model)`
-仅当满足任一条件才返回真：
-- `provider` 字符串（小写化后）**包含** `llama` 子串；
-- `model` 字符串（小写化后）**以** `.gguf` 结尾。
+**双层保险（关键设计）**：`disableThinking` 现在由**两处**协同关闭思考，二者互补、各有覆盖：
+- **层 1（请求缝，adapter 产出）**：`agent/request` waterfall 设 `reasoningEffort:'off'`，经 DeepSeek 适配器序列化为 wire 字段 `thinking:{type:'disabled'}`。**真 DeepSeek API 认这个字段**；在 llama.cpp/OAI 兼容端点上该顶层键不被 schema 识别、被透传进 `llama_params` 后忽略——故此层对 llama.cpp **无效**。
+- **层 2（wire 缝，本钩子追加）**：`llm/stream` waterfall 在 adapter 序列化之后追加顶层 `reasoning_effort:"none"`。**llama.cpp/OAI 兼容端点认这个字段**（`server-common.cpp:1295-1304` 特判为 `inputs.enable_thinking=false`，与 jinja 模板能力无关）；真 DeepSeek 端点将该未知键静默忽略——故此层对真 DeepSeek **无害**。
 
-这两条覆盖了本机 :8080 部署（`/v1/models` 实测返回的 `model` 值为
-GGUF 绝对路径，符合第二条）。对未来新变型可在此函数内扩展；漏判的最坏后果
-仅是回到静默失效（而非崩溃），误判（真 DeepSeek 被打上 `reasoning_effort`
-键）因 OpenAI 兼容层对未知顶层字段的容错特性也不会导致请求失败。
+任一端点至少收到它能理解的其中一个字段，`disableThinking:true` 即在**任何后端**
+都如实关闭思考，两层之间无盲区。
+
+**为何不做目标识别**：早期版本曾用 `isOpenAiCompatibleTarget`（`provider` 含
+`llama` / `model` 以 `.gguf` 结尾）做保守门控，但漏判某条非常规路由的后果就是
+回到静默失效；而误判（真 DeepSeek 被多打一未知键）本就无害。既然两端点都无害，
+干脆去掉门控改为全量追加——覆盖率确定性最高，也不再有启发式要维护。
 
 **惰性幂等安装**：与 `maybeRegisterCommand` 同套路——`maybeInstallWireRewrite`
 在每个受守卫的监听器（`agent/request` / `agent/pre-step` / `agent/status`
@@ -141,8 +146,8 @@ DeepSeek 适配器（无独立的 llama.cpp 适配器包），再起一份 adapt
 `docs/llm-stream-llamacpp-adaptation.md` §7（A/B/C 三方案，此处采用 A）。
 
 **观测**：钩子仅在真正改写时输出一条
-`ctx.logger.debug('[force-compact] llm/stream: appended reasoning_effort="none" for OpenAI-compatible target <provider>/<model>')`，
-供事后核查；不改写路径零日志。
+`ctx.logger.debug('[force-compact] llm/stream: appended reasoning_effort="none" (disableThinking on) for <provider>/<model>')`，
+供事后核查；`disableThinking` 关闭或不改写路径零日志。
 
 ### 摘要器：深度对齐官方 `compaction-basic`（2026-08 升级）
 
