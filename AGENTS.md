@@ -32,9 +32,9 @@ resolveCompaction
 | 步骤 | 追加的事件 | 说明 |
 |------|-----------|------|
 | 打开锁 | `fc-compact/start` | `compactionId`（UUID），`turn`（当前 open turn 号或 null） |
-| 摘要生成 | — | 通过 `ctx.llm.stream` 流式生成，受 `maxSummaryTokens` 上限约束 |
+| 摘要生成 | — | 通过 `ctx.llm.stream` 流式生成，受 `maxSummaryTokens` 上限约束；**对齐官方 `compaction-basic`**：注入会话最新请求头中的 `system` 提示词 + `tools` 模式做前缀缓存对齐、三级 target 解析（configured→routed header→agent.options）、`purpose:'compaction'` 标签、完整 StreamChunk 装配（文本/推理/图像/用量）、终止 finish 分类（error/aborted/max-tokens/image 均按 fail-closed 抛错） |
 | 收缩门禁 | — | `tokenMeter.estimateMessage` 判定摘要 tokens < 被遮蔽区间 tokens，否则中止 |
-| 提交摘要标记 | `fc-compact/summary` | 记录 `compactionId`、`shadowedRange`、`shadowedSeqs`、`shadowedTokenCount`、可选 `provider`/`model` |
+| 提交摘要标记 | `fc-compact/summary` | 记录 `compactionId`、`shadowedRange`、`shadowedSeqs`、`shadowedTokenCount`、实测 `provider`/`model`/`maxTokens`、provider 上报的 `usage`（摘要调用真正观察到的 LLM 封装，而非预调用启发式猜测） |
 | Surface 替换 | `user/message` + `surfaceOp:{op:'replace',start,end}` | 带 `source={kind:'plugin',plugin:'force-compact-builtin'}`；`sourceEventSeqs` 指向 start+summary+shadowed |
 | 闭合锁 | `fc-compact/end` | 同上 `compactionId`；失败路径在此带 `error:` 字段 |
 
@@ -84,11 +84,31 @@ preset 把 `compaction-basic` 挂在了 `- isolate:{compaction:true,…}` 组里
    `fc-compact/start` → `fc-compact/summary` → `user/message`(replace) → `fc-compact/end`，
    共享同一个 `compactionId`。
 
-### 如何让官方服务"赢回来"
+### 如何将官方服务"赢回来"
 
 如果你的 preset 改过组合拓扑，使 `compaction-basic` 不再 isolate（root-realm
 或服务被显式挂到 host plane），则 `ctx.get('compaction')` 可命中，priority-1 路径
 直接胜出，内置引擎自然不参与——无需改动任何配置。
+
+### 摘要器：深度对齐官方 `compaction-basic`（2026-08 升级）
+
+内置引擎的 `ctx.llm` 摘要调用现已全面对齐官方 `compaction-basic` 的单源实现
+（`deepseek-harness/packages/compaction/compaction-basic/src/summarizer.ts` 的
+`summarizeWithLlm`）。**单一事实源原则**：所有可观察的 LLM 行为——target 解析顺序、
+前缀缓存对齐策略、`purpose` 标签、finish 语义、输出过滤、usage 采集——与官方保持一致，
+避免插件维护两份互相漂移的实现。
+
+| 维度 | 现状 |
+|------|------|
+| **Target 解析** | 三级回退：① 配置 `summarizationProvider`/`summarizationModel`（双非空才有效）→ ② 会话最新路由头 `agent.session.requestHeader().config.{provider,model}` → ③ `agent.options.{provider,model}`。取首个同时提供两字段的候选；三者皆缺 → 返回 `null`（不发出调用）。 |
+| **前缀缓存对齐** | 从 `requestHeader()` 提取 `system`（字符串）与 `tools`（数组）原样传入 `options.system` / `options.tools`，辅助调用即成为上次路由请求的真前缀，provider 的热 KV 缓存得以复用而非失效。请求头缺省时相应字段整体省略，退回旧的"仅消息"形态。 |
+| **Purpose** | `options.purpose = 'compaction'` 恒定标签（closed-union，adapter 据此路由生成策略）；**不用** agent 的自由文本 purpose。 |
+| **流式装配** | 对所有 `StreamChunk` 种类做完整装配（仿官方 `BlockAssembler`，但因插件以 plain JS 发布、无法解析 `@deepseek-ai/dsh-llm` 符号，此处**内联**一份等价装配逻辑，对照文档化的 `StreamChunk` 形状书写）：`text-delta` 累积为 `{type:'text'}` 块；`reasoning-delta`/`reasoning-chunks` 归并为 `{type:'reasoning'}` 块（**后续剔除**——推理是 UI 折叠区，不作 checkpoint 内容）；`image` 置 `hasImage=true` 并保留块；`usage` 捕获 provider 上报的 usage；`finish` 捕获终止事实。 |
+| **Finish 分类（fail-closed）** | 无终块 → `TypeError`；`error` → `PROVIDER_ERROR`（携带 provider 失败描述）；`aborted`/`abort` → `ABORTED`；`max-tokens`/`length` 且文本为空 → `MAX_TOKENS_EMPTY`；`max-tokens`/`length` 且有文本 → **接受为部分摘要**（交由下游收缩门禁决定是否有用）；图像输出 → `UNSUPPORTED_CONTENT`；纯白文本 → 抛错。 |
+| **错误语义** | `null` 仅表示"从未发出调用"（缺 target 或缺 `ctx.llm`）；其他一切失败一律**抛异常**，由 `runTransaction` 捕获并经 `closeWithError` 走带 `error:` 字段的 `fc-compact/end`。 |
+| **Usage 采集** | provider 上报的 usage 随结果上浮，落到 `fc-compact/summary` 事件的 `usage` 字段，供可观测性使用。 |
+| **`<compacted-summary>` 标签** | 指令尾部明确要求：若输入已含 `<compacted-summary>` 块（前次 checkpoint），不得逐字复制，须保留仍然成立的、丢弃过期信息、并入更新的信息。防二次压缩整段拷贝旧摘要导致雪球膨胀。 |
+| **向后兼容** | `summarize(ctx, config, agent, messagesOrInput, signal, extra)` 第 4 参既可传裸 `messages` 数组（旧形态，自动包装为 `{messages}`），也可传 `{messages, system?, tools?}`（新形态）。现有调用方零修改即可享受新能力；`builtin.js` 已切到新形态并喂入 `headerPrefix()` 提取的前缀。 |
 
 ## 如何判断插件是否加载成功
 

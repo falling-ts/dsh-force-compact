@@ -23,16 +23,12 @@
  * @module @falling-ts/dsh-force-compact/builtin-engine
  */
 
-import { summarize } from './summarizer.js'
+import { summarize, CHECKPOINT_PREAMBLE, headerPrefix } from './summarizer.js'
 import { selectEarliestByTokens } from './region.js'
 import { readSettings, DEFAULTS } from '../core/settings.js'
 
 /** Characters per token — mirrors the token meter's coarse estimator. */
 const CHARS_PER_TOKEN = 4
-
-/** The framing that marks the replacement as established background context. */
-const CHECKPOINT_PREAMBLE =
-  'This is an automatically generated checkpoint condensing an earlier span of the conversation to free up context. Treat the captured context as established background and build on it without restating it.'
 
 /** Provenance tag carried on the checkpoint message's `source`. */
 const CHECKPOINT_SOURCE = Object.freeze({ kind: 'plugin', plugin: 'force-compact-builtin' })
@@ -148,15 +144,40 @@ async function runTransaction(ctx, agent, session, region, signal, settings) {
   if (signal !== undefined) signal.throwIfAborted()
 
   // ---- Summarize ---------------------------------------------------------
+  // Feed the session's latest request-header prefix (system prompt + tool
+  // schemas) verbatim into the summarization call so the provider's warm KV
+  // cache for the last routed request is REUSED rather than invalidated (the
+  // official `compaction-basic` prefix-cache-alignment strategy). When the
+  // header carries neither, the call degrades to the legacy messages-only
+  // shape. The summarizer's three-tier target resolution (configured →
+  // latest-routed-header → agent.options) picks the right provider/model.
   let summaryBlocks
+  let summarizationUsage
+  let summarizationProvider
+  let summarizationModel
+  let summarizationMaxTokens
   try {
     const extra = { reasoningEffort: settings.disableThinking ? 'off' : undefined }
     if (Number.isFinite(settings.maxSummaryTokens) && settings.maxSummaryTokens > 0) {
       extra.maxTokens = settings.maxSummaryTokens
     }
-    const preview = await summarize(ctx, settings, agent, messages, signal, extra)
+    const prefix = headerPrefix(agent && agent.session)
+    const input = {
+      messages,
+      ...(prefix.system !== undefined ? { system: prefix.system } : {}),
+      ...(prefix.tools !== undefined ? { tools: prefix.tools } : {}),
+    }
+    const preview = await summarize(ctx, settings, agent, input, signal, extra)
+    // `summarize` returns null ONLY when no target could be resolved OR the
+    // `ctx.llm` service is missing (the call was never made). Every other
+    // failure path (terminal error / abort / truncated-with-no-output / image
+    // content / empty-text) THROWS a typed error caught below.
     if (preview === null) throw new Error('summarizer produced no text')
     summaryBlocks = preview.summary
+    summarizationUsage = preview.usage
+    summarizationProvider = preview.provider
+    summarizationModel = preview.model
+    summarizationMaxTokens = preview.maxTokens
   } catch (error) {
     closeWithError(session, startEvent, compactionId, error, ctx)
     return null
@@ -195,9 +216,17 @@ async function runTransaction(ctx, agent, session, region, signal, settings) {
     shadowedSeqs,
     shadowedTokenCount,
   }
-  const target = resolveTargetLabel(agent)
-  if (target.provider) summaryData.provider = target.provider
-  if (target.model) summaryData.model = target.model
+  // Record the ACTUAL LLM call envelope observed from the summarization
+  // invocation (ground-truth provider/model/maxTokens/usage) — this is the
+  // authoritative source, replacing the previous pre-call header/options
+  // label heuristic. We only reach this point after a successful summarization,
+  // so the observed fields are defined whenever the provider carried them.
+  if (summarizationProvider) summaryData.provider = summarizationProvider
+  if (summarizationModel) summaryData.model = summarizationModel
+  if (Number.isFinite(summarizationMaxTokens) && summarizationMaxTokens > 0) {
+    summaryData.maxTokens = summarizationMaxTokens
+  }
+  if (summarizationUsage !== undefined) summaryData.usage = summarizationUsage
 
   try {
     summaryEvent = markIgnorable(session.append('fc-compact/summary', summaryData))
@@ -377,22 +406,6 @@ function currentOpenTurn(session) {
     if (ev.type === 'turn/end') return null
   }
   return null
-}
-
-/** Resolve the provider/model route label for the summary metadata. */
-function resolveTargetLabel(agent) {
-  const out = { provider: '', model: '' }
-  const session = agent.session
-  if (session !== undefined && typeof session.requestHeader === 'function') {
-    const header = session.requestHeader()
-    const config = header && header.config
-    if (config && typeof config.provider === 'string' && config.provider) out.provider = config.provider
-    if (config && typeof config.model === 'string' && config.model) out.model = config.model
-  }
-  const opts = agent.options || {}
-  if (!out.provider && typeof opts.provider === 'string' && opts.provider) out.provider = opts.provider
-  if (!out.model && typeof opts.model === 'string' && opts.model) out.model = opts.model
-  return out
 }
 
 /** Coarse token count for a set of messages (4 chars/token). */
