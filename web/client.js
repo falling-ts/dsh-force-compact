@@ -614,7 +614,6 @@ window.__ModuleLoader__.load({
           d.value = s.value;
           d.writable = s.writable;
         });
-      };
         // ── Live UI 徽章（详见上方 paintTurnStatus 文档）──
         // 每次命名空间快照翻转（含宿主写入 liveUi 瞬间）,顺路把最新 liveUi
         // 贴到对话区 TurnStatus DOM 上。这一步搭车在已有 scope.subscribe
@@ -623,6 +622,7 @@ window.__ModuleLoader__.load({
         if (s.status === "ready" && s.value && typeof s.value.liveUi === "object") {
          paintTurnStatus(s.value.liveUi);
         }
+      };
       // 关键：settingsScope 的快照自带权威状态枚举 'loading'|'ready'|'unavailable'
       // （见 ui-settings 的 SettingsScopeController.derive：命名空间未出现时置
       // 'unavailable'，并非 'loading'）。derive 直接透传该枚举，绝不按 mode 二次
