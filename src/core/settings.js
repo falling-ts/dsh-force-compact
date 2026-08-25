@@ -162,32 +162,49 @@ export const DEFAULTS = Object.freeze({
  *   (callers should fall back to their composition entry).
  */
 export async function readSettings(ctx) {
+  // SAFETY ENVELOPE: every model request and compaction path reads settings —
+  // a throw escaping here would take down the model-request seam. Wrap the whole
+  // read so ANY anomaly (a rejecting `settings.get`, a non-object stored value)
+  // degrades to `null` (= "use the caller's composition defaults"), never throw.
+  try {
+    return await __readSettingsBody(ctx)
+  } catch (error) {
+    const logger = (typeof ctx?.logger?.warn === 'function') ? ctx.logger.warn.bind(ctx.logger) : () => {}
+    logger(`[force-compact] readSettings degraded to defaults — ${error instanceof Error ? error.message : String(error)}`)
+    return null
+  }
+}
+
+async function __readSettingsBody(ctx) {
   const settings = ctx.get('settings')
-  if (settings === undefined) return null
-  const value = settings.get(NS)
-  if (value === undefined) return null
+  if (settings === undefined || typeof settings.get !== 'function') return null
+  const rawSection = settings.get(NS)
+  if (rawSection === undefined) return null
+  // A non-object stored value (corrupt/legacy yaml edge) degrades to an empty
+  // section so every field resolves to its DEFAULT below — never a throw.
+  const section = (rawSection && typeof rawSection === 'object') ? rawSection : {}
   const asBool = (field, fallback) =>
-    (typeof value[field] === 'boolean' ? value[field] : fallback)
+    (typeof section[field] === 'boolean' ? section[field] : fallback)
   const asPositiveInt = (field, fallback) =>
-    (Number.isFinite(value[field]) && value[field] > 0 ? value[field] : fallback)
+    (Number.isFinite(section[field]) && section[field] > 0 ? section[field] : fallback)
   const asRatio = (field, fallback) =>
-    (Number.isFinite(value[field]) && value[field] > 0 && value[field] <= 1 ? value[field] : fallback)
+    (Number.isFinite(section[field]) && section[field] > 0 && section[field] <= 1 ? section[field] : fallback)
   const disableThinking = asBool('disableThinking', DEFAULTS.disableThinking)
   const autoThresholdTokens = asPositiveInt('autoThresholdTokens', DEFAULTS.autoThresholdTokens)
   const autoEarliestRatio = asRatio('autoEarliestRatio', DEFAULTS.autoEarliestRatio)
   const forceEarliestRatio = asRatio('forceEarliestRatio', DEFAULTS.forceEarliestRatio)
   const turnEndForceCompactionEnabled = asBool('turnEndForceCompactionEnabled', DEFAULTS.turnEndForceCompactionEnabled)
   const debug = asBool('debug', DEFAULTS.debug)
-  const logFile = (typeof value.logFile === 'string' ? value.logFile : DEFAULTS.logFile)
-  const rawMode = (typeof value.compactionMode === 'string' && value.compactionMode.length > 0
-    ? value.compactionMode.toLowerCase()
+  const logFile = (typeof section.logFile === 'string' ? section.logFile : DEFAULTS.logFile)
+  const rawMode = (typeof section.compactionMode === 'string' && section.compactionMode.length > 0
+    ? section.compactionMode.toLowerCase()
     : DEFAULTS.compactionMode)
   const compactionMode = COMPACT_MODES.includes(rawMode) ? rawMode : DEFAULTS.compactionMode
   // Builtin-engine gate: absent / non-boolean stored values treat the field as
   // UNSET (rather than false), preserving the "default on" semantics even
   // when a legacy settings.yaml predates the field.
-  const builtinEnabled = (typeof value.builtinEnabled === 'boolean'
-    ? value.builtinEnabled
+  const builtinEnabled = (typeof section.builtinEnabled === 'boolean'
+    ? section.builtinEnabled
     : DEFAULTS.builtinEnabled)
   const maxSummaryTokens = asPositiveInt('maxSummaryTokens', DEFAULTS.maxSummaryTokens)
   return {
@@ -245,11 +262,19 @@ function buildEnumField(z, fallback) {
  *   settings service is not mounted or the field is unset.
  */
 export async function readRawSetting(ctx, field) {
-  const settings = ctx.get('settings')
-  if (settings === undefined) return undefined
-  const value = settings.get(NS)
-  if (value === undefined || value === null) return undefined
-  return value[field]
+  // SAFETY ENVELOPE: called from service-resolution and command paths; a
+  // rejecting `settings.get` or a non-section shape degrades to `undefined`
+  // (= "unset") rather than throwing.
+  try {
+    const settings = ctx.get('settings')
+    if (settings === undefined || typeof settings.get !== 'function') return undefined
+    const value = settings.get(NS)
+    if (value === undefined || value === null) return undefined
+    if (value !== null && typeof value !== 'object') return undefined
+    return value[field]
+  } catch {
+    return undefined
+  }
 }
 
 /**
@@ -379,6 +404,13 @@ export async function registerNamespace(ctx) {
   // so the namespace stays exposed even when schemastery is unresolvable.
   const placeholderSchema = (section) => section
   placeholderSchema.toJSON = () => ({})
-  settings.register(NS, schema !== null ? schema : placeholderSchema, thirdArg)
-  return true
+  // Contain the actual `settings.register` call: a hostile/partial `settings`
+  // implementation that throws on register must NOT break the plugin's `apply`
+  // (which registers all listeners). Degrade to "not registered" (false).
+  try {
+    settings.register(NS, schema !== null ? schema : placeholderSchema, thirdArg)
+    return true
+  } catch {
+    return false
+  }
 }

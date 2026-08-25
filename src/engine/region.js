@@ -15,7 +15,9 @@
  * @returns {{start: number, end: number} | null} the head-anchored span to compact, or `null` when there is nothing worth compacting.
  */
 export function selectRegion(session, config) {
-  const nodes = session.surface.nodes
+  // A malformed surface (missing `session.surface` / non-array `nodes`) yields
+  // nothing to compact — return null rather than throw.
+  const nodes = (session && session.surface && Array.isArray(session.surface.nodes)) ? session.surface.nodes : []
   const total = nodes.length
   if (total < config.minNodes) return null
 
@@ -80,8 +82,10 @@ export function selectRegion(session, config) {
  */
 function userMessageEventSeqs(session) {
   const seqs = new Set()
-  for (const event of session.events) {
-    if (event.type === 'user/message') seqs.add(event.seq)
+  const events = (session && Array.isArray(session.events)) ? session.events : []
+  for (const event of events) {
+    if (event === null || typeof event !== 'object') continue
+    if (event.type === 'user/message' && typeof event.seq === 'number') seqs.add(event.seq)
   }
   return seqs
 }
@@ -107,15 +111,17 @@ function userMessageEventSeqs(session) {
  * @returns {{start: number, end: number} | null} the head-anchored span to compact, or `null`.
  */
 export function selectEarliestByTokens(session, ratio, totalTokens) {
-  const nodes = session.surface.nodes
+  // A malformed surface / bad ratio yields nothing to compact — return null
+  // rather than throwing on a missing `session.surface.nodes` or an NaN budget.
+  const nodes = (session && session.surface && Array.isArray(session.surface.nodes)) ? session.surface.nodes : []
   const total = nodes.length
   if (total < 2) return null
+  const clampedRatio = Number.isFinite(ratio) ? Math.min(Math.max(ratio, 0), 1) : 0.5
 
   // Estimate the session's total tokens (surface content only).
-  const surfaceTokens = totalTokens !== undefined
-    ? totalTokens
-    : estimateSurfaceTokens(session)
-  const budget = Math.max(1, Math.round(surfaceTokens * ratio))
+  const rawTotal = (typeof totalTokens === 'number' && Number.isFinite(totalTokens) && totalTokens > 0) ? totalTokens : estimateSurfaceTokens(session)
+  const surfaceTokens = rawTotal
+  const budget = Math.max(1, Math.round(surfaceTokens * clampedRatio))
 
   const userMessageSeqs = userMessageEventSeqs(session)
 
@@ -150,27 +156,28 @@ export function selectEarliestByTokens(session, ratio, totalTokens) {
  * @returns {number}
  */
 function estimateEventTokens(session, seq) {
-  const event = session.events[seq]
-  if (event === undefined) return 0
+  // A missing/malformed event (non-array `session.events`, a non-object row, or
+  // missing `data` / `message`) degrades to 0 tokens rather than throwing — this
+  // estimator feeds a budget decision, never a correctness path.
+  const events = (session && Array.isArray(session.events)) ? session.events : []
+  const event = events[seq]
+  if (event === undefined || event === null || typeof event !== 'object') return 0
+  const data = (event.data && typeof event.data === 'object') ? event.data : {}
   let chars = 0
+  const sumBlocks = (blocks) => {
+    if (!Array.isArray(blocks)) return
+    for (const block of blocks) {
+      if (block && typeof block === 'object' && typeof block.text === 'string') chars += block.text.length
+    }
+  }
   if (event.type === 'user/message') {
-    for (const block of event.data.content || []) {
-      if (block && typeof block.text === 'string') chars += block.text.length
-    }
+    sumBlocks(data.content)
   } else if (event.type === 'assistant/message') {
-    const content = event.data.message && event.data.message.content
-    if (content) {
-      for (const block of content) {
-        if (block && typeof block.text === 'string') chars += block.text.length
-      }
-    }
+    const content = (data.message && Array.isArray(data.message.content)) ? data.message.content : undefined
+    if (content) sumBlocks(content)
   } else if (event.type === 'tool/result') {
-    const message = event.data.message
-    if (message && message.content) {
-      for (const block of message.content) {
-        if (block && typeof block.text === 'string') chars += block.text.length
-      }
-    }
+    const content = (data.message && Array.isArray(data.message.content)) ? data.message.content : undefined
+    if (content) sumBlocks(content)
   }
   return Math.ceil(chars / 4)
 }
@@ -182,15 +189,21 @@ function estimateEventTokens(session, seq) {
  * @returns {number}
  */
 function estimateSurfaceTokens(session) {
+  // Malformed shape (missing/non-array `events`, non-object rows, missing
+  // `data`/`message`) degrades each row to 0 tokens rather than throwing — this
+  // estimator feeds a budget decision, never a correctness path.
   let chars = 0
-  for (const event of session.events) {
+  const events = (session && Array.isArray(session.events)) ? session.events : []
+  for (const event of events) {
+    if (event === null || typeof event !== 'object') continue
+    const data = (event.data && typeof event.data === 'object') ? event.data : {}
     let content
-    if (event.type === 'user/message') content = event.data.content
-    else if (event.type === 'assistant/message') content = event.data.message && event.data.message.content
-    else if (event.type === 'tool/result') content = event.data.message && event.data.message.content
+    if (event.type === 'user/message') content = Array.isArray(data.content) ? data.content : undefined
+    else if (event.type === 'assistant/message') content = (data.message && Array.isArray(data.message.content)) ? data.message.content : undefined
+    else if (event.type === 'tool/result') content = (data.message && Array.isArray(data.message.content)) ? data.message.content : undefined
     if (content === undefined) continue
-    for (const block of content || []) {
-      if (block && typeof block.text === 'string') chars += block.text.length
+    for (const block of content) {
+      if (block && typeof block === 'object' && typeof block.text === 'string') chars += block.text.length
     }
   }
   return Math.ceil(chars / 4)

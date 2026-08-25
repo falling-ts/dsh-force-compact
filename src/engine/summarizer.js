@@ -117,22 +117,46 @@ export const CHECKPOINT_PREAMBLE =
  *   adapter's thinking toggle; `maxTokens` OVERRIDES the `config.maxSummaryTokens`
  *   base value when present (callers route through the `settings.maxSummaryTokens`
  *   runtime knob without changing the static default).
- * @returns {Promise<{ summary: Array, provider: string, model: string, maxTokens?: number, usage?: object }|null>}
- *   the condensed checkpoint (text-only blocks), the actual call envelope, and
- *   the provider-reported usage when available. Returns `null` ONLY when no
- *   target can be resolved (the call is never made). All other failures
- *   THROW (typed errors) so callers can classify them via `closeWithError`.
- *
- *   NOTE: a prior version returned `null` for every failure (empty target AND
- *   empty text alike); callers had no way to distinguish. Now: null = "never
- *   called" (missing target OR missing `ctx.llm`), throw = "called, failed".
+ * @returns {Promise<object>} NEVER rejects. A discriminated result object the
+ *   caller branches on by `status`:
+ *   • `{ status: 'ok', summary, provider, model, maxTokens?, usage? }` —
+ *     `summary` is the condensed text-only checkpoint blocks.
+ *   • `{ status: 'no-target' }` / `{ status: 'no-llm' }` — the call was never
+ *     made; caller silently skips (nothing to cool down).
+ *   • `{ status: '<failure>', reason: string }` — the call was made but no
+ *     usable summary resulted. Failure labels: `not-iterable`, `no-finish`,
+ *     `provider-error`, `aborted`, `truncated-empty`, `image-content`,
+ *     `empty-text`. Caller arms the per-session cooldown and closes the
+ *     transaction with `error`.
+ *   No throw path exists: a malformed chunk/finish/object degrades to a
+ *   labeled failure, so a bad provider response can never surface a TypeError
+ *   nor trap the idle path in an uncaught-exception retry loop.
  */
 export async function summarize(ctx, config, agent, input, signal, extra) {
+  // NEVER THROWS. Always resolves to a structured result the caller branches on
+  // by `status`:
+  //   { status: 'ok',        summary[], provider, model, maxTokens?, usage? }
+  //   { status: 'no-target' }            — no resolvable provider/model (call never made)
+  //   { status: 'no-llm' }               — ctx has no `llm.stream` service (call never made)
+  //   { status: '<failure>', reason: string } — the call was MADE but produced no usable
+  //                                              summary. Failures:
+  //     'not-iterable' (returned stream not an async iterable),
+  //     'no-finish' (stream consumed but delivered no terminal finish chunk),
+  //     'provider-error' (terminal finish kind:'error'),
+  //     'aborted' (terminal finish kind:'aborted'),
+  //     'truncated-empty' (kind:'max-tokens' with no text),
+  //     'image-content' (image blocks present — unsafe as a checkpoint),
+  //     'empty-text' (terminated successfully but emitted no text).
+  // The caller (builtin.js runTransaction) maps 'ok' → commit; 'no-target'/
+  // 'no-llm' → silent skip (nothing to cool down); any other status → arm the
+  // per-session failure cooldown + close the transaction with `error`. No throw
+  // path exists, so a malformed chunk/finish/object can never propagate a
+  // TypeError and the idle path can never loop on an uncaught exception.
   const target = resolveTarget(config, agent)
-  if (target === undefined) return null
+  if (target === undefined) return { status: 'no-target' }
 
   const llm = ctx.get('llm')
-  if (llm === undefined || typeof llm.stream !== 'function') return null
+  if (llm === undefined || typeof llm.stream !== 'function') return { status: 'no-llm' }
 
   // Backwards-compatible call signature: a bare `messages` array (the old
   // 4-arg form) is treated as an input with no system/tools prefix. New
@@ -200,75 +224,100 @@ export async function summarize(ctx, config, agent, input, signal, extra) {
   // — distinguishing "not async-iterable (swapped by a waterfall listener)" from
   // "iterated cleanly but never delivered a finish chunk".
   const stream = llm.stream(options)
-  const collected = await collectChunks(stream, signal, { recordOnEmpty: true })
-
-  // Terminal finish classification (fail-closed), keyed on the OFFICIAL
-  // `FinishReason.kind` closed union (upstream `packages/llm/llm/src/types.ts`:
-  // `'stop' | 'tool-calls' | 'max-tokens' | 'aborted' | 'error'`). Earlier code
-  // matched on invented literals ('complete'/'length'/'abort') that the provider
-  // never emits, so a NORMAL completion (`kind:'stop'`) fell through unclassified
-  // — harmless here (we only act on the failure kinds) but misleading. Matching
-  // the real enum keeps the branches honest and makes a future unknown `kind`
-  // visible rather than silently swallowed.
-  const finish = collected.finish
-  if (finish === undefined) {
-    // Stream terminated WITHOUT a terminal `finish` chunk. Two causes, both
-    // reported distinctly so the operator can act:
-    //   • the provider stream errored before emitting any chunk (setup/auth/
-    //     oversized-prompt rejection) — usually surfaces as a separate thrown
-    //     iteration error, but a lazy generator that dies quietly leaves finish
-    //     unset;
-    //   • the returned value was not async-iterable (a `llm/stream` waterfall
-    //     listener swapped the generator for a Promise/plain object) — the
-    //     `for await` threw or silently yielded nothing.
-    // Either way: NO usable summary. Attach the observed stream facts so the
-    // next reader knows which of the two happened.
-    const err = new Error(
-      'summarization stream ended without a terminal finish chunk '
-      + `(collected ${collected._chunkCount ?? '?'} chunks; stream was ${describeStream(stream)})`,
-    )
-    err.code = 'NO_FINISH_CHUNK'
-    throw err
+  // `collectChunks` performs the up-front async-iterability assertion and, if the
+  // returned value is NOT a real async iterable (a `llm/stream` waterfall
+  // listener swapped it for a Promise/plain object), it RESOLVES to
+  // `{ _rejected: true, _rejectReason, ... }` rather than throwing. Any other
+  // shape is treated as a degenerate collection (zero chunks, no finish) below.
+  // We therefore wrap in try/catch as belt-and-braces: even a stray iteration
+  // error degrades to a labeled failure instead of escaping `summarize`.
+  let collected
+  try {
+    collected = await collectChunks(stream, signal, { recordOnEmpty: true })
+  } catch (err) {
+    // `for await` threw mid-iteration (generator fault, network reset, a
+    // poisoned composed stream, …). Record it and fall through to the shared
+    // failure handling — never let it escape this function.
+    collected = {
+      blocks: [], text: '', hasImage: false, finish: undefined, usage: undefined,
+      _chunkCount: 0, _rejected: true,
+      _rejectReason: (err && err.message) ? err.message : String(err),
+    }
   }
-  const finishKind = finish.kind
+  if (!collected || typeof collected !== 'object') {
+    collected = { blocks: [], text: '', hasImage: false, finish: undefined, usage: undefined, _chunkCount: 0, _rejected: true, _rejectReason: 'collectChunks returned a non-object' }
+  }
+  if (collected._rejected) {
+    // The stream value was not a usable async iterable (see collectChunks).
+    return { status: 'not-iterable', reason: 'llm.stream() did not return an async iterable: ' + (collected._rejectReason || describeStream(stream)) }
+  }
+
+  // ---- Defensive read of the terminal `finish` ---------------------------
+  // We do NOT trust that `finish` is a well-formed object. Every property is
+  // read behind an explicit validity guard; any anomaly degrades to a labeled
+  // failure instead of throwing.
+  const finish = collected.finish
+  const finishIsObject = finish !== null && typeof finish === 'object'
+  const finishKind = finishIsObject ? (typeof finish.kind === 'string' ? finish.kind : undefined) : undefined
+
+  // No terminal finish chunk (or the chunk carried no recognizable `kind`):
+  // the stream stopped without telling us it completed. Report the observed
+  // facts and give up — never assume success.
+  if (finish === undefined) {
+    const n = (typeof collected._chunkCount === 'number') ? collected._chunkCount : '?'
+    return {
+      status: 'no-finish',
+      reason: `stream ended without a terminal finish chunk (collected ${n} chunks; stream was ${describeStream(stream)})`,
+    }
+  }
+  if (!finishIsObject || finishKind === undefined) {
+    // A `finish` chunk was seen but its payload was not the expected
+    // `FinishReason` object (e.g. `chunk.reason` was undefined/null or a
+    // primitive). Treat as an incomplete termination.
+    return {
+      status: 'no-finish',
+      reason: `terminal finish chunk lacked a valid kind (finish rendered as ${renderFinish(finish)})`,
+    }
+  }
+
+  // Official `FinishReason.kind` closed union (upstream types.ts):
+  //   'stop' | 'tool-calls' | 'max-tokens' | 'aborted' | 'error'.
   if (finishKind === 'error') {
-    const err = new Error('summarization provider failure: ' + (failureText(finish.failure) || 'unknown provider error'))
-    err.code = 'PROVIDER_ERROR'
-    throw err
+    return { status: 'provider-error', reason: 'provider failure: ' + (failureText(readProp(finish, 'failure')) || 'unknown provider error') }
   }
   if (finishKind === 'aborted') {
-    const err = new Error('summarization aborted during generation: ' + (failureText(finish.failure) || '(caller abort)'))
-    err.code = 'ABORTED'
-    throw err
+    return { status: 'aborted', reason: 'aborted during generation: ' + (failureText(readProp(finish, 'failure')) || '(caller abort)') }
   }
   if (finishKind === 'max-tokens') {
-    const textLen = measuredLength(collected.text)
-    if (textLen === 0) {
-      const err = new Error('summarization truncated at the token cap with no output')
-      err.code = 'MAX_TOKENS_EMPTY'
-      throw err
+    // Truncation at the token cap. Empty → useless (report); non-empty → a
+    // partial summary we ACCEPT, letting the downstream shrink gate arbitrate.
+    if (measuredLength(safeText(collected.text)) === 0) {
+      return { status: 'truncated-empty', reason: 'truncated at the token cap with no output' }
     }
-    // Truncated but non-empty: accept as a partial summary. The downstream
-    // shrink gate will decide whether it is useful; if it balloons beyond
-    // the shadowed span the transaction is aborted there anyway.
+    // fall through to extraction (partial accept)
   }
-  // `kind: 'stop'` and `kind: 'tool-calls'` are SUCCESS terminations — fall
-  // through to extracting the text below. (Tool-call output from a compaction
-  // request is unexpected but harmless; extractTextOnly keeps only text blocks.)
+  // `stop` / `tool-calls` / any unrecognized kind are treated as a normal
+  // termination — fall through to extracting whatever text was produced. An
+  // unrecognized `kind` is NOT fatal: we still surface any text and let the
+  // shrink gate decide usefulness.
 
-  const extracted = extractTextOnly(collected.blocks)
-  if (collected.hasImage) {
-    // Image output can never safely become a checkpoint user-message. Refuse
-    // loudly so the caller can close the transaction via closeWithError.
-    const err = new Error('summarization output contained image content — refusing to land as a checkpoint')
-    err.code = 'UNSUPPORTED_CONTENT'
-    throw err
+  // ---- Text extraction --------------------------------------------------
+  // `collected.blocks` is expected to be an array; a missing/non-array value
+  // simply yields an empty extraction (handled by the empty-text branch).
+  const extracted = extractTextOnly(Array.isArray(collected.blocks) ? collected.blocks : [])
+
+  // Image output can never safely become a checkpoint user-message.
+  if (collected.hasImage === true) {
+    return { status: 'image-content', reason: 'output contained image content — refusing to land as a checkpoint' }
   }
-  if (extracted.length === 0 || extracted.every(b => !(typeof b.text === 'string' && b.text.trim().length > 0))) {
-    throw new Error('summarization produced no usable text')
+
+  const usableText = extracted.some(b => b != null && typeof b === 'object' && typeof b.text === 'string' && b.text.trim().length > 0)
+  if (!usableText) {
+    return { status: 'empty-text', reason: 'produced no usable text' }
   }
 
   const result = {
+    status: 'ok',
     summary: extracted,
     provider: target.provider,
     model: target.model,
@@ -276,8 +325,44 @@ export async function summarize(ctx, config, agent, input, signal, extra) {
   }
   // Surface provider-reported usage when the adapter carried it; callers can
   // record it alongside `compaction/summary` for observability.
-  if (collected.usage !== undefined) result.usage = collected.usage
+  const usage = collected.usage
+  if (usage !== undefined && usage !== null) result.usage = usage
   return result
+}
+
+/**
+ * Read a single property defensively. Never throws regardless of `obj` shape.
+ * Returns `undefined` for non-objects or missing/invalid values. Used wherever
+ * we read into a structure we do not control (chunk payloads, finish reasons).
+ * @param {*} obj
+ * @param {string} key
+ * @returns {*}
+ */
+function readProp(obj, key) {
+  try {
+    if (obj === null || typeof obj !== 'object') return undefined
+    return obj[key]
+  } catch {
+    return undefined
+  }
+}
+
+/** Coerce a possibly-missing text field to a safe string for measurement. */
+function safeText(value) {
+  return typeof value === 'string' ? value : ''
+}
+
+/** Render a possibly-malformed `finish` value for diagnostics without throwing. */
+function renderFinish(finish) {
+  try {
+    if (finish === undefined) return 'undefined'
+    if (finish === null) return 'null'
+    if (typeof finish !== 'object') return typeof finish
+    const k = typeof finish.kind === 'string' ? `kind='${finish.kind}'` : 'kind=<missing>'
+    return `an object (${k})`
+  } catch {
+    return '<undescribable>'
+  }
 }
 
 /**
@@ -386,17 +471,19 @@ async function collectChunks(stream, signal, opts) {
     ? (stream[Symbol.asyncIterator]?.bind(stream))
     : undefined
   if (typeof asyncIterFn !== 'function') {
+    // The returned value is NOT a usable async iterable (a `llm/stream`
+    // waterfall listener swapped the generator for a Promise/plain object, or
+    // the value was undefined/null). Rather than THROWING — which would bubble
+    // an opaque `yield*`-style TypeError far up the stack — RESOLVE to a
+    // marked failure result so the caller can report it as a labeled
+    // `not-iterable` summarization failure and recover normally. No partial
+    // result is possible (nothing could be consumed), so nothing is salvaged.
     const detail = describeStream(stream)
-    const err = new Error(
-      `llm.stream() did NOT return an async iterable (got ${detail}) — `
-      + `a \`llm/stream\` waterfall listener is almost certainly replacing the `
-      + `stream generator with a different object; no chunks can be consumed`,
-    )
-    err.code = 'STREAM_NOT_ITERABLE'
-    // Propagate out of collectChunks straight to the transaction's catch
-    // (closeWithError records it). No partial result — the stream was never
-    // consumable, so there is nothing to salvage.
-    throw err
+    return {
+      blocks: [], text: '', hasImage: false, finish: undefined, usage: undefined,
+      _chunkCount: 0, _rejected: true,
+      _rejectReason: `did NOT return an async iterable (got ${detail}); a llm/stream waterfall listener likely replaced the generator with another object`,
+    }
   }
   const blocks = []
   let text = ''
@@ -460,11 +547,20 @@ async function collectChunks(stream, signal, opts) {
   const recording = Boolean(opts && opts.recordOnEmpty)
   let chunkCount = 0
 
-  for await (const chunk of stream) {
+  for await (const rawChunk of stream) {
     if (signal !== undefined && signal.aborted) break
+    // Defensive: a malformed stream may yield null/undefined/non-object items.
+    // Count them (so the "consumed N chunks" diagnostic stays accurate) but skip
+    // their processing — reading `.type` on a non-object would throw.
+    const chunk = (rawChunk !== null && typeof rawChunk === 'object') ? rawChunk : undefined
     chunkCount++
+    if (chunk === undefined) continue
     if (recording && probeBuf.length < 3 && chunkCount <= 3) {
-      probeBuf.push({ type: chunk && chunk.type, keys: Object.keys(chunk || {}).join(','), sample: JSON.stringify(chunk).slice(0, 160) })
+      // Best-effort shape capture; a non-serializable chunk must not abort the
+      // collection, so stringify is guarded and falls back to a placeholder.
+      let sample
+      try { sample = JSON.stringify(chunk).slice(0, 160) } catch { sample = '<unserializable>' }
+      probeBuf.push({ type: chunk.type, keys: Object.keys(chunk).join(','), sample })
     }
     switch (chunk.type) {
       case 'block-start':
@@ -530,13 +626,24 @@ async function collectChunks(stream, signal, opts) {
     }
   }
   flushOpenSlots()
-  // TEMPORARY CHUNK-SHAPE PROBE emission: only when the caller asked to record
-  // AND this run yielded zero text blocks — i.e. the exact failure signature
-  // ("produced no usable text"). Self-limiting; guarded.
+  // CHUNK-SHAPE PROBE emission: only when the caller asked to record AND this
+  // run yielded zero text blocks — i.e. the exact failure signature ("produced
+  // no usable text"). Fully self-contained and guarded: NOTHING in this block
+  // may throw out of `collectChunks`, so serialization is try/catch'd and the
+  // whole emission is a no-op on any anomaly.
   if (recording && !blocks.some(b => b && b.type === 'text')) {
-    const desc = probeBuf.map(p => `#${p.type}[${p.keys}] ${p.sample}`).join(' | ')
-    const reasonJson = finish && typeof finish === 'object' ? JSON.stringify(finish) : String(finish)
-    process.stdout.write(`[force-compact] CHUNK-SHAPE PROBE (no text blocks): finishReason=${reasonJson} count=${chunkCount} :: ${desc}\n`)
+    try {
+      const desc = probeBuf.map(p => `#${p.type}[${p.keys}] ${p.sample}`).join(' | ')
+      let reasonJson
+      try {
+        reasonJson = (finish && typeof finish === 'object') ? JSON.stringify(finish) : String(finish)
+      } catch {
+        reasonJson = '<unserializable finish>'
+      }
+      process.stdout.write(`[force-compact] CHUNK-SHAPE PROBE (no text blocks): finishReason=${reasonJson} count=${chunkCount} :: ${desc}\n`)
+    } catch {
+      /* a diagnostic probe must never abort the summarization itself */
+    }
   }
   // `_chunkCount` is exposed (underscore-prefixed, internal) purely so a
   // missing-finish diagnostic can distinguish "consumed N chunks but never a

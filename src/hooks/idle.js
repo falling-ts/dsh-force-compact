@@ -34,18 +34,43 @@ import { publishCompressing, publishDone } from '../core/ui-signal.js'
  * @returns {Promise<void>}
  */
 export async function handleAgentStatus(ctx, payload, mode) {
-  const { agent, status } = payload
+  // SAFETY ENVELOPE: this handler fires on EVERY `agent/status` transition.
+  // `compactNow` is a heavyweight LLM round-trip and the idle tick recurs ~every
+  // 5s, so ANY uncaught throw here would repeat on every tick — the concrete
+  // "stutters every request / stuck" symptom. The ENTIRE body is therefore
+  // contained: any anomaly (malformed payload, a rejecting `readSettings`, a
+  // missing `agent.session`, a failing backend call) logs and returns; it NEVER
+  // throws into the `agent/status` dispatch.
+  try {
+    await __handleAgentStatusBody(ctx, payload, mode)
+  } catch (error) {
+    const message = error instanceof Error ? (error.stack || error.message) : String(error)
+    ctx.logger.warn(`[force-compact] handleAgentStatus degraded (swallowed) — ${message}`)
+  }
+}
+
+/** Body of {@link handleAgentStatus}; wrapped by its safe envelope. */
+async function __handleAgentStatusBody(ctx, payload, mode) {
+  if (payload === null || typeof payload !== 'object') return
+  const agent = payload.agent
+  const status = payload.status
   if (status !== 'idle') return
+  // A usable session is required to address the compaction; without one there is
+  // nothing to do (and no id to log) — degrade quietly rather than deref crash.
+  const session = (agent && typeof agent === 'object') ? agent.session : undefined
+  const sid = (session && typeof session.id === 'string') ? session.id : '?'
   const settings = (await readSettings(ctx)) ?? DEFAULTS
   if (settings.turnEndForceCompactionEnabled !== true) {
     // Visible so a tester who flipped the setting OFF can confirm the guard is
     // what suppressed the idle compaction (not a missing listener).
-    const sid = agent.session ? agent.session.id : '?'
     ctx.logger.debug(`[force-compact] ${sid}: turn-end compaction disabled by settings — idle transition ignored`)
     return
   }
 
-  const session = agent.session
+  if (session === undefined || session === null || typeof session.id !== 'string') {
+    ctx.logger.debug(`[force-compact] ${sid}: idle transition observed but agent.session is unusable — skipping turn-end compaction`)
+    return
+  }
   // Locate a usable compaction backend: the OFFICIAL `compaction` service
   // (preferred) OR this plugin's OWN builtin engine (fallback when the service
   // is realm-isolated away — see `engine/backend.js`). At idle the agent is

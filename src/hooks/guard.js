@@ -158,21 +158,28 @@ function clearCompactCooldown(sessionId) {
  * @returns {number} the summed token estimate (0 when nothing measurable).
  */
 function estimateRegionTokens(meter, session, region) {
-  const nodes = Array.from(session.surface.nodes)
+  // Malformed shape (missing `session.surface` / non-array `nodes`, missing
+  // `events`, non-object rows, missing `data`/`message`) degrades to whatever
+  // IS measurable (often 0) rather than throwing — feeds a shrink gate, never a
+  // correctness path.
+  const surfaceNodes = (session && session.surface && Array.isArray(session.surface.nodes)) ? session.surface.nodes : []
+  const nodes = [...surfaceNodes]
   const firstIdx = nodes.indexOf(region.start)
   const lastIdx = nodes.lastIndexOf(region.end)
   const segment = (firstIdx >= 0 && lastIdx >= firstIdx)
     ? nodes.slice(firstIdx, lastIdx + 1)
     : []
+  const events = (session && Array.isArray(session.events)) ? session.events : []
   let tokens = 0
   const useMeter = meter !== undefined && typeof meter.estimateMessage === 'function'
   for (const seq of segment) {
-    const event = session.events[seq]
-    if (event === undefined) continue
+    const event = events[seq]
+    if (event === undefined || event === null || typeof event !== 'object') continue
+    const data = (event.data && typeof event.data === 'object') ? event.data : {}
     let content
-    if (event.type === 'user/message') content = event.data.content
-    else if (event.type === 'assistant/message') content = event.data.message && event.data.message.content
-    else if (event.type === 'tool/result') content = event.data.message && event.data.message.content
+    if (event.type === 'user/message') content = data.content
+    else if (event.type === 'assistant/message') content = (data.message && data.message.content !== undefined) ? data.message.content : undefined
+    else if (event.type === 'tool/result') content = (data.message && data.message.content !== undefined) ? data.message.content : undefined
     if (content === undefined || content === null) continue
     if (useMeter) {
       try {
@@ -182,7 +189,8 @@ function estimateRegionTokens(meter, session, region) {
       }
     } else {
       let chars = 0
-      for (const block of content) if (block && typeof block.text === 'string') chars += block.text.length
+      const blocks = Array.isArray(content) ? content : []
+      for (const block of blocks) if (block && typeof block === 'object' && typeof block.text === 'string') chars += block.text.length
       tokens += Math.ceil(chars / 4)
     }
   }
@@ -208,8 +216,28 @@ function estimateRegionTokens(meter, session, region) {
  * @returns {Promise<boolean>} whether a compaction was committed.
  */
 async function compactEarliestRatio(ctx, agent, signal, ratio, mode) {
+  // SAFETY ENVELOPE: this function's CONTRACT is to resolve `false` (let the
+  // request proceed) on ANY failure — a missing service, a missing span, a
+  // throwing `tokenMeter.measure`, a rejecting backend call, or even a
+  // malformed `agent` shape. None of those may propagate into the `agent/pre-step`
+  // waterfall, where an uncaught throw would surface as a stalled/aborted step
+  // (the "every request pauses" symptom). The actual logic lives in the inner
+  // closure; any exception anywhere inside resolves `false`.
+  try {
+    return await __compactEarliestRatioBody(ctx, agent, signal, ratio, mode)
+  } catch (error) {
+    const message = error instanceof Error ? (error.stack || error.message) : String(error)
+    const sid = (agent && agent.session && agent.session.id) ? agent.session.id : '?'
+    ctx.logger.warn(`[force-compact] ${sid}: compactEarliestRatio degraded to false (letting the request proceed) — ${message}`)
+    return false
+  }
+}
+
+/** Body of {@link compactEarliestRatio}; wrapped by its safe envelope. */
+async function __compactEarliestRatioBody(ctx, agent, signal, ratio, mode) {
   const settings = (await readSettings(ctx)) ?? DEFAULTS
   const session = agent.session
+  if (session === undefined || session === null) return false
   // Locate a usable compaction backend: the OFFICIAL `compaction` service
   // (preferred when reachable) OR this plugin's OWN builtin engine (the
   // fallback when the service is realm-isolated away — e.g. standard preset).
@@ -227,11 +255,20 @@ async function compactEarliestRatio(ctx, agent, signal, ratio, mode) {
     return false
   }
   // Measure the session's total context tokens (authoritative when tokenMeter is
-  // mounted; character-based fallback otherwise).
+  // mounted; character-based fallback otherwise). Defensive: `measure` might
+  // return undefined/a non-object for a malformed session, and calling it might
+  // throw on a transient backend glitch — BOTH must degrade to `undefined`
+  // (fallback estimation) rather than propagate.
   const meter = ctx.get('tokenMeter')
-  const totalTokens = meter !== undefined && typeof meter.measure === 'function'
-    ? meter.measure(session).totalTokens
-    : undefined
+  let totalTokens
+  if (meter !== undefined && typeof meter.measure === 'function') {
+    try {
+      const measured = meter.measure(session)
+      totalTokens = (measured !== undefined && measured !== null) ? measured.totalTokens : undefined
+    } catch {
+      totalTokens = undefined
+    }
+  }
   const region = selectEarliestByTokens(session, ratio, totalTokens)
   if (region === null) {
     ctx.logger.debug(`[force-compact] ${session.id}: no earliest ${ratio} token region to compact (totalTokens=${totalTokens == null ? 'unknown(fallback est)' : totalTokens})`)
@@ -253,8 +290,13 @@ async function compactEarliestRatio(ctx, agent, signal, ratio, mode) {
   // explicit `/force-compact` path (both funnel here), so a command that
   // cannot shrink below the threshold is likewise deferred rather than spammed.
   if (totalTokens !== undefined && totalTokens >= settings.autoThresholdTokens) {
-    const regionTokens = estimateRegionTokens(meter, session, region)
-    if (regionTokens > 0 && totalTokens - regionTokens >= settings.autoThresholdTokens) {
+    let regionTokens
+    try {
+      regionTokens = estimateRegionTokens(meter, session, region)
+    } catch {
+      regionTokens = 0 // a measurement failure means "skip the shrink gate"; the inner try/catch handles the eventual compaction.
+    }
+    if (typeof regionTokens === 'number' && regionTokens > 0 && totalTokens - regionTokens >= settings.autoThresholdTokens) {
       ctx.logger.debug(
         `[force-compact] ${session.id}: threshold-aware gate — earliest ${ratio} region (~${regionTokens} tokens) `
         + `cannot pull total ~${totalTokens} below threshold ${settings.autoThresholdTokens} `
@@ -310,8 +352,31 @@ async function compactEarliestRatio(ctx, agent, signal, ratio, mode) {
  * @returns {Promise<boolean>} `true` when the caller should return `{ kind: 'reject' }`.
  */
 export async function forceCompactIfNeeded(ctx, agent, signal, mode) {
+  // SAFETY ENVELOPE (pre-step gate): the CONTRACT is to resolve `false` (let
+  // the model request proceed) whenever ANYTHING goes wrong — missing/malformed
+  // `agent.session`, a rejecting `readSettings`, a throwing `tokenMeter.measure`,
+  // or a failing compaction. An uncaught throw HERE would surface as a broken
+  // `agent/pre-step` step (a stall), which is precisely the "every request
+  // pauses" symptom we are eliminating. So the entire body is contained; any
+  // anomaly logs and lets the request through.
+  try {
+    return await __forceCompactIfNeededBody(ctx, agent, signal, mode)
+  } catch (error) {
+    const message = error instanceof Error ? (error.stack || error.message) : String(error)
+    ctx.logger.warn(`[force-compact] forceCompactIfNeeded degraded to false (letting the request proceed) — ${message}`)
+    return false
+  }
+}
+
+/** Body of {@link forceCompactIfNeeded}; wrapped by its safe envelope. */
+async function __forceCompactIfNeededBody(ctx, agent, signal, mode) {
   const settings = (await readSettings(ctx)) ?? DEFAULTS
-  const session = agent.session
+  const session = (agent && typeof agent === 'object') ? agent.session : undefined
+  // No usable session object → nothing to gate; let the request proceed.
+  if (session === undefined || session === null || typeof session.id !== 'string') {
+    ctx.logger.debug(`[force-compact] forceCompactIfNeeded: agent.session unusable — threshold gate skipped, letting the request proceed`)
+    return false
+  }
 
   // A `/force-compact` command was issued for this agent while it was busy:
   // compact now, regardless of the token threshold — the earliest
@@ -386,8 +451,17 @@ export async function forceCompactIfNeeded(ctx, agent, signal, mode) {
  * @returns {Promise<boolean>}
  */
 export async function thinkingDisabled(ctx) {
-  const settings = (await readSettings(ctx)) ?? DEFAULTS
-  return settings.disableThinking === true
+  // `agent/request` entry — a throw here would corrupt EVERY outgoing model
+  // request. Contain it: any settings anomaly resolves `false` (thinking left
+  // at its provider default) rather than breaking the request path.
+  try {
+    const settings = (await readSettings(ctx)) ?? DEFAULTS
+    return settings.disableThinking === true
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    ctx.logger.warn(`[force-compact] thinkingDisabled degraded to false — ${message}`)
+    return false
+  }
 }
 
 /**
@@ -398,16 +472,28 @@ export async function thinkingDisabled(ctx) {
  * @returns {number}
  */
 function estimateSessionTokens(session) {
+  // Coarse char-based estimator used ONLY when `tokenMeter` is absent. Must
+  // survive ANY receiver/event shape: every dereference is guarded so a
+  // malformed session (no `events`, missing `data`, non-object blocks) degrades
+  // to 0 rather than throwing — this feeds a fallback measurement, not a
+  // correctness path.
   const CHARS_PER_TOKEN = 4
   let chars = 0
-  for (const event of session.events) {
+  const events = (session && Array.isArray(session.events)) ? session.events : []
+  for (const event of events) {
+    if (event === null || typeof event !== 'object') continue
     let content
-    if (event.type === 'user/message') content = event.data.content
-    else if (event.type === 'assistant/message') content = event.data.message.content
-    else if (event.type === 'tool/result') content = event.data.message !== undefined ? event.data.message.content : undefined
-    if (content === undefined) continue
-    for (const block of content || []) {
-      if (block && typeof block.text === 'string') chars += block.text.length
+    const data = (event.data && typeof event.data === 'object') ? event.data : undefined
+    if (event.type === 'user/message') content = data.content
+    else if (event.type === 'assistant/message') {
+      content = (data.message && typeof data.message === 'object') ? data.message.content : undefined
+    } else if (event.type === 'tool/result') {
+      const msg = (data.message && typeof data.message === 'object') ? data.message : undefined
+      content = msg !== undefined ? msg.content : undefined
+    }
+    if (!Array.isArray(content)) continue
+    for (const block of content) {
+      if (block && typeof block === 'object' && typeof block.text === 'string') chars += block.text.length
     }
   }
   return Math.ceil(chars / CHARS_PER_TOKEN)

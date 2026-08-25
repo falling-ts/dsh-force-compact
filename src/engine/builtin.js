@@ -201,11 +201,16 @@ export async function compactNowBuiltin(ctx, agent, signal) {
     // session whose head IS a previously-generated checkpoint (small, not
     // worth re-summarizing) — re-running /force-compact right after a
     // successful compaction is the classic trigger.
-    const nodes = session.surface.nodes
-    const headIsCheckpoint = nodes.length > 0 && session.events[nodes[0]]?.data?.source?.plugin === 'force-compact-builtin'
+    const surfNodes = (session.surface && Array.isArray(session.surface.nodes)) ? session.surface.nodes : []
+    let headIsCheckpoint = false
+    if (surfNodes.length > 0 && Array.isArray(session.events)) {
+      const headEvent = session.events[surfNodes[0]]
+      const headSource = headEvent && headEvent.data && typeof headEvent.data === 'object' ? headEvent.data.source : undefined
+      headIsCheckpoint = !!(headSource && typeof headSource === 'object' && headSource.plugin === 'force-compact-builtin')
+    }
     info(ctx,
       `${session.id}: builtin compaction — no compactable region; skipping `
-      + `(${nodes.length} surface nodes, head=${headIsCheckpoint ? 'previous checkpoint' : 'ordinary history'}, `
+      + `(${surfNodes.length} surface nodes, head=${headIsCheckpoint ? 'previous checkpoint' : 'ordinary history'}, `
       + `estimated ~${estimateSurfaceTokens(session)} surface tokens)`,
     )
     return null
@@ -329,27 +334,65 @@ async function runTransaction(ctx, agent, session, region, signal, settings) {
       ...(prefix.system !== undefined ? { system: prefix.system } : {}),
       ...(prefix.tools !== undefined ? { tools: prefix.tools } : {}),
     }
+    // `summarize` NEVER throws and resolves to a discriminated `{ status, ... }`
+    // object (plus `reason` on non-ok outcomes). Branch defensively:
+    //   • status 'ok'        → commit-ready: read summary/envelope.
+    //   • 'no-target'/'no-llm' → call never made (nothing to cool). Silently
+    //                            close the bracket with a neutral note and stop.
+    //   • anything else      → the call was made but produced no usable summary
+    //                            (provider-error / aborted / truncated-empty /
+    //                            image-content / empty-text / no-finish /
+    //                            not-iterable). ARM the per-session failure
+    //                            cooldown (so the idle path backs off instead of
+    //                            re-running the same doomed span every tick) and
+    //                            close the bracket carrying the descriptive error.
+    // Belt-and-braces: `summarize` is total, but we STILL guard the result shape
+    // here so a hypothetical non-object result cannot throw downstream either.
     const preview = await summarize(ctx, settings, agent, input, signal, extra)
-    // `summarize` returns null ONLY when no target could be resolved OR the
-    // `ctx.llm` service is missing (the call was never made). Every other
-    // failure path (terminal error / abort / truncated-with-no-output / image
-    // content / empty-text) THROWS a typed error caught below.
-    if (preview === null) throw new Error('summarizer produced no text')
-    summaryBlocks = preview.summary
-    summarizationUsage = preview.usage
-    summarizationProvider = preview.provider
-    summarizationModel = preview.model
-    summarizationMaxTokens = preview.maxTokens
+    const ok = preview !== null && typeof preview === 'object' && preview.status === 'ok'
+    if (ok) {
+      const s = Array.isArray(preview.summary) ? preview.summary : []
+      if (s.length === 0) {
+        // Defensive: a declared-'ok' result with an empty summary is anomalous;
+        // treat it as a failure rather than committing an empty checkpoint.
+        markFailureCooldown(session.id, currentTotalTokens)
+        closeWithError(session, startEvent, compactionId, new Error('summarizer returned ok but no summary blocks'), ctx)
+        return null
+      }
+      summaryBlocks = s
+      summarizationUsage = (preview.usage !== undefined && preview.usage !== null) ? preview.usage : undefined
+      summarizationProvider = typeof preview.provider === 'string' ? preview.provider : ''
+      summarizationModel = typeof preview.model === 'string' ? preview.model : ''
+      summarizationMaxTokens = Number.isFinite(preview.maxTokens) ? preview.maxTokens : undefined
+    } else if (preview !== null && typeof preview === 'object' && (preview.status === 'no-target' || preview.status === 'no-llm')) {
+      // The summarization call was NEVER made (no resolvable target, or no `llm`
+      // service). There is nothing that "failed", so do NOT arm the cooldown —
+      // the next attempt should try again immediately. Close the bracket with a
+      // neutral, non-error note and stop (no doomed round-trip occurred).
+      const why = (typeof preview.reason === 'string' && preview.reason.length > 0) ? preview.reason : preview.status
+      info(ctx, `${session.id}: builtin compaction skipped (no summarization call made — ${why})`)
+      try {
+        session.append('compaction/end', { compactionId, turn: currentOpenTurn(session), note: why })
+      } catch { /* best effort */ }
+      return null
+    } else {
+      // A call was made but yielded no usable summary — OR (defensively) the
+      // result was a completely unexpected shape. Arm the cooldown and close with
+      // a descriptive error so the operator sees WHY it skipped.
+      const label = (preview && typeof preview.status === 'string') ? preview.status : 'unexpected-result-shape'
+      const reason = (preview && typeof preview.reason === 'string' && preview.reason.length > 0) ? preview.reason : 'no usable summary'
+      markFailureCooldown(session.id, currentTotalTokens)
+      warn(ctx, `${session.id}: builtin compaction summarized-but-unusable (${label}): ${reason}`)
+      closeWithError(session, startEvent, compactionId, new Error(`summarization ${label}: ${reason}`), ctx)
+      return null
+    }
   } catch (error) {
-    // ARM THE FAILURE COOLDOWN: this summarization just failed (provider error
-    // / aborted / truncated-empty / non-iterable stream / no-target-null). Without
-    // this, the next idle tick would select the SAME region and repeat the doomed
-    // round-trip — the livelock. Marking it makes subsequent idle attempts back
-    // off for a bounded interval. Armed here (NOT in closeWithError) because
-    // closeWithError is ALSO called on the shrink-gate abort, which is a DIFFERENT
-    // outcome (a summary WAS produced, just not shrunk) and must NOT cool the LLM.
+    // Last-resort safety net: `summarize` is designed to never reject, but if an
+    // unexpected error ever escapes (bug, or a non-guarded read), it lands HERE
+    // rather than propagating into the event dispatcher. Same treatment as a
+    // labeled failure: arm the cooldown, close the bracket, stop. No throw.
     markFailureCooldown(session.id, currentTotalTokens)
-    closeWithError(session, startEvent, compactionId, error, ctx)
+    closeWithError(session, startEvent, compactionId, error instanceof Error ? error : new Error(messageOf(error)), ctx)
     return null
   }
 
@@ -472,15 +515,22 @@ function closeWithError(session, startEvent, compactionId, error, ctx) {
 
 /** Total surface-content token estimate for diagnostics (4 chars/token). */
 function estimateSurfaceTokens(session) {
+  // Coarse char-based fallback used only when `tokenMeter` is absent. Every
+  // dereference is guarded so a malformed session (missing `events`, `data`,
+  // or `message`) degrades to 0 instead of throwing — this feeds a
+  // diagnostics/cooldown decision, never a correctness path.
   let chars = 0
-  for (const event of session.events) {
+  const events = (session && Array.isArray(session.events)) ? session.events : []
+  for (const event of events) {
+    if (event === null || typeof event !== 'object') continue
+    const data = (event.data && typeof event.data === 'object') ? event.data : {}
     let content
-    if (event.type === 'user/message') content = event.data.content
-    else if (event.type === 'assistant/message') content = event.data.message && event.data.message.content
-    else if (event.type === 'tool/result') content = event.data.message && event.data.message.content
+    if (event.type === 'user/message') content = data.content
+    else if (event.type === 'assistant/message') content = (data.message && data.message.content !== undefined) ? data.message.content : undefined
+    else if (event.type === 'tool/result') content = (data.message && data.message.content !== undefined) ? data.message.content : undefined
     if (content === undefined) continue
-    for (const block of content || []) {
-      if (block && typeof block.text === 'string') chars += block.text.length
+    for (const block of Array.isArray(content) ? content : []) {
+      if (block && typeof block === 'object' && typeof block.text === 'string') chars += block.text.length
     }
   }
   return Math.ceil(chars / 4)
@@ -518,26 +568,33 @@ function selectHeadAnchoredRegion(settings, session) {
  * shadowed.
  */
 function projectRegion(session, region) {
-  const nodes = Array.from(session.surface.nodes)
+  // Tolerate a malformed surface: a missing `session.surface` / non-array
+  // `nodes` yields an EMPTY projection (zero shadowed, zero messages) rather
+  // than a throw, so the caller simply finds nothing to compact instead of
+  // crashing the transaction.
+  const surfaceNodes = (session && session.surface && Array.isArray(session.surface.nodes)) ? session.surface.nodes : []
+  const nodes = [...surfaceNodes]
   const firstIdx = nodes.indexOf(region.start)
   const lastIdx = nodes.lastIndexOf(region.end)
   const segment = (firstIdx >= 0 && lastIdx >= firstIdx)
     ? nodes.slice(firstIdx, lastIdx + 1)
     : []
+  const events = (session && Array.isArray(session.events)) ? session.events : []
   const messages = []
   const shadowedSeqs = []
   for (const seq of segment) {
-    const event = session.events[seq]
-    if (event === undefined) continue
+    const event = events[seq]
+    if (event === undefined || event === null || typeof event !== 'object') continue
+    const data = (event.data && typeof event.data === 'object') ? event.data : {}
     if (event.type === 'user/message') {
       shadowedSeqs.push(seq)
-      messages.push({ role: 'user', content: event.data.content })
+      messages.push({ role: 'user', content: data.content })
     } else if (event.type === 'assistant/message') {
       shadowedSeqs.push(seq)
-      const content = event.data.message && event.data.message.content
+      const content = (data.message && data.message.content !== undefined) ? data.message.content : undefined
       if (content) messages.push({ role: 'assistant', content })
     } else if (event.type === 'tool/result') {
-      const msg = event.data.message
+      const msg = (data.message && typeof data.message === 'object') ? data.message : undefined
       if (msg && msg.content) {
         shadowedSeqs.push(seq)
         messages.push({ role: 'user', content: msg.content, tool_call_id: msg.toolCallId })
@@ -558,9 +615,13 @@ function projectRegion(session, region) {
  * or `null` when invalid.
  */
 function validateReplacementBounds(session, region) {
-  const nodes = Array.from(session.surface.nodes)
-  const firstIdx = nodes.indexOf(region.start)
-  const lastIdx = nodes.lastIndexOf(region.end)
+  // A malformed surface (missing `session.surface` / non-array `nodes`) means
+  // we cannot validate the bounds — return null (refuse the replace) rather
+  // than throw. Reading `.nodes` off a null surface would otherwise crash the
+  // whole transaction.
+  const surfaceNodes = (session && session.surface && Array.isArray(session.surface.nodes)) ? session.surface.nodes : []
+  const firstIdx = surfaceNodes.indexOf(region.start)
+  const lastIdx = surfaceNodes.lastIndexOf(region.end)
   // Same validity predicate the session core applies: both bounds exist in the
   // projection and start precedes end BY INDEX (not by seq value — see
   // projectRegion).
@@ -570,9 +631,15 @@ function validateReplacementBounds(session, region) {
 
 /** Whether an open compaction transaction is present (durant lock check). */
 function hasOpenFctLock(session) {
-  const events = session.events
+  // Conservative under a malformed shape: a missing/non-array `events` cannot
+  // prove a lock is open, so treat it as NOT locked (return false) and let
+  // downstream guards decide. Non-object event rows are tolerated (skipped) so
+  // a `.type` read never throws on a primitive row.
+  const events = (session && Array.isArray(session.events)) ? session.events : []
   for (let i = events.length - 1; i >= 0; i--) {
-    const t = events[i].type
+    const e = events[i]
+    if (e === null || typeof e !== 'object') continue
+    const t = e.type
     if (t === 'compaction/start') return true
     if (t === 'compaction/end') return false
   }
@@ -581,10 +648,18 @@ function hasOpenFctLock(session) {
 
 /** The turn number of the currently-open turn, or `null` (standalone/idle). */
 function currentOpenTurn(session) {
-  const events = session.events
+  // Reads the latest turn bracket from the durable log to stamp `compaction/*`
+  // events' `turn` field. Must never throw (it runs on every append/close): a
+  // missing/non-array `events` or a non-object row degrades to `null` (no open
+  // turn), matching the standalone/idle case.
+  const events = (session && Array.isArray(session.events)) ? session.events : []
   for (let i = events.length - 1; i >= 0; i--) {
     const ev = events[i]
-    if (ev.type === 'turn/start') return ev.data.turn
+    if (ev === null || typeof ev !== 'object') continue
+    if (ev.type === 'turn/start') {
+      const data = (ev.data && typeof ev.data === 'object') ? ev.data : undefined
+      return (data && data.turn !== undefined) ? data.turn : null
+    }
     if (ev.type === 'turn/end') return null
   }
   return null

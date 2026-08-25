@@ -43,15 +43,38 @@ export function registerCommand(ctx) {
     description: 'Force-compact the agent session context now (compacts immediately when idle).',
     recordInput: false,
     handler: async (invocation) => {
-      const agent = invocation.agent
-      const session = agent.session
-      // Locate the compaction backend through `agent.ctx` (presets isolate it)
-      // with a host-global fallback (see `engine/backend.js`). The
-      // `compactionMode` setting is read once here (raw, cheap) and passed so
-      // the resolver need not re-read settings.
-      const mode = await readRawSetting(ctx, 'compactionMode')
-      const backend = await resolveCompaction(ctx, agent, mode)
-      ctx.logger.debug(`[force-compact] ${session.id}: /force-compact handler entered (backend ${backend ? backend.kind : 'UNAVAILABLE'})`)
+      // SAFETY ENVELOPE: a slash-command handler that throws surfaces a raw
+      // error to the user. Contain the whole body so ANY anomaly (missing
+      // `invocation.agent`, a missing `session`, a rejecting settings read, a
+      // failing backend call) settles as a friendly `{kind:'error'}` result.
+      try {
+        return await __forceCompactCommandBody(ctx, invocation)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        ctx.logger.warn(`[force-compact] /force-compact handler degraded — ${message}`)
+        return { kind: 'error', text: `compaction could not be started: ${message}` }
+      }
+    },
+  })
+
+  ctx.logger.debug('[force-compact] registered /force-compact command')
+  return true
+}
+
+/** Body of the `/force-compact` command handler; wrapped by its safe envelope. */
+async function __forceCompactCommandBody(ctx, invocation) {
+  const agent = (invocation && typeof invocation === 'object') ? invocation.agent : undefined
+  const session = (agent && typeof agent === 'object') ? agent.session : undefined
+  if (agent === undefined || agent === null || session === undefined || session === null || typeof session.id !== 'string') {
+    return { kind: 'error', text: 'no usable agent session for this command' }
+  }
+  // Locate the compaction backend through `agent.ctx` (presets isolate it)
+  // with a host-global fallback (see `engine/backend.js`). The
+  // `compactionMode` setting is read once here (raw, cheap) and passed so
+  // the resolver need not re-read settings.
+  const mode = await readRawSetting(ctx, 'compactionMode')
+  const backend = await resolveCompaction(ctx, agent, mode)
+  ctx.logger.debug(`[force-compact] ${session.id}: /force-compact handler entered (backend ${backend ? backend.kind : 'UNAVAILABLE'})`)
 
       // Guard the case it is not available so the command settles as an error
       // rather than throwing out of the handler. When the OFFICIAL service is
@@ -99,9 +122,4 @@ export function registerCommand(ctx) {
           text: `agent is busy — will force-compact at the next model step (${message})`,
         }
       }
-    },
-  })
-
-  ctx.logger.debug('[force-compact] registered /force-compact command')
-  return true
 }

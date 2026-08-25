@@ -125,6 +125,18 @@ export async function ensureDebugLogger(ctx) {
   if (debugState.attempted) return
   debugState.attempted = true
 
+  // SAFETY ENVELOPE: a diagnostic-sink installer must NEVER break a business
+  // path. Wrap the whole install so any anomaly (a throwing
+  // `ctx.logger.exporter`, a rejecting settings read, a bad path) marks the
+  // sink as settled-installed and moves on silently rather than propagating.
+  try {
+    await __ensureDebugLoggerBody(ctx)
+  } catch {
+    debugState.installed = true
+  }
+}
+
+async function __ensureDebugLoggerBody(ctx) {
   const resolved = (await readSettings(ctx)) ?? { ...DEFAULTS }
   // Centralize the `debug` gate at the EXPORT boundary: the exporter decides,
   // per line, whether to persist — reading the live `debug` setting at install
@@ -238,9 +250,18 @@ function shouldInclude(message) {
  * @returns {string}
  */
 function renderLine(message) {
-  const ts = new Date(message.ts).toISOString()
-  const type = String(message.type ?? 'info').toUpperCase()
-  return `${ts} [${type}] ${formatArgs(Array.isArray(message.args) ? message.args : [])}`
+  // Tolerate a malformed `message`: a non-date `ts` (undefined/null/nonsense
+  // string) would otherwise make `new Date(...).toISOString()` throw on the
+  // `Invalid Date` value. Degrade to an epoch-zero timestamp so the line still
+  // renders — a diagnostic line dropping on a weird record is unacceptable.
+  let ts
+  try {
+    ts = Number.isFinite(+new Date(message.ts).getTime()) ? new Date(message.ts).toISOString() : new Date(0).toISOString()
+  } catch {
+    ts = new Date(0).toISOString()
+  }
+  const type = String(message && message.type !== undefined ? message.type : 'info').toUpperCase()
+  return `${ts} [${type}] ${formatArgs(Array.isArray(message && message.args) ? message.args : [])}`
 }
 
 /**

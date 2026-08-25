@@ -351,25 +351,45 @@ export function apply(ctx) {
   // `agent/request` is a Waterfall — `await next()` yields the config the
   // machine would use; returning a replacement switches it.
   guard('agent/request listener', () => ctx.on('agent/request', async (payload, next) => {
-    maybeInstallDebugSink()
-    maybeRegisterSettingsNamespace()
-    maybeRegisterCommand()
-    maybeInstallWireRewrite()
-    const config = await next()
-    if (!payload || config === undefined) return config
-    if (!(await thinkingDisabled(ctx))) {
-      // disableThinking=false (setting off): leave the machine's config untouched.
-      ctx.logger.debug('[force-compact] agent/request: disableThinking=false — leaving reasoning effort unchanged')
-      return config
+    // SAFETY ENVELOPE: this is a PER-MODEL-REQUEST seam — an anomaly (a
+    // non-object `config` seed, a rejecting `thinkingDisabled`, a Proxy that
+    // traps on spread) must degrade to PASSING THROUGH the original config so
+    // the request proceeds normally, never crashing the request chain.
+    try {
+      maybeInstallDebugSink()
+      maybeRegisterSettingsNamespace()
+      maybeRegisterCommand()
+      maybeInstallWireRewrite()
+      return await __agentRequestListenerBody(ctx, payload, next)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      ctx.logger.warn(`[force-compact] agent/request listener degraded — forwarding config unchanged (swallowed: ${message})`)
+      try { return await next() } catch { return undefined }
     }
-    if (config.reasoningEffort === 'off') {
-      // Already off — nothing to switch (still proves the guard is active on this request).
-      ctx.logger.debug('[force-compact] agent/request: reasoningEffort already off — no change')
-      return config
-    }
-    ctx.logger.debug(`[force-compact] agent/request: applying reasoningEffort=off (disableThinking=true) — original=${config.reasoningEffort ?? '(unset)'}`)
-    return { ...config, reasoningEffort: 'off' }
   }))
+
+/** Body of the `agent/request` listener; wrapped by its safe envelope above. */
+async function __agentRequestListenerBody(ctx, payload, next) {
+  const config = await next()
+  if (!payload || config === undefined || config === null) return config
+  if (!(await thinkingDisabled(ctx))) {
+    // disableThinking=false (setting off): leave the machine's config untouched.
+    ctx.logger.debug('[force-compact] agent/request: disableThinking=false — leaving reasoning effort unchanged')
+    return config
+  }
+  // `config` may be a non-object seed; guard the property reads so a weird shape
+  // degrades to returning it untouched rather than throwing on `.reasoningEffort`.
+  const isObj = (config !== null && typeof config === 'object')
+  const currentEffort = isObj ? config.reasoningEffort : undefined
+  if (currentEffort === 'off') {
+    // Already off — nothing to switch (still proves the guard is active on this request).
+    ctx.logger.debug('[force-compact] agent/request: reasoningEffort already off — no change')
+    return config
+  }
+  if (!isObj) return config
+  ctx.logger.debug(`[force-compact] agent/request: applying reasoningEffort=off (disableThinking=true) — original=${currentEffort ?? '(unset)'}`)
+  return { ...config, reasoningEffort: 'off' }
+}
 
   // Before each model step, run a forced/threshold-triggered compaction as a
   // side effect. `agent/pre-step` is a Waterfall: after the hook processing
@@ -379,10 +399,14 @@ export function apply(ctx) {
   // compact, then unconditionally `return next()`). Returning a value such as
   // `{ kind: 'reject' }` without ever calling `next()` stalls the request chain.
   guard('agent/pre-step listener', () => ctx.on('agent/pre-step', async (payload, next) => {
-    maybeInstallDebugSink()
-    maybeRegisterSettingsNamespace()
-    maybeRegisterCommand()
-    maybeInstallWireRewrite()
+    // SAFETY ENVELOPE: the `maybeInstall*` prologue and the terminal `next()`
+    // hop sit OUTSIDE the inner compaction try/catch — a throwing install or a
+    // rejecting `next()` would otherwise escape the per-step seam. Contain them
+    // so the step ALWAYS routes through `next()` (the Waterfall requirement).
+    try { maybeInstallDebugSink() } catch { /* non-fatal */ }
+    try { maybeRegisterSettingsNamespace() } catch { /* non-fatal */ }
+    try { maybeRegisterCommand() } catch { /* non-fatal */ }
+    try { maybeInstallWireRewrite() } catch { /* non-fatal */ }
     const agent = payload && payload.agent
     const signal = payload && payload.signal
     if (agent !== undefined && agent !== null && (signal === undefined || !signal.aborted)) {
@@ -395,10 +419,16 @@ export function apply(ctx) {
         await forceCompactIfNeeded(ctx, agent, signal, mode)
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
-        ctx.logger.warn(`[force-compact] ${agent.id}: request guard failed — ${message}`)
+        ctx.logger.warn(`[force-compact] ${(agent && typeof agent.id === 'string') ? agent.id : '?'}: request guard failed — ${message}`)
       }
     }
-    return next()
+    try {
+      return await next()
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      ctx.logger.warn(`[force-compact] agent/pre-step next() hop degraded (swallowed: ${message})`)
+      return undefined
+    }
   }))
 
   // Turn-end forced compaction: when `turnEndForceCompactionEnabled` is on,
@@ -417,15 +447,27 @@ export function apply(ctx) {
     // Fire-and-forget: trace listener liveness on the idle transition, read the
     // compactionMode raw (cheap), then hand off to the turn-end handler which
     // locates the per-realm compaction backend via `agent.ctx`.
+    // SAFETY: this IIFE has NO other error boundary — an anomaly (a missing
+    // `payload.agent.session`, a rejecting `readRawSetting`, or a throwing
+    // `handleAgentStatus`) would otherwise become an UNHANDLED REJECTION. Attach
+    // a `.catch` so every path settles cleanly. `handleAgentStatus` itself is
+    // envelope-guarded; this is belt-and-braces for the sid extraction + mode
+    // read that precede it.
     void (async () => {
-      const st = payload && payload.status
+      const st = (payload && typeof payload === 'object') ? payload.status : undefined
       if (st === 'idle') {
-        const sid = payload && payload.agent ? payload.agent.session.id : '?'
+        const agentObj = (payload && typeof payload === 'object' && payload.agent && typeof payload.agent === 'object') ? payload.agent : undefined
+        const sess = (agentObj && agentObj.session) ? agentObj.session : undefined
+        const sid = (sess && typeof sess.id === 'string') ? sess.id : '?'
         ctx.logger.debug(`[force-compact] agent/status fired: idle for ${sid} — evaluating turn-end compaction`)
       }
       const mode = await readRawSetting(ctx, 'compactionMode')
       await handleAgentStatus(ctx, payload, mode)
     })()
+      .catch(error => {
+        const message = error instanceof Error ? error.message : String(error)
+        ctx.logger.warn(`[force-compact] agent/status idle-turn handler degraded (swallowed) — ${message}`)
+      })
   }))
 
   // Checkpoint-driven compaction: condense useful history at each durability
@@ -434,41 +476,54 @@ export function apply(ctx) {
   ctx.logger.info('[force-compact][diagnostic] apply END (all registrations attempted)')
 
   guard('session/flush listener', () => ctx.on('session/flush', (session) => {
-    maybeInstallDebugSink()
-    maybeRegisterSettingsNamespace()
-    maybeRegisterCommand()
-    const agents = ctx.get('agents')
-    if (agents === undefined) return
-    const agent = agents.get(session.id)
-    if (agent === undefined || agent === null) {
-      ctx.logger.debug(`[force-compact] ${session.id}: no live agent — skipping`)
-      return
+    // SAFETY ENVELOPE: `session/flush` is an AWAITED parallel checkpoint — a
+    // throw escaping this listener would break the persistence checkpoint on
+    // EVERY flush. The synchronous prologue (service installs, agent lookup,
+    // slot check) is NOT covered by the async IIFE's own `.catch`, so the whole
+    // callback body is wrapped: any anomaly logs and returns cleanly. The async
+    // IIFE keeps its own `.catch`/`.finally` for the background compaction op.
+    try {
+      maybeInstallDebugSink()
+      maybeRegisterSettingsNamespace()
+      maybeRegisterCommand()
+      const sid = (session && typeof session.id === 'string') ? session.id : '?'
+      const agents = ctx.get('agents')
+      if (agents === undefined) return
+      const agent = agents.get(sid)
+      if (agent === undefined || agent === null) {
+        ctx.logger.debug(`[force-compact] ${sid}: no live agent — skipping`)
+        return
+      }
+      // COMPRESSION SLOT: if a flush-driven compaction for this session id is
+      // ALREADY running, a repeat `session/flush` dispatch starts NOTHING and
+      // returns immediately — suppressing the concurrent / re-entrant same-id
+      // `compactRegion` call that interleaves with the persistence coordinator's
+      // per-id chain (the "third send wedges" deadlock vector). The listener is
+      // SYNCHRONOUS: it starts the op and returns at once so it is never on the
+      // checkpoint's await path (which is what lets the write-behind barrier
+      // settle and `session.list` stay responsive). See `compactSlot` above.
+      if (compactSlot.has(sid)) {
+        ctx.logger.debug(`[force-compact] ${sid}: session/flush dispatched while a compaction slot is still settling — starting no duplicate (serialized by the slot)`)
+        return
+      }
+      const controller = new AbortController()
+      // Start the compaction, attach settlement cleanup, store the settling
+      // promise as the id's slot. Never `await`ed here — the listener returns
+      // before this op progresses, keeping the checkpoint non-blocking.
+      const op = (async () => {
+        const mode = await readRawSetting(ctx, 'compactionMode')
+        await compactSession(ctx, agent, controller, mode)
+      })()
+        .catch(error => {
+          const message = error instanceof Error ? error.message : String(error)
+          ctx.logger.warn(`[force-compact] ${sid}: flush-triggered compaction failed — ${message}`)
+        })
+        .finally(() => { compactSlot.delete(sid) })
+      compactSlot.set(sid, op)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      const sid = (session && typeof session.id === 'string') ? session.id : '?'
+      ctx.logger.warn(`[force-compact] ${sid}: session/flush listener degraded (swallowed) — ${message}`)
     }
-    // COMPRESSION SLOT: if a flush-driven compaction for this session id is
-    // ALREADY running, a repeat `session/flush` dispatch starts NOTHING and
-    // returns immediately — suppressing the concurrent / re-entrant same-id
-    // `compactRegion` call that interleaves with the persistence coordinator's
-    // per-id chain (the "third send wedges" deadlock vector). The listener is
-    // SYNCHRONOUS: it starts the op and returns at once so it is never on the
-    // checkpoint's await path (which is what lets the write-behind barrier
-    // settle and `session.list` stay responsive). See `compactSlot` above.
-    if (compactSlot.has(session.id)) {
-      ctx.logger.debug(`[force-compact] ${session.id}: session/flush dispatched while a compaction slot is still settling — starting no duplicate (serialized by the slot)`)
-      return
-    }
-    const controller = new AbortController()
-    // Start the compaction, attach settlement cleanup, store the settling
-    // promise as the id's slot. Never `await`ed here — the listener returns
-    // before this op progresses, keeping the checkpoint non-blocking.
-    const op = (async () => {
-      const mode = await readRawSetting(ctx, 'compactionMode')
-      await compactSession(ctx, agent, controller, mode)
-    })()
-      .catch(error => {
-        const message = error instanceof Error ? error.message : String(error)
-        ctx.logger.warn(`[force-compact] ${session.id}: flush-triggered compaction failed — ${message}`)
-      })
-      .finally(() => { compactSlot.delete(session.id) })
-    compactSlot.set(session.id, op)
   }))
 }

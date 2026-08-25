@@ -608,19 +608,30 @@ window.__ModuleLoader__.load({
       // 把 settingsScope 镜像成 uSES 安全的 SnapshotStore（hooks 分区的可观察源）。
       const store = createSnapshotStore({ status: "loading", value: undefined, writable: false });
       const derive = () => {
-        const s = scope.getSnapshot();
-        store.update((d) => {
-          d.status = s.status;
-          d.value = s.value;
-          d.writable = s.writable;
-        });
-        // ── Live UI 徽章（详见上方 paintTurnStatus 文档）──
-        // 每次命名空间快照翻转（含宿主写入 liveUi 瞬间）,顺路把最新 liveUi
-        // 贴到对话区 TurnStatus DOM 上。这一步搭车在已有 scope.subscribe
-        // 回调上不新增任何订阅机制 / timer / 组件,符合 client 端 AGENTS.md
-        // 红线。幂等纯装饰:贴不上（无 running 会话/无 DOM 锚点）即静默跳过。
-        if (s.status === "ready" && s.value && typeof s.value.liveUi === "object") {
-         paintTurnStatus(s.value.liveUi);
+        // SAFETY ENVELOPE: derive runs BOTH as a direct call and as the
+        // scope.subscribe callback — a throwing `scope.getSnapshot()` or an
+        // unexpected snapshot shape must not escape out of the subscription
+        // dispatch (which would strand the whole settings panel). Any anomaly
+        // degrades to leaving the previous snapshot in place (store untouched).
+        try {
+          const s = scope.getSnapshot();
+          if (s === undefined || s === null || typeof s !== "object") return;
+          store.update((d) => {
+            d.status = s.status;
+            d.value = s.value;
+            d.writable = s.writable;
+          });
+          // ── Live UI 徽章（详见上方 paintTurnStatus 文档）──
+          // 每次命名空间快照翻转（含宿主写入 liveUi 瞬间）,顺路把最新 liveUi
+          // 贴到对话区 TurnStatus DOM 上。这一步搭车在已有 scope.subscribe
+          // 回调上不新增任何订阅机制 / timer / 组件,符合 client 端 AGENTS.md
+          // 红线。幂等纯装饰:贴不上（无 running 会话/无 DOM 锚点）即静默跳过。
+          const liveUi = (typeof s.value === "object" && s.value !== null) ? s.value.liveUi : undefined;
+          if (s.status === "ready" && typeof liveUi === "object" && liveUi !== null) {
+           paintTurnStatus(liveUi);
+          }
+        } catch {
+          // Never let a cosmetic derive take down the settings panel.
         }
       };
       // 关键：settingsScope 的快照自带权威状态枚举 'loading'|'ready'|'unavailable'

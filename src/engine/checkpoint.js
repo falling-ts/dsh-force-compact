@@ -39,7 +39,19 @@ const CHARS_PER_TOKEN = 4
  *   when nothing was worth compacting or no backend was available.
  */
 export async function compactSession(ctx, agent, controller, mode) {
-  const session = agent.session
+  // SAFETY GUARD: a missing/unusable `agent.session` means there is nothing to
+  // compact — degrade to `null` (skip) rather than a downstream `session.id` /
+  // `session.events` dereference throwing out of the flush-checkpoint path.
+  const agentObj = (agent && typeof agent === 'object') ? agent : undefined
+  const session = (agentObj && agentObj.session) ? agentObj.session : undefined
+  if (session === undefined || session === null || typeof session.id !== 'string') {
+    if (controller && typeof controller.abort === 'function' && controller.signal.aborted === false) {
+      // Nothing actionable; leave the slot open for the caller's finally cleanup.
+    }
+    const sid = (session && typeof session.id === 'string') ? session.id : '?'
+    ctx.logger.debug(`[force-compact] ${sid}: checkpoint skipped — no usable agent session`)
+    return null
+  }
   const config = resolveConfig()
 
   // The "强制压缩配置" (force-compact configuration) settings: the automatic
@@ -108,15 +120,21 @@ export async function compactSession(ctx, agent, controller, mode) {
  * @returns {number}
  */
 function estimateSessionTokens(session) {
+  // Feeds only the threshold GATE: a malformed session (missing/non-array
+  // `events`, non-object rows, missing `data`/`message`) degrades each row to
+  // 0 rather than throwing. Every deep deref is individually guarded.
   let chars = 0
-  for (const event of session.events) {
+  const events = (session && Array.isArray(session.events)) ? session.events : []
+  for (const event of events) {
+    if (event === null || typeof event !== 'object') continue
+    const data = (event.data && typeof event.data === 'object') ? event.data : {}
     let content
-    if (event.type === 'user/message') content = event.data.content
-    else if (event.type === 'assistant/message') content = event.data.message.content
-    else if (event.type === 'tool/result') content = event.data.message !== undefined ? event.data.message.content : undefined
+    if (event.type === 'user/message') content = Array.isArray(data.content) ? data.content : undefined
+    else if (event.type === 'assistant/message') content = (data.message && Array.isArray(data.message.content)) ? data.message.content : undefined
+    else if (event.type === 'tool/result') content = (data.message && Array.isArray(data.message.content)) ? data.message.content : undefined
     if (content === undefined) continue
-    for (const block of content || []) {
-      if (block && typeof block.text === 'string') chars += block.text.length
+    for (const block of content) {
+      if (block && typeof block === 'object' && typeof block.text === 'string') chars += block.text.length
     }
   }
   return Math.ceil(chars / CHARS_PER_TOKEN)
