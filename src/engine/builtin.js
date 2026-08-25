@@ -72,7 +72,18 @@ export async function compactNowBuiltin(ctx, agent, signal) {
 
   const region = selectHeadAnchoredRegion(settings, session)
   if (region === null) {
-    info(ctx, `${session.id}: builtin fc-compact — no compactable region; skipping`)
+    // Diagnose WHY: report the surface-node count and how much of it is already
+    // checkpoint material. The typical "nothing worth compacting" case is a
+    // session whose head IS a previously-generated checkpoint (small, not
+    // worth re-summarizing) — re-running /force-compact right after a
+    // successful compaction is the classic trigger.
+    const nodes = session.surface.nodes
+    const headIsCheckpoint = nodes.length > 0 && session.events[nodes[0]]?.data?.source?.plugin === 'force-compact-builtin'
+    info(ctx,
+      `${session.id}: builtin fc-compact — no compactable region; skipping `
+      + `(${nodes.length} surface nodes, head=${headIsCheckpoint ? 'previous checkpoint' : 'ordinary history'}, `
+      + `estimated ~${estimateSurfaceTokens(session)} surface tokens)`,
+    )
     return null
   }
 
@@ -246,6 +257,22 @@ function closeWithError(session, startEvent, compactionId, error, ctx) {
     session.append('fc-compact/end', { compactionId, turn: currentOpenTurn(session), error: messageOf(error) })
   } catch { /* best effort */ }
   warn(ctx, `builtin fc-compact transaction ended in error: ${messageOf(error)}`)
+}
+
+/** Total surface-content token estimate for diagnostics (4 chars/token). */
+function estimateSurfaceTokens(session) {
+  let chars = 0
+  for (const event of session.events) {
+    let content
+    if (event.type === 'user/message') content = event.data.content
+    else if (event.type === 'assistant/message') content = event.data.message && event.data.message.content
+    else if (event.type === 'tool/result') content = event.data.message && event.data.message.content
+    if (content === undefined) continue
+    for (const block of content || []) {
+      if (block && typeof block.text === 'string') chars += block.text.length
+    }
+  }
+  return Math.ceil(chars / 4)
 }
 
 /**
