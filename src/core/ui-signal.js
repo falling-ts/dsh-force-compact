@@ -52,10 +52,10 @@ export const PINNED_TEXTS = Object.freeze({
   [PHASE_DONE]: '[压缩完成!]',
 })
 
-/** Pinned colors matching {@link PINNED_TEXTS} — red while compacting, green on completion. */
+/** Pinned colors matching {@link PINNED_TEXTS} — extra-dark tuned: deep burgundy-red while compacting, muted pine-green on completion. */
 export const PINNED_COLORS = Object.freeze({
-  [PHASE_COMPRESSING]: '#ff4d4f',
-  [PHASE_DONE]: '#52c41a',
+  [PHASE_COMPRESSING]: '#9b1c2b',
+  [PHASE_DONE]: '#2f6f52',
 })
 
 /**
@@ -97,27 +97,38 @@ export const WORKING_TEXTS = Object.freeze([
  * so repeated draws visibly vary BOTH dimensions).
  * @readonly
  */
+/**
+ * Extra-dark 20-color WORKING-phase palette (second darkening pass). Each
+ * entry sits one brightness step deeper than the prior dark-tuned set while
+ * preserving the full hue-wheel sweep (blue → indigo → violet → purple →
+ * plum → orchid → magenta → fuchsia → pink → rose → crimson → scarlet →
+ * vermilion → rust → ochre → gold → olive → moss → pine → fir → teal →
+ * cyan → azure → cobalt → navy). Saturation is held high enough that the
+ * badge reads as a distinct hue rather than desaturating toward grey.
+ * Random pairing with {@link WORKING_TEXTS} remains unchanged.
+ * @readonly
+ */
 export const WORKING_COLORS = Object.freeze([
-  '#4f9cf9',
-  '#5b8def',
-  '#6a5bff',
-  '#8b5cf6',
-  '#a855f7',
-  '#c45bf9',
-  '#db6bd4',
-  '#e86bb0',
-  '#f06b8b',
-  '#f76b5b',
-  '#fb8c5b',
-  '#fca95b',
-  '#fdc35b',
-  '#d8e05b',
-  '#aede5b',
-  '#7ee083',
-  '#5be0a0',
-  '#5becd8',
-  '#5bcdf9',
-  '#7ba8f9',
+  '#1e40af',   // royal blue
+  '#1e3a8a',   // deep blue
+  '#312e81',   // indigo
+  '#4c1d95',   // violet
+  '#581c87',   // purple
+  '#8318a3',   // plum
+  '#86198f',   // orchid
+  '#9d174d',   // magenta
+  '#9f1239',   // pink
+  '#991b1b',   // rose
+  '#9a3412',   // crimson
+  '#92400e',   // scarlet
+  '#854d0e',   // rust
+  '#4d7c0f',   // ochre-gold
+  '#3f6212',   // olive
+  '#166534',   // moss
+  '#065f46',   // pine
+  '#0e7490',   // teal
+  '#155e75',   // cyan
+  '#172554',   // navy
 ])
 
 /**

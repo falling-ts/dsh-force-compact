@@ -1,170 +1,219 @@
 # dsh-force-compact
 
-[English](README.md) | 中文
+**面向本地推理的「本地优先 · 激进压缩」插件。**
 
-`@falling-ts/dsh-force-compact` 是一个 DSH **Cordis 函数插件**，**钩住官方的核心
-模型请求**。每次请求模型前都会读取"强制压缩配置"（`falling-ts-force-compact`）设置：
+`@falling-ts/dsh-force-compact` 是一个 DSH **Cordis 函数插件**,它让 agent 的工作上下文**始终
+保持在紧凑、高信号的区间**,从而让你能用自托管 llama.cpp 服务上的 `Qwen3.8‑27B`(低上下文
+配置)跑出**接近大窗口**的体验——更低延迟、数据不出本机、无 API 费用。
 
-- 当 `disableThinking` 开启时，在**请求参数中强制关闭思考/推理**；
-- 当会话上下文总 tokens 数**达到** `autoThresholdTokens` 时，**不请求模型**，
-  而是**强制执行强制压缩**。
+[English](README.md)
 
-此外，插件还在每次会话持久化检查点（`session/flush`）压缩有用历史：拥有自己的
-区间选择策略与 LLM 摘要器，并把持久的 surface 变更委托给 `compaction` 服务。
+---
+
+## 为什么做这件事
+
+主流做法是把大模型塞进短上下文预算里硬扛。本插件反其道而行:**权重、端点、上下文预算都由你
+自己掌控。**
+
+- **自托管推理。** 把 agent 指向本地 OpenAI 兼容的 llama.cpp 服务器,运行 `Qwen3.8‑27B`
+  (GGUF / NVFP4 / MTP 变体均可走标准 DeepSeek 适配器路径,**无需单独的 llama.cpp 适配器**)。
+- **低上下文、高信号。** 不与小硬上限较劲,而是**直接收缩会话本身**——agent 永远在紧凑、
+  高信号的小 prompt 上推理,却等效获得更大的工作记忆。
+- **默认关闭思考。** `disableThinking: true` 对**每一次出站调用**(业务请求 + 插件自己的摘要
+  调用)都关闭模型的内部推理努力,并在两个互补缝上双重保障(见下文「后端无关的思考控制」)。
+- **私有且免费。** 无按 token 计费、无数据外泄,模型与上下文的取舍完全由你调。
+
+---
+
+## 插件做了什么
+
+两条压缩引擎通过统一 facade(`resolveCompaction`)并存,对调用者透明:
+
+| 引擎 | 何时使用 | 说明 |
+|------|----------|------|
+| **官方** | agent realm 内可解析到 `compaction` 服务时 | 首选,委托给 `compaction/basic`。 |
+| **内置** | 官方服务被 realm 隔离时自动接管(典型标准预设) | 自包含持久事务,仅依赖 `ctx.sessions` / `ctx.llm.stream` / `ctx.tokenMeter`;复用官方 `compaction/*` 事件词汇,跨 build 重放存活、无需 `ignorable` hack。 |
+
+你**无需手动切换**:官方可达就用官方,不可达才落到内置。
+
+### 触发点
+
+- **每请求门禁(`agent/pre-step`)** —— 读取会话的 *投影* 上下文 token(与 harness 右下角显示
+  的同一数值,provider 锚定)。达到 `autoThresholdTokens` 时,拒绝发起模型请求,改为压缩头段,
+  并逐字保留最新的 `retainLatestTokens`。
+- **回合结束 / idle(`agent/status` → `idle`)** —— agent 静止(含子代理全部结束)时,可选地
+  经 `compactNow` 压缩(开关:`turnEndForceCompactionEnabled`)。
+- **手动 `/force-compact` 斜杠命令** —— 对忙/闲 agent 都能生效:空闲立即压缩;繁忙则排队一个
+  process-local 强制标记,在下一个模型步骤消费。
+- **`session/flush` 检查点** —— 等待型的持久化检查点。
+
+每条路径最终都汇入唯一的「**压缩结果落入会话**」边界——也正是**发送 liveUI 信令**的位置。
+
+### 判定基准是 provider 锚定的
+
+判定使用 `projectedTokens`(与 UI 角标同款数值),插件因此永不偏离你所见的数字。阈值感知的
+缩容门禁会跳过「注定无法把会话降到阈值以下」的摘要 LLM 调用(消灭低阈值死循环)。
+
+### 影子价格记账与米表对齐
+
+内置事务的 `shadowedTokenCount` 取自**与官方相同的** `tokenMeter.measure` 逐节点单价,使米表
+的折叠协议正确结算下降——压缩后右下角计数是**下降**而非漂移上涨。
+
+### 后端无关的思考控制
+
+`disableThinking` 在**两个互补的缝**上强制执行:
+
+1. **请求缝** —— `reasoningEffort:'off'` → DeepSeek 适配器序列化为
+   `thinking:{type:'disabled'}`(真 DeepSeek API 认这个字段)。
+2. **wire 缝(`llm/stream`)** —— 插件在序列化后追加顶层 `reasoning_effort:"none"`,llama.cpp
+   的 OpenAI 兼容层原生解析(`server-common.cpp` 映射到 `enable_thinking=false`,与模板能力
+   无关)。真 DeepSeek 端点忽略未知键。
+
+结果:在任何后端(包括本地 llama.cpp)上都**确实关闭了思考**,不依赖目标嗅探启发式而漏判路由。
+
+### LiveUI 状态
+
+一个极小的 host→client 信令通道(`liveUi` 设置字段,实时镜像到浏览器),在 turn 旁绘制徽标:
+
+- **🟥 compressing** —— 固定红色 `[强制压缩中>>>]`,在压缩提交前一刻发出;
+- **🟢 done** —— 固定绿色 `[压缩完成!]`,**在压缩结果落入会话的瞬间**发出,3 秒后回落为一组
+  全新的随机 working 文案;
+- **🔵 working** —— 否则是一条玩梗式的随机短句("正在缝合上下文…"、"正在憋大招…"),颜色为
+  20 色深色色板随机抽取。
+
+发布器绝对安全:信令故障永远不会干扰真实压缩事务。
+
+---
 
 ## 工作原理
 
-插件钩住官方的模型请求 Waterfall，使判断发生在**每次模型请求之前**（即"钩住
-核心模型请求"的需求），并保留持久化检查点：
-
-- **`agent/request`** —— 围绕冻结调用配置的 Waterfall。当 `disableThinking` 开启时，
-  返回的 `LlmCallConfig` 携带 `reasoningEffort: 'off'`，LLM 适配器将其映射为
-  `thinking: { type: 'disabled' }`，即进程内**每次模型请求**都关闭思考。设置在此
-  （每次请求）读取，因此 `settings.yaml` 的改动在下一次请求即生效。
-- **`agent/pre-step`** —— 每个模型步骤之前的 Waterfall。通过 `tokenMeter` 服务
-  读取会话**上下文总 tokens 数**；当其**达到或超过** `autoThresholdTokens` 时，
-  返回 `{ kind: 'reject' }` **不发起模型请求**，并通过 compaction 服务的
-  `compactRegion`（经 `ctx.get('compaction')` 实时读取）**保留最新的
-  `retainLatestTokens` 个 token 逐字不变**，并将其余**头段**一次性浓缩为一个摘要节点，
-  让循环以更小的上下文重试。
-- **`session/flush`** —— 一个被等待（awaited）的 `parallel` 持久化检查点。检查点
-  会等待所有监听器完成，因此压缩在调用方继续之前就已结束，摘要保证落盘。
-- **`/force-compact`** —— 通过 `/` 选择执行的斜杠命令，强制压缩该 Agent 的会话
-  上下文。其 handler **不发送模型请求**：Agent **空闲**时经 `compactNow`
-  （owner `null`，空闲手动入口，引擎自身区间选择）立即压缩；**繁忙**时
-  `compactNow` 被拒绝，handler **插入一个 process-local 强制标记**（JS 内存记录，
-  无持久态、无 timer），由 `agent/pre-step` 钩子在下一个模型步骤读取。
-  读到强制标记时，该步骤**跳过 token 阈值门禁**，按 `retainLatestTokens`
-  语义选区（保留最新 N 个 token、头段一次性压缩）并经 `compactRegion`（current-turn owner，可在 mid-turn 执行）执行，并返回 `{ kind: 'reject' }`
-
-- **`agent/status`** —— agent 生命周期迁移监听器。当 agent 转入 `idle`
-  （所有轮次结束，含子代理，下一次人为对话之前）且 `turnEndForceCompactionEnabled`
-  为 `true` 时，经 `compactNow`（owner `null`，空闲手动入口）压缩会话——使用
-  引擎自身的区间选择（空闲路径无法选择自定义 token 比例，故无一轮结束比例参数）。
-
-支撑模块：
-
-- **`src/hooks/guard.js`** —— 每次请求的门禁：`agent/request` 关闭思考 +
-  `agent/pre-step` 阈值门禁 + 强制压缩 + `/force-compact` 的 process-local 强制标记。
-- **`src/hooks/command.js`** —— `/force-compact` 斜杠命令：Agent 空闲时经 `compactNow`
-  压缩；繁忙时插入强制标记，待下一个模型步骤消费。
-- **`src/hooks/idle.js`** —— 一轮结束强制压缩：`agent/status` 上的 `idle` 监听器，
-  经 `compactNow`（引擎自身区间选择）压缩。
-- **`src/engine/region.js`** —— 插件自己的 head-anchored 区间选择：`selectRegion`（检查点
-  路径）与 `selectEarliestByTokens`（供 `agent/pre-step` 使用）：前者按 surface
-  节点数保留最近尾段，且都把区间末端对齐到 `user/message` 边界（始终是一个平衡
-  边界）。`idle` / `/force-compact` 路径改用 `compactNow` 的引擎自身区间选择。
-- **`src/engine/summarizer.js`** —— 插件自己的一次性 LLM 摘要器：回放区间消息，把压缩
-  指令作为最后一条 user 消息追加，通过 `ctx.llm` 流式生成，返回浓缩后的检查点。
-- **`src/engine/checkpoint.js`** —— 检查点编排器：选区间 → 投影区间消息 → 运行预览 + 收缩
-  门禁 → 把持久变更委托给 compaction 服务的 **`compactRegion(start, end,
-  agent, signal)`**（经 `ctx.get('compaction')` 实时读取；权威摘要器）。
+插件钩住官方的模型请求 Waterfall,使决策发生在**真正发起模型请求之前**,以及持久化检查点上:
 
 ```
 agent/request(payload, next)              # 每次模型请求
-    settings.get("falling-ts-force-compact") -> disableThinking?
-        return { ...config, reasoningEffort: "off" }   # 关闭思考
+    disableThinking? -> { ...config, reasoningEffort: "off" }
 
-agent/pre-step(payload, next)             # 每个模型步骤之前
-    tokenMeter.measure(session).totalTokens >= autoThresholdTokens?
-        否  -> next()                      # 让模型请求继续
-        是  -> compactRegion(head-before-retainLatestTokens, signal)   # 强制压缩
-              return { kind: "reject" }    # 本次步骤不请求模型
+agent/pre-step(payload, next)             # 每个模型步骤前
+    projectedTokens >= autoThresholdTokens?
+        否  -> next()                       # 放行模型请求
+        是  -> compactRegion(head-before-retainLatestTokens, signal)
+               return { kind: "reject" }    # 本步不请求模型
 
-agent/status({ agent, status })           # agent 生命周期迁移
+agent/status({ agent, status })          # 生命周期过渡
     status === "idle" && turnEndForceCompactionEnabled?
-        是  -> compactNow(agent, freshSignal)   # 一轮结束压缩（空闲）
-        否  -> 跳过
+        -> compactNow(agent, freshSignal)   # 回合结束压缩
 
 session/flush(session)                    # 持久化检查点
-    agents.get(session.id)                -> 实时 Agent（不存在则跳过）
-    region.selectRegion(session)          -> {start, end} 或 null（跳过）
-    projectRegionMessages()               -> 区间消息
-    summarizer.summarize()                -> 预览 + 收缩门禁
-    compaction.compactRegion(start, end, agent, signal)
-        null   -> 无操作（没有可压缩内容）
-        result -> 已将区间压缩为一个摘要节点
+    选区 -> 投影消息 -> 预览 + 缩容门禁
+    -> compaction.compactRegion(start, end, agent, signal)
 ```
 
-## 安装
+支撑模块:
 
-作为可安装 bundle（推荐）：
+- `src/hooks/guard.js` —— 每请求门禁:关思考 + 阈值门 + 强制标记。
+- `src/hooks/command.js` —— `/force-compact` 命令。
+- `src/hooks/idle.js` —— 回合结束强制压缩。
+- `src/hooks/wire-rewrite.js` —— `llm/stream` wire 补丁,追加 `reasoning_effort:"none"`。
+- `src/engine/region.js` —— 头/尾锚定的选区(含官方工具配对账本)。
+- `src/engine/summarizer.js` —— 一次性 LLM 摘要器(与官方 `compaction-basic` 全面对齐:
+  三级 target 解析、前缀缓存对齐、`purpose:'compaction'` 标签、fail-closed finish 分类、
+  usage 采集)。
+- `src/engine/builtin.js` —— 内置持久事务(官方 `compaction/*` 词汇)。
+- `src/engine/checkpoint.js` —— 预览 + 缩容门禁 + 委托 compaction 服务。
+- `src/core/projected.js` —— provider 锚定的 `projectedTokens` 读取。
+- `src/core/ui-signal.js` —— liveUI 信令器。
+
+---
+
+## 安装与验证
+
+作为可安装 bundle(推荐):
 
 ```sh
-# 从 git：
+# 从 npm(已发布):
+npm install @falling-ts/dsh-force-compact
+# 从 git:
 dsh plugin --profile web add github:falling-ts/dsh-force-compact
-# 从本地检出：
+# 从本地检出:
 dsh plugin --profile web add ./dsh-force-compact
 ```
 
-或从本地检出，以 `--patch` overlay 挂载（不安装）：
+或从本地检出,以 `--patch` overlay 挂载(不安装):
 
 ```sh
 dsh web --patch dsh-force-compact/cordis.patch.yml
 ```
 
-该层把 `force-compact` 函数插件插入当前组合（composition），不改动默认发布
-配置。
+插件已加载 ⟺ `~/.dsh/logs/dsh-force-compact.log` 出现:
 
-## 设置（强制压缩配置）
+```
+[force-compact] debug logging enabled — writing [force-compact] lines to <绝对路径>
+```
 
-当 `settings` 服务已挂载（web bundle 通过 `@deepseek-ai/dsh-settings-file` 始终
-挂载它）时，插件会注册 `falling-ts-force-compact` 设置命名空间，使五个参数可从
-`$DSH_HOME/settings.yaml` 配置（`falling-ts-` 前缀用于防止与其他插件的键冲突）：
+验证压缩确实发生:
 
-| 键 | 类型 | 默认值 | 作用 |
-| --- | --- | --- | --- |
-| `disableThinking` | `boolean` | `true` | 为 `true` 时，**每次模型请求**都携带 `reasoningEffort: 'off'`，LLM 适配器将其映射为 `thinking: { type: 'disabled' }`——即请求时关闭提供方的思考/推理。同样作用于插件自己的摘要调用。 |
-| `autoThresholdTokens` | `number`（≥ 32000） | `32000` | 自动压缩触发阈值（单位 tokens）。**在请求模型前**，通过 `tokenMeter` 测量会话上下文总 tokens 数；当其**达到或超过**该值时，**不请求模型**，而是强制执行一次压缩。`session/flush` 检查点路径也把它作为触发门禁。**下限 32000**：低于 32000 的值读取时自动抬升至 32000。 |
-| `retainLatestTokens` | positive int（≥ 8000） | `8000` | **保留最新上下文的绝对 token 数**——`agent/pre-step` 阈值门禁或 `/force-compact` 强制标记触发时，从会话**最新条目**起，按官方 `tokenMeter` 的逐节点计数**反向**累加 token，直到 ≥ 该值**停止**；该截点之前的**所有条目一次性**发往大模型做摘要（原条目被遮蔽/跳过），保留段逐字不变。**下限 8000**：低于 8000 的值读取时自动抬升至 8000。
-| ~~`forceEarliestRatio`~~ | — | — | *已移除。* 强制标记路径现同样使用上方 `retainLatestTokens`（见上行），不再单独保留一个比例参数。 |
-| `turnEndForceCompactionEnabled` | `boolean` | `true` | **是否开启一轮结束强制压缩**——为 `true` 时，agent 转入 `idle`（所有轮次结束，含子代理，下一次人为对话之前）时经 `compactNow`（引擎自身区间选择）强制执行一轮结束压缩。 |
+```
+idle compaction (builtin) shadowed N nodes (~M tokens)
+builtin compaction OK — replaced span seq[A..B] (N nodes, ~K tokens) with a P-char checkpoint
+```
 
-`$DSH_HOME/settings.yaml` 示例：
+---
+
+## 配置
+
+`$DSH_HOME/settings.yaml`,命名空间 `falling-ts-force-compact`:
+
+| 键 | 类型 | 默认 | 含义 |
+|----|------|------|------|
+| `disableThinking` | boolean | `true` | 每次出站调用关闭模型推理努力(上述两缝)。 |
+| `autoThresholdTokens` | number ≥ 32000 | `32000` | 每请求门禁的投影 token 阈值。越低越激进、上下文越瘦。**下限 32000**(存储值读取时抬升)。 |
+| `retainLatestTokens` | 正整数 ≥ 8000 | `8000` | 逐字保留最新 N tokens;更早内容一次性发给摘要器。**下限 8000**。同时驱动自动门禁与 `/force-compact`。 |
+| `turnEndForceCompactionEnabled` | boolean | `true` | 在 agent `idle` 过渡时压缩。 |
+| `debug` | boolean | `true` | 输出 `[force-compact]` 诊断到插件日志。 |
+| `logFile` | string | `~/.dsh/logs/dsh-force-compact.log` | 诊断输出路径(`~` 展开为用户家目录)。 |
+| `compactionMode` | `'realm' \| 'global'` | `'realm'` | 官方服务解析策略(priority‑1 路径)。 |
+| `builtinEnabled` | boolean | `true` | 内置引擎后备闸门。 |
+| `maxSummaryTokens` | 整数 (1024–200000) | `1024` | 摘要 LLM 调用的 `maxTokens` 上限。 |
+
+示例——激进的**本地**配置:
 
 ```yaml
 falling-ts-force-compact:
   disableThinking: true
-  autoThresholdTokens: 32000
+  autoThresholdTokens: 40000   # 更早压缩 ⇒ 常驻 prompt 更小
   retainLatestTokens: 8000
   turnEndForceCompactionEnabled: true
 ```
 
-当 `settings` 服务不存在时，插件回退到同样的默认值，压缩照常进行——设置命名空间
-是可选的，绝非硬依赖。
+当 `settings` 服务缺席时,插件回退到相同默认值并照常压缩——该命名空间是可选的,绝不成为硬依赖。
+
+### 面向低上下文 llama.cpp 的调参建议
+
+用舒适但适中的上下文服务 `Qwen3.8‑27B`,把有效窗口交给插件决定:将 `autoThresholdTokens` 设在
+**明显低于**你服务的上下文,使常驻 prompt 保持小、延迟平稳,而 agent 仍通过被压缩的头段保留
+深层记忆。由于压力按 *投影* token(provider 锚定)度量,阈值会可预测地对应到你 UI 上看到的
+数字。
+
+---
 
 ## 行为说明
 
-- **运行时依赖：** `compaction` 服务，由 preset 平面（`include:agent-presets:compaction-basic`，默认启用并挂载）提供，事件时经 `ctx.get('compaction')` 实时读取。不可用时插件不做任何事（强制压缩路径会降级为让请求继续）。
-- **可选依赖：** `agents` 服务。仅供 `session/flush` 检查点路径使用；若某次
-  flush 触发时 `Agent` 已被注销，插件打印 `no live agent … — skipping` 并跳过
-  该检查点。`agent/*` Waterfall 的 payload 直接携带 `Agent`，无需 `agents` 查找。
-- **可选依赖：** `settings` 服务。不存在时，参数回退到默认值（`disableThinking:
-  true`、`autoThresholdTokens: 32000`、`retainLatestTokens: 8000`、
-  `turnEndForceCompactionEnabled: true`）。
-- **可选依赖：** `tokenMeter` 服务。供 `agent/pre-step` 阈值门禁使用；不存在时，
-  门禁回退到对会话 surface 内容的粗略字符估算。
-- **每次请求读取设置：** 两个参数都**每次模型请求**读取
-  （同步 `settings.get('falling-ts-force-compact')`），因此 `settings.yaml` 的改动在下一次
-  请求即生效，无需重启。
-- **信号（signal）：** `agent/*` Waterfall 转发当前 turn 的 signal；
-  `session/flush` 检查点与 `agent/status` idle 监听器各新建一个 `AbortController`。
+- **运行时依赖:** `compaction` 服务(preset 平面 `agent-presets:compaction-basic`)。经
+  `ctx.get('compaction')` 实时读取;不可用时强制压缩路径放行、让请求继续。
+- **可选依赖:** `settings` / `tokenMeter` / `commands` / `llm` / `agents` 均经 `ctx.get(...)`
+  读取并守卫;缺任一都优雅降级而非崩溃。
+- **每请求读参数:** 参数每次模型请求读取,故改动下次请求即生效、无需重启。
+- **信号:** `agent/*` Waterfall 转发当前 turn 的 signal;`session/flush` 检查点与
+  `agent/status` idle 监听器各自新建 `AbortController`。
+- **持久性:** 持久产物为 `compaction/*` 括号事件 + 带 `surfaceOp:replace` 的
+  `user/message` 检查点,跨 build 重放安全。
+- **客户端半部:** `web/client.js` 新增设置分区 "强制压缩 / Force Compact",支持实时改值
+  (uSES 安全的镜像,无 timer/状态)。
+- **除一处外无 timer:** 唯一有意保留的是 3 s 的 `publishDone` 回落(纯表现层,已在文档声明)。
+  其余均为纯监听器 + 一个 process-local `Map` 强制标记。
 
-## 已知限制
+---
 
-- 插件在**持久化检查点**（`session/flush`）时压缩，此时 `Agent` 可能尚未被
-  注销。如果你的部署在最后一次 flush 之前就注销了 `Agent`，最后一次压缩可能被
-  跳过；若该时序对你重要，可改为监听 `agent/disposed`（其 payload 直接携带
-  `Agent`）。
-- 插件自己的摘要器是**预提交预览 + 收缩门禁**；持久摘要内容由 `compaction`
-  服务权威生成。
-- 强制压缩门禁在达到阈值时**拒绝所提议的模型步骤**，随后依赖循环以更小的
-  上下文重试。若 `compactRegion` 找不到安全区间（例如已无可压缩的有用内容），
-  则让请求按原样继续，而非循环。
-- `idle` 与 `/force-compact` 路径使用 `compactNow`（引擎的空闲手动入口），其
-  区间选择是引擎自身的（基于 `retainTokens`），而非插件可调比例。插件可调比例
-  （`retainLatestTokens` 驱动 `agent/pre-step` 钩子
-  （current-turn owner `compactRegion`）遵守。
-- 不注册任何 client/browser UI；插件是纯 Host 插件。参数可通过
-  `falling-ts-force-compact` 设置命名空间调参（未来某个动态 client 插件可读取它
-  来提供设置页面），并可通过 `[force-compact]` 日志行与持久日志观察。
+## License
+
+MIT(见 LICENSE)。
