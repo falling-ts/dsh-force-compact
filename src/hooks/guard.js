@@ -32,29 +32,6 @@ import { resolveCompaction } from '../engine/backend.js'
 import { publishCompressing, publishDone } from '../core/ui-signal.js'
 
 /**
- * The plugin's OWN debug logger — the single, consistent observability channel.
- *
- * Emits one line through the standard `[force-compact]`-marked `ctx.logger`
- * path UNCONDITIONALLY (the hot per-model-request path pays no settings read).
- * Whether the line actually reaches `~/.dsh/logs/dsh-force-compact.log` is
- * decided ONCE, centrally, by the debug-log exporter in `core/log.js`: that
- * exporter is installed only when the `debug` setting is on and writes a line
- * only when it carries the `[force-compact]` marker. So the `debug` gate lives
- * exclusively at the export boundary; callers simply emit.
- *
- * `msg` is the full `[force-compact] …` line.
- * @param {import('@deepseek-ai/cordis').Context} ctx
- * @param {string} msg
- */
-export function dbg(ctx, msg) {
-  try {
-    ctx.logger.debug(msg)
-  } catch {
-    /* observability must never break the requesting path */
-  }
-}
-
-/**
  * Process-local "force compact now" flags, one per session (keyed by
  * `session.id`). Set by the `/force-compact` command handler when the agent is
  * busy, and consumed (and cleared) by the `agent/pre-step` hook at the next
@@ -214,10 +191,10 @@ async function compactEarliestRatio(ctx, agent, signal, ratio, mode) {
     : undefined
   const region = selectEarliestByTokens(session, ratio, totalTokens)
   if (region === null) {
-    await dbg(ctx, `[force-compact] ${session.id}: no earliest ${ratio} token region to compact (totalTokens=${totalTokens == null ? 'unknown(fallback est)' : totalTokens})`)
+    ctx.logger.debug(`[force-compact] ${session.id}: no earliest ${ratio} token region to compact (totalTokens=${totalTokens == null ? 'unknown(fallback est)' : totalTokens})`)
     return false
   }
-  await dbg(ctx, `[force-compact] ${session.id}: compacting earliest ${ratio} via ${backend.kind} backend -> span seqs ${region.start}..${region.end} (totalTokens=${totalTokens})`)
+  ctx.logger.debug(`[force-compact] ${session.id}: compacting earliest ${ratio} via ${backend.kind} backend -> span seqs ${region.start}..${region.end} (totalTokens=${totalTokens})`)
   try {
     // LIVE UI SIGNAL — PIN RED "compressing" BEFORE the region compaction
     // commits. This single site covers BOTH pre-step trigger paths (queued
@@ -272,7 +249,7 @@ export async function forceCompactIfNeeded(ctx, agent, signal, mode) {
   if (takeForceCompact(session.id)) {
     ctx.logger.info(`[force-compact] ${session.id}: /force-compact queued; force-compacting the earliest ${settings.forceEarliestRatio} immediately`)
     const committed = await compactEarliestRatio(ctx, agent, signal, settings.forceEarliestRatio, mode)
-    await dbg(ctx, `[force-compact] ${session.id}: /force-compact forced compaction ${committed ? 'COMMITTED' : 'did not commit'} — letting the request proceed`)
+    ctx.logger.debug(`[force-compact] ${session.id}: /force-compact forced compaction ${committed ? 'COMMITTED' : 'did not commit'} — letting the request proceed`)
     return committed
   }
 
@@ -280,7 +257,7 @@ export async function forceCompactIfNeeded(ctx, agent, signal, mode) {
   // official `compaction-basic` uses for its pressure gate.
   const meter = ctx.get('tokenMeter')
   if (meter === undefined || typeof meter.measure !== 'function') {
-    await dbg(ctx, `[force-compact] ${session.id}: tokenMeter unavailable — threshold gate skipped, letting the request proceed`)
+    ctx.logger.debug(`[force-compact] ${session.id}: tokenMeter unavailable — threshold gate skipped, letting the request proceed`)
     return false
   }
   const measurement = meter.measure(session)
@@ -288,7 +265,7 @@ export async function forceCompactIfNeeded(ctx, agent, signal, mode) {
     ? measurement.totalTokens
     : estimateSessionTokens(session)
   if (total < settings.autoThresholdTokens) {
-    await dbg(ctx, `[force-compact] ${session.id}: total ~${total} tokens < threshold ${settings.autoThresholdTokens} — below gate, letting the request proceed`)
+    ctx.logger.debug(`[force-compact] ${session.id}: total ~${total} tokens < threshold ${settings.autoThresholdTokens} — below gate, letting the request proceed`)
     return false
   }
 
@@ -302,7 +279,7 @@ export async function forceCompactIfNeeded(ctx, agent, signal, mode) {
   // bypasses this guard deliberately — honoring a user's direct request.)
   const cooldownNote = consultCompactCooldown(session.id, total)
   if (cooldownNote !== undefined) {
-    await dbg(ctx, `[force-compact] ${session.id}: threshold reached (~${total} tokens) but AUTO compaction previously came back blank/unchanged and context has not grown past the cooldown mark — SKIPPING compaction, letting the request proceed (note: ${cooldownNote}). Will re-arm once the session grows ~${COOLDOWN_GROWTH_TOLERANCE} tokens past the last blank mark.`)
+    ctx.logger.debug(`[force-compact] ${session.id}: threshold reached (~${total} tokens) but AUTO compaction previously came back blank/unchanged and context has not grown past the cooldown mark — SKIPPING compaction, letting the request proceed (note: ${cooldownNote}). Will re-arm once the session grows ~${COOLDOWN_GROWTH_TOLERANCE} tokens past the last blank mark.`)
     return false
   }
 
@@ -321,9 +298,9 @@ export async function forceCompactIfNeeded(ctx, agent, signal, mode) {
     // consultCompactCooldown) or a compaction finally commits (see
     // compactEarliestRatio).
     markCompactCooldown(session.id, total, 'blank/unchanged summary at threshold')
-    await dbg(ctx, `[force-compact] ${session.id}: threshold-gate compaction came back BLANK — recorded a compaction cooldown at ~${total} tokens (auto-gate will pause here until context grows). Letting the request proceed.`)
+    ctx.logger.debug(`[force-compact] ${session.id}: threshold-gate compaction came back BLANK — recorded a compaction cooldown at ~${total} tokens (auto-gate will pause here until context grows). Letting the request proceed.`)
   } else {
-    await dbg(ctx, `[force-compact] ${session.id}: threshold-gate compaction COMMITTED — letting the request proceed`)
+    ctx.logger.debug(`[force-compact] ${session.id}: threshold-gate compaction COMMITTED — letting the request proceed`)
   }
   return committed
 }

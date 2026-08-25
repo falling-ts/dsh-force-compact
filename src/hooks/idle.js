@@ -20,7 +20,6 @@
  */
 
 import { readSettings, DEFAULTS } from '../core/settings.js'
-import { dbg } from './guard.js'
 import { resolveCompaction } from '../engine/backend.js'
 import { publishCompressing, publishDone } from '../core/ui-signal.js'
 
@@ -42,7 +41,7 @@ export async function handleAgentStatus(ctx, payload, mode) {
     // Visible so a tester who flipped the setting OFF can confirm the guard is
     // what suppressed the idle compaction (not a missing listener).
     const sid = agent.session ? agent.session.id : '?'
-    void dbg(ctx, `[force-compact] ${sid}: turn-end compaction disabled by settings — idle transition ignored`)
+    ctx.logger.debug(`[force-compact] ${sid}: turn-end compaction disabled by settings — idle transition ignored`)
     return
   }
 

@@ -41,7 +41,7 @@
 import { compactSession } from './src/engine/checkpoint.js'
 import { registerNamespace, readRawSetting } from './src/core/settings.js'
 import { ensureDebugLogger } from './src/core/log.js'
-import { forceCompactIfNeeded, thinkingDisabled, dbg } from './src/hooks/guard.js'
+import { forceCompactIfNeeded, thinkingDisabled } from './src/hooks/guard.js'
 import { registerCommand } from './src/hooks/command.js'
 import { handleAgentStatus } from './src/hooks/idle.js'
 import { registerLlmStreamHook } from './src/hooks/wire-rewrite.js'
@@ -315,15 +315,15 @@ export function apply(ctx) {
     if (!payload || config === undefined) return config
     if (!(await thinkingDisabled(ctx))) {
       // disableThinking=false (setting off): leave the machine's config untouched.
-      await dbg(ctx, '[force-compact] agent/request: disableThinking=false — leaving reasoning effort unchanged')
+      ctx.logger.debug('[force-compact] agent/request: disableThinking=false — leaving reasoning effort unchanged')
       return config
     }
     if (config.reasoningEffort === 'off') {
       // Already off — nothing to switch (still proves the guard is active on this request).
-      await dbg(ctx, '[force-compact] agent/request: reasoningEffort already off — no change')
+      ctx.logger.debug('[force-compact] agent/request: reasoningEffort already off — no change')
       return config
     }
-    await dbg(ctx, `[force-compact] agent/request: applying reasoningEffort=off (disableThinking=true) — original=${config.reasoningEffort ?? '(unset)'}`)
+    ctx.logger.debug(`[force-compact] agent/request: applying reasoningEffort=off (disableThinking=true) — original=${config.reasoningEffort ?? '(unset)'}`)
     return { ...config, reasoningEffort: 'off' }
   }))
 
@@ -377,7 +377,7 @@ export function apply(ctx) {
       const st = payload && payload.status
       if (st === 'idle') {
         const sid = payload && payload.agent ? payload.agent.session.id : '?'
-        void dbg(ctx, `[force-compact] agent/status fired: idle for ${sid} — evaluating turn-end compaction`)
+        ctx.logger.debug(`[force-compact] agent/status fired: idle for ${sid} — evaluating turn-end compaction`)
       }
       const mode = await readRawSetting(ctx, 'compactionMode')
       await handleAgentStatus(ctx, payload, mode)

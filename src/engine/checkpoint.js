@@ -16,7 +16,6 @@
 import { resolveConfig } from '../core/policy.js'
 import { selectRegion } from './region.js'
 import { readSettings, DEFAULTS } from '../core/settings.js'
-import { dbg } from '../hooks/guard.js'
 import { resolveCompaction } from './backend.js'
 
 /** Characters per token, mirroring the token meter's coarse estimate. */
@@ -53,7 +52,7 @@ export async function compactSession(ctx, agent, controller, mode) {
   // estimated total context reaches the configured threshold. Below it, the
   // checkpoint is skipped so short sessions are never force-compacted.
   const sessionTokens = estimateSessionTokens(session)
-  void dbg(ctx, `[force-compact] ${session.id}: session/flush checkpoint fired — session ~${sessionTokens} tokens (threshold ${settings.autoThresholdTokens})`)
+  ctx.logger.debug(`[force-compact] ${session.id}: session/flush checkpoint fired — session ~${sessionTokens} tokens (threshold ${settings.autoThresholdTokens})`)
   if (sessionTokens < settings.autoThresholdTokens) {
     ctx.logger.debug(`[force-compact] ${session.id}: context ~${sessionTokens} tokens below threshold ${settings.autoThresholdTokens}; skipping`)
     return null
@@ -80,7 +79,7 @@ export async function compactSession(ctx, agent, controller, mode) {
     return null
   }
 
-  void dbg(ctx, `[force-compact] ${session.id}: checkpoint compaction via ${backend.kind} over seq ${region.start}..${region.end}`)
+  ctx.logger.debug(`[force-compact] ${session.id}: checkpoint compaction via ${backend.kind} over seq ${region.start}..${region.end}`)
   let result
   try {
     result = await backend.compactRegion(region.start, region.end, agent, controller.signal)

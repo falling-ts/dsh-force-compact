@@ -13,7 +13,7 @@
  * @module @falling-ts/dsh-force-compact/command
  */
 
-import { queueForceCompact, dbg } from './guard.js'
+import { queueForceCompact } from './guard.js'
 import { resolveCompaction } from '../engine/backend.js'
 import { readRawSetting } from '../core/settings.js'
 import { publishCompressing, publishDone } from '../core/ui-signal.js'
@@ -51,7 +51,7 @@ export function registerCommand(ctx) {
       // the resolver need not re-read settings.
       const mode = await readRawSetting(ctx, 'compactionMode')
       const backend = await resolveCompaction(ctx, agent, mode)
-      void dbg(ctx, `[force-compact] ${session.id}: /force-compact handler entered (backend ${backend ? backend.kind : 'UNAVAILABLE'})`)
+      ctx.logger.debug(`[force-compact] ${session.id}: /force-compact handler entered (backend ${backend ? backend.kind : 'UNAVAILABLE'})`)
 
       // Guard the case it is not available so the command settles as an error
       // rather than throwing out of the handler. When the OFFICIAL service is
