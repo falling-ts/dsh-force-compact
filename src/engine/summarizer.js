@@ -195,16 +195,40 @@ export async function summarize(ctx, config, agent, input, signal, extra) {
   // TEMPORARY: pass recordOnEmpty so a zero-text run dumps its raw chunk shape
   // (see collectChunks probe) — the only reliable way to learn what the harness
   // actually hands us vs the expected `chunk.type` literals.
-  const collected = await collectChunks(llm.stream(options), signal, { recordOnEmpty: true })
+  // Bind the stream ONCE (rather than inline in the collectChunks call) so the
+  // missing-finish diagnostic below can describe the ACTUAL object we were given
+  // — distinguishing "not async-iterable (swapped by a waterfall listener)" from
+  // "iterated cleanly but never delivered a finish chunk".
+  const stream = llm.stream(options)
+  const collected = await collectChunks(stream, signal, { recordOnEmpty: true })
 
-  // Terminal finish classification (fail-closed, mirroring the official
-  // summarizer's `finishError`). `complete`/`length` are treated per spec:
-  // a `length` finish WITHOUT text is an error (truncation), WITH text is a
-  // partial-but-valid summary (accepted); `abort` throws.
+  // Terminal finish classification (fail-closed), keyed on the OFFICIAL
+  // `FinishReason.kind` closed union (upstream `packages/llm/llm/src/types.ts`:
+  // `'stop' | 'tool-calls' | 'max-tokens' | 'aborted' | 'error'`). Earlier code
+  // matched on invented literals ('complete'/'length'/'abort') that the provider
+  // never emits, so a NORMAL completion (`kind:'stop'`) fell through unclassified
+  // — harmless here (we only act on the failure kinds) but misleading. Matching
+  // the real enum keeps the branches honest and makes a future unknown `kind`
+  // visible rather than silently swallowed.
   const finish = collected.finish
   if (finish === undefined) {
-    // Stream terminated without a terminal chunk — treat as aborted/malformed.
-    throw new TypeError('summarization stream ended without a terminal finish chunk')
+    // Stream terminated WITHOUT a terminal `finish` chunk. Two causes, both
+    // reported distinctly so the operator can act:
+    //   • the provider stream errored before emitting any chunk (setup/auth/
+    //     oversized-prompt rejection) — usually surfaces as a separate thrown
+    //     iteration error, but a lazy generator that dies quietly leaves finish
+    //     unset;
+    //   • the returned value was not async-iterable (a `llm/stream` waterfall
+    //     listener swapped the generator for a Promise/plain object) — the
+    //     `for await` threw or silently yielded nothing.
+    // Either way: NO usable summary. Attach the observed stream facts so the
+    // next reader knows which of the two happened.
+    const err = new Error(
+      'summarization stream ended without a terminal finish chunk '
+      + `(collected ${collected._chunkCount ?? '?'} chunks; stream was ${describeStream(stream)})`,
+    )
+    err.code = 'NO_FINISH_CHUNK'
+    throw err
   }
   const finishKind = finish.kind
   if (finishKind === 'error') {
@@ -212,12 +236,12 @@ export async function summarize(ctx, config, agent, input, signal, extra) {
     err.code = 'PROVIDER_ERROR'
     throw err
   }
-  if (finishKind === 'aborted' || finishKind === 'abort') {
-    const err = new Error('summarization aborted during generation')
+  if (finishKind === 'aborted') {
+    const err = new Error('summarization aborted during generation: ' + (failureText(finish.failure) || '(caller abort)'))
     err.code = 'ABORTED'
     throw err
   }
-  if (finishKind === 'max-tokens' || finishKind === 'length') {
+  if (finishKind === 'max-tokens') {
     const textLen = measuredLength(collected.text)
     if (textLen === 0) {
       const err = new Error('summarization truncated at the token cap with no output')
@@ -228,6 +252,9 @@ export async function summarize(ctx, config, agent, input, signal, extra) {
     // shrink gate will decide whether it is useful; if it balloons beyond
     // the shadowed span the transaction is aborted there anyway.
   }
+  // `kind: 'stop'` and `kind: 'tool-calls'` are SUCCESS terminations — fall
+  // through to extracting the text below. (Tool-call output from a compaction
+  // request is unexpected but harmless; extractTextOnly keeps only text blocks.)
 
   const extracted = extractTextOnly(collected.blocks)
   if (collected.hasImage) {
@@ -346,6 +373,31 @@ export function headerPrefix(session) {
  * @returns {Promise<{ blocks: Array, text: string, hasImage: boolean, finish: object|undefined, usage: object|undefined }> }
  */
 async function collectChunks(stream, signal, opts) {
+  // UP-FRONT ITERABILITY CHECK: `ctx.llm.stream()` is contractually an
+  // `AsyncIterable<StreamChunk>` (direct `for await`, no outer await /
+  // `.values()`). But `llm.stream` COMPOSES every `llm/stream` waterfall
+  // listener, and a listener that `return`s a Promise or a plain (non-
+  // async-iterable) object poisons the composition — turning the stream into
+  // exactly the unstable "sometimes throws not-async-iterable, sometimes
+  // yields nothing" we observed. Detect it HERE with a precise, actionable
+  // message naming the offending constructor, instead of letting a confusing
+  // `yield* (intermediate value)…` TypeError leak out later.
+  const asyncIterFn = (stream && typeof stream === 'object')
+    ? (stream[Symbol.asyncIterator]?.bind(stream))
+    : undefined
+  if (typeof asyncIterFn !== 'function') {
+    const detail = describeStream(stream)
+    const err = new Error(
+      `llm.stream() did NOT return an async iterable (got ${detail}) — `
+      + `a \`llm/stream\` waterfall listener is almost certainly replacing the `
+      + `stream generator with a different object; no chunks can be consumed`,
+    )
+    err.code = 'STREAM_NOT_ITERABLE'
+    // Propagate out of collectChunks straight to the transaction's catch
+    // (closeWithError records it). No partial result — the stream was never
+    // consumable, so there is nothing to salvage.
+    throw err
+  }
   const blocks = []
   let text = ''
   let hasImage = false
@@ -486,7 +538,33 @@ async function collectChunks(stream, signal, opts) {
     const reasonJson = finish && typeof finish === 'object' ? JSON.stringify(finish) : String(finish)
     process.stdout.write(`[force-compact] CHUNK-SHAPE PROBE (no text blocks): finishReason=${reasonJson} count=${chunkCount} :: ${desc}\n`)
   }
-  return { blocks, text, hasImage, finish, usage }
+  // `_chunkCount` is exposed (underscore-prefixed, internal) purely so a
+  // missing-finish diagnostic can distinguish "consumed N chunks but never a
+  // terminal finish" from "consumed ZERO chunks (silent/lazy/no-op stream)".
+  return { blocks, text, hasImage, finish, usage, _chunkCount: chunkCount }
+}
+
+/**
+ * Render a terse, human-readable description of whatever object `stream` actually
+ * is — used ONLY in error paths to identify who replaced the expected async
+ * iterable. Never throws: any inspection failure degrades to a generic tag.
+ * @param {*} stream the object passed where an `AsyncIterable` was expected.
+ * @returns {string} e.g. `a Promise (constructor Promise)`, `a Generator`, `undefined`, `an array of length 3`.
+ */
+function describeStream(stream) {
+  try {
+    if (stream === undefined) return 'undefined'
+    if (stream === null) return 'null'
+    const ctor = (stream.constructor && stream.constructor.name) || typeof stream
+    if (ctor === 'Promise') return 'a Promise (constructor Promise) — a listener likely wrapped the stream in an async fn'
+    if (Array.isArray(stream)) return `an array of length ${stream.length} — a listener likely returned a pre-materialized chunk array`
+    const hasAsyncIter = typeof stream[Symbol.asyncIterator] === 'function'
+    const hasSyncIter = typeof stream[Symbol.iterator] === 'function'
+    const keys = Object.prototype.toString.call(stream)
+    return `constructor=${ctor} ${keys} asyncIterable=${hasAsyncIter} syncIterable=${hasSyncIter}`
+  } catch {
+    return `<undescribable object (${typeof stream})>`
+  }
 }
 
 /**

@@ -37,8 +37,115 @@ import { summarize, CHECKPOINT_PREAMBLE, headerPrefix } from './summarizer.js'
 import { selectEarliestByTokens } from './region.js'
 import { readSettings, DEFAULTS } from '../core/settings.js'
 
+/**
+ * Per-session SUMMARIZATION FAILURE cooldown (process-local, no timers, no
+ * persistence) — the storm-suppression layer for the IDLE/`compactNow` path,
+ * which (unlike the `agent/pre-step` threshold gate) never consulted the
+ * existing `guard.js` blank-result cooldown.
+ *
+ * Why this exists: `compactNow` runs its OWN head-anchored region selection on
+ * EVERY `agent/status: idle` transition. If that region's summarization FAILS
+ * (provider error, truncated-empty, non-iterable stream — anything that reaches
+ * `closeWithError`), NOTHING commits, so the surface is UNCHANGED. The next idle
+ * transition selects the IDENTICAL region and repeats the doomed, expensive LLM
+ * round-trip. At the observed cadence (one idle tick roughly every ~5s on a
+ * busy session) this becomes a livelock: the SAME giant span re-summarized and
+ * re-failed on every tick — the concrete "stutters every request" symptom.
+ *
+ * Mechanism (mirrors `guard.js`'s `compactCooldown` token-high-water-mark):
+ * when a transaction fails we remember the session's CURRENT authoritative
+ * total-token count as a "do not retry until it grows past THIS" mark, plus a
+ * wall-clock timestamp so a pure stall (no new tokens ever) also cools off after
+ * a fixed grace period. Both conditions being satisfied clears the mark and the
+ * NEXT attempt proceeds. Wall-clock use here is a process-local monotonic-ish
+ * read at DECISION time (Date.now()); it stores no timers and starts no
+ * intervals — consistent with the "no timer/memory-state beyond Maps" rule.
+ * Capped at MAX_FAILURE_COOLDOWN_ENTRIES to stay bounded under many sessions.
+ */
+const failureCooldown = new Map()
+const MAX_FAILURE_COOLDOWN_ENTRIES = 32
+/** Absolute token-growth needed past the recorded mark before a failed span may retry. */
+const FAILURE_RETRY_GROWTH_TOL = 500
+/** Grace period (ms) after a failure before a retry is permitted EVEN IF the
+ *  token count has not grown (guards the "identical doomed span" livelock where
+ *  the surface never changes, so the growth test alone would never clear). */
+const FAILURE_RETRY_GRACE_MS = 60_000
+/** How often (ms) a still-cooled session re-evaluates, bounding how long a
+ *  genuinely-stuck span suppresses further attempts; also caps map retention. */
+const FAILURE_REEVAL_INTERVAL_MS = 15_000
+
 /** Characters per token — mirrors the token meter's coarse estimator. */
 const CHARS_PER_TOKEN = 4
+
+/**
+ * Hard CAP on the NUMBER of messages replayed into a single summarization call.
+ * A head-anchored region spanning thousands of surface nodes (observed live: a
+ * session whose whole 3600-node history kept getting projected into one prompt)
+ * produces a multi-hundred-KB prompt that a LOCAL GGUF endpoint
+ * (llama.cpp :8080, Qwen3.8-27B) routinely rejects or times out on — guaranteeing
+ * a FAILED, never-committing compaction every idle tick (the "stuck, stutters
+ * every ~5s" symptom). Refusing such a replay outright (return `null`, skip) is
+ * strictly better than paying a doomed round-trip repeatedly: it stops the
+ * livelock at its source. The cap is generous (128 messages ≈ a substantial but
+ * bounded window) so legitimate mid-size compactions still proceed; only
+ * pathological whole-history replays are refused.
+ */
+const MAX_REPLAY_MESSAGES = 128
+
+/**
+ * Consult a session's summarization-failure cooldown. Returns a human-readable
+ * SKIP NOTE (suppress this attempt) or `undefined` (proceed normally). Clears
+ * the mark when EITHER condition holds, so a recovered span retries promptly:
+ *   • the session's total tokens have grown past `mark + tolerance` (new content
+ *     arrived → a different, larger span is now worth trying), OR
+ *   • `FAILURE_RETRY_GRACE_MS` have elapsed since the last failure (pure stall
+ *     guard against the identical-doomed-span livelock).
+ * @param {string} sessionId
+ * @param {number|undefined} totalTokens current authoritative total (best-effort).
+ * @returns {string|undefined} skip-note, or `undefined` to proceed.
+ */
+function consultFailureCooldown(sessionId, totalTokens) {
+  const entry = failureCooldown.get(sessionId)
+  if (entry === undefined) return undefined
+  const grew = Number.isFinite(totalTokens)
+    && totalTokens > entry.tokens + FAILURE_RETRY_GROWTH_TOL
+  const agedOut = (Date.now() - entry.at) >= FAILURE_RETRY_GRACE_MS
+    && (Date.now() - entry.lastReeval) >= FAILURE_REEVAL_INTERVAL_MS
+  if (grew || agedOut) {
+    failureCooldown.delete(sessionId)
+    return undefined
+  }
+  // Still cooling: refresh the re-eval watermark (throttled bookkeeping only —
+  // no timers spawned) and explain the suppression.
+  if (agedOut === false && (Date.now() - entry.lastReeval) >= FAILURE_REEVAL_INTERVAL_MS) {
+    entry.lastReeval = Date.now()
+  }
+  return `last builtin summarization failed (at ~${entry.tokens} total tokens); backing off ${Math.max(1, Math.round((FAILURE_RETRY_GRACE_MS - (Date.now() - entry.at)) / 1000))}s`
+}
+
+/**
+ * Record a summarization failure for a session so subsequent idle ticks back
+ * off (see the `failureCooldown` doc-block for rationale). Bounded & evicted
+ * oldest-first like `guard.js`'s cooldown.
+ * @param {string} sessionId
+ * @param {number|undefined} totalTokens best-effort current total (marks the growth baseline).
+ */
+function markFailureCooldown(sessionId, totalTokens) {
+  while (failureCooldown.size >= MAX_FAILURE_COOLDOWN_ENTRIES) {
+    const oldest = failureCooldown.keys().next().value
+    if (oldest === undefined) break
+    failureCooldown.delete(oldest)
+  }
+  const now = Date.now()
+  const base = Number.isFinite(totalTokens) ? totalTokens : 0
+  failureCooldown.delete(sessionId) // move-to-tail semantics
+  failureCooldown.set(sessionId, { tokens: base, at: now, lastReeval: now })
+}
+
+/** Drop a session's failure cooldown (called when a compaction SUCCEEDS). */
+function clearFailureCooldown(sessionId) {
+  failureCooldown.delete(sessionId)
+}
 
 /**
  * Checkpoint provenance carried on the replacement `user/message`'s `source`.
@@ -142,6 +249,22 @@ async function runTransaction(ctx, agent, session, region, signal, settings) {
   }
   const meter = ctx.get('tokenMeter')
 
+  // ---- Failure cooldown ---------------------------------------------------
+  // Suppress a retry of a recently FAILED summarization on this session (see
+  // the `failureCooldown` doc-block). Best-effort read of the authoritative
+  // total; a missing meter simply passes `undefined` and relies on the grace
+  // period alone. This is what breaks the idle livelock: a failing span backs
+  // off for a bounded interval instead of re-hammering every tick.
+  let currentTotalTokens
+  if (meter !== undefined && typeof meter.measure === 'function') {
+    try { currentTotalTokens = meter.measure(session)?.totalTokens } catch { /* best effort */ }
+  }
+  const cooledNote = consultFailureCooldown(session.id, currentTotalTokens)
+  if (cooledNote !== undefined) {
+    info(ctx, `${session.id}: builtin compaction SKIPPED (cooldown) — ${cooledNote}`)
+    return null
+  }
+
   // ---- Prepare the replay input ------------------------------------------
   const { shadowedSeqs, messages } = projectRegion(session, region)
   if (messages.length === 0) {
@@ -149,6 +272,24 @@ async function runTransaction(ctx, agent, session, region, signal, settings) {
     return null
   }
   const shadowedTokenCount = estimateTokens(messages)
+
+  // ---- Replay-size CAP ----------------------------------------------------
+  // Refuse a replay whose message count exceeds MAX_REPLAY_MESSAGES. Such a
+  // region (typically a head-anchored selection that grabbed nearly the WHOLE
+  // session) sends a gigantic prompt the local model endpoint cannot serve, so
+  // attempting it guarantees a failed, non-committing transaction repeated on
+  // every idle tick — the livelock behind "stuck + stutters each request".
+  // Skipping here (before opening the lock or calling the LLM) costs nothing.
+  if (messages.length > MAX_REPLAY_MESSAGES) {
+    warn(
+      ctx,
+      `${session.id}: builtin compaction REFUSED — region projects ${messages.length} messages `
+      + `(span seq ${region.start}..${region.end}), exceeding the ${MAX_REPLAY_MESSAGES}-message replay cap; `
+      + `a summarization of that size is unserviceable on a local model endpoint. Skipping (no lock opened, `
+      + `no LLM call made). Lower the auto-region extent (autoEarliestRatio) to compact smaller windows.`,
+    )
+    return null
+  }
 
   // ---- Open the durable lock ---------------------------------------------
   const compactionId = mintCompactionId()
@@ -200,6 +341,14 @@ async function runTransaction(ctx, agent, session, region, signal, settings) {
     summarizationModel = preview.model
     summarizationMaxTokens = preview.maxTokens
   } catch (error) {
+    // ARM THE FAILURE COOLDOWN: this summarization just failed (provider error
+    // / aborted / truncated-empty / non-iterable stream / no-target-null). Without
+    // this, the next idle tick would select the SAME region and repeat the doomed
+    // round-trip — the livelock. Marking it makes subsequent idle attempts back
+    // off for a bounded interval. Armed here (NOT in closeWithError) because
+    // closeWithError is ALSO called on the shrink-gate abort, which is a DIFFERENT
+    // outcome (a summary WAS produced, just not shrunk) and must NOT cool the LLM.
+    markFailureCooldown(session.id, currentTotalTokens)
     closeWithError(session, startEvent, compactionId, error, ctx)
     return null
   }
@@ -296,6 +445,9 @@ async function runTransaction(ctx, agent, session, region, signal, settings) {
     info(ctx, `${session.id}: builtin compaction — warning: could not append compaction/end (lock may appear open on next reload)`)
   }
 
+  // A successful compaction clears ANY residual failure cooldown for this
+  // session so the NEXT idle tick isn't suppressed by a stale mark.
+  clearFailureCooldown(session.id)
   info(ctx, `${session.id}: builtin compaction OK — replaced span seq[${targetRange.start}..${targetRange.end}] (${shadowedSeqs.length} nodes, ~${shadowedTokenCount} tokens) with a ${summaryTextLen}-char checkpoint`)
   return {
     kind: 'builtin',
