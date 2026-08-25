@@ -173,6 +173,10 @@ export async function publishUiStatus(ctx, status, isImportant = false) {
     if (!isImportant) {
       let currentText
       try {
+        // SYNC read — the settings service's `get` returns the cached value
+        // immediately (same call style as settings.js:226); the gate is purely
+        // advisory (worst case: the write proceeds, nothing breaks), so there
+        // is no reason to await an async variant even if one ever appeared.
         const nsValue = (typeof settings.get === 'function') ? settings.get(NS) : undefined
         currentText = (nsValue != null && typeof nsValue === 'object')
           ? nsValue[LIVE_UI_FIELD]?.text
