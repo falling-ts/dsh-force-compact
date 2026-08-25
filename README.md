@@ -196,6 +196,19 @@ falling-ts-force-compact:
 When the `settings` service is absent, the plugin falls back to the same defaults and still
 compacts — the namespace is optional, never a hard dependency.
 
+---
+
+## Screenshots
+
+![Settings panel — "Force Compaction / 强制压缩" section with all five knobs live-editable](docs/settings-panel.png)
+
+*Settings panel — `设置 > 强制压缩`. All nine fields above can be edited live without restart.*
+
+![Live conversation — red "[forced compacting>>>]" badge pinned beside an in-flight turn](docs/live-conversation.png)
+
+*Conversation page — the live-UI signal paints three states (🟥 compressing / 🟢 done / 🔵 working);
+the green banner fades after ~3 s back to a random "working" line.*
+
 ### Tuning for low-context llama.cpp
 
 Serve `Qwen3.8‑27B` with a comfortable-but-modest context and let the plugin decide the
