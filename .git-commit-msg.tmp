@@ -1,0 +1,7 @@
+release: v0.2.3 — ship screenshots in assets/ + README references
+
+package.json: 0.2.2 -> 0.2.3; files[] gains assets/ so the two reference
+screenshots ship alongside the published tarball. README (EN/ZH) now point
+at assets/settings-panel.png and assets/live-conversation.png.
+
+No src/index.js or behavior changes in this release.
