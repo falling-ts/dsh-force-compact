@@ -259,10 +259,58 @@ export async function readRawSetting(ctx, field) {
  *   the schemastery schema (a callable validator with a `toJSON`), or `null`
  *   when the schemastery module cannot be resolved at runtime.
  */
-export async function buildSchema() {
+/**
+ * Resolve the `z` schema constructor, tolerating BOTH layouts the plugin ships
+ * in:
+ *  - a monorepo/dev layout where `@deepseek-ai/schemastery` is a resolvable
+ *    bare specifier (other workspace packages depend on it and Node walks up
+ *    their `node_modules`);
+ *  - this plugin as a STANDALONE repo (its own `node_modules` lacks
+ *    schemastery, which lives in the sibling `deepseek-harness/vendor/` copy).
+ *    In that case the bare import fails, so we additionally attempt the known
+ *    vendored build by ABSOLUTE path (relative to this file, walking upward to
+ *    the workspace root), which is portable across machines/users because it is
+ *    resolved at runtime from this very file's location. Returns the resolved
+ *    `z`, or `undefined` when NO candidate yields a usable `z.object`.
+ */
+async function resolveZ() {
+  // Candidate 1: bare specifier (works when installed inside the monorepo).
   try {
     const mod = await import('@deepseek-ai/schemastery')
     const z = mod.default ?? mod
+    if (typeof z.object === 'function') return z
+  } catch { /* fall through to candidate 2 */ }
+  // Candidate 2: the vendored build sitting beside the checkout. Walk up from
+  // THIS file (dsh-force-compact/src/core/) looking for a
+  // `deepseek-harness/vendor/schemastery/lib/index.mjs` alongside the checkout
+  // root. Portable: computed from this file's own path, never hardcoded.
+  try {
+    const { fileURLToPath, pathToFileURL } = await import('node:url')
+    const { dirname, join } = await import('node:path')
+    const { existsSync } = await import('node:fs')
+    let dir = dirname(fileURLToPath(import.meta.url))
+    for (let hop = 0; hop < 8; hop += 1) {
+      const cand = join(dir, 'deepseek-harness/vendor/schemastery/lib/index.mjs')
+      if (existsSync(cand)) {
+        // Dynamic import() on Windows REQUIRES a file:// URL (a bare drive-letter
+        // absolute path throws ERR_UNSUPPORTED_ESM_URL_SCHEME). Convert the found
+        // path so the vendored build loads reliably on both POSIX and Windows.
+        const mod = await import(pathToFileURL(cand).href)
+        const z = mod.default ?? mod
+        if (typeof z.object === 'function') return z
+      }
+      const parent = dirname(dir)
+      if (parent === dir) break
+      dir = parent
+    }
+  } catch { /* candidate 2 unavailable — proceed unresolved */ }
+  return undefined
+}
+
+export async function buildSchema() {
+  try {
+    const z = await resolveZ()
+    if (z === undefined) return null
     const schema = z.object({
       disableThinking: z.boolean().default(DEFAULTS.disableThinking),
       // `step(1)` constrains to whole numbers (schemastery has no `.int()`).
@@ -297,15 +345,7 @@ export async function buildSchema() {
       // strictly smaller than the span it replaces) this keeps transactions
       // bounded while ensuring compression is always net-negative.
       maxSummaryTokens: z.number().step(1).min(256).max(200000).default(DEFAULTS.maxSummaryTokens),
-       // TRANSIENT UI MESSENGER (see core/ui-signal.js): the host writes
-       // "{ phase, text, color }" here; the client half's existing
-       // settingsScope.bind mirror reflects it live so the browser can
-       // repaint the conversation area 'TurnStatus' node. Optional on
-       // purpose: the field is ABSENT until the first LLM call publishes
-       // a working pair, and readSettings deliberately ignores it (it is
-       // not a user-facing preference, so it stays OUT of the DEFAULTS
-       // nine-field shape and the settings panel renders nothing).
-       liveUi: z.record(z.unknown()).optional()
+        liveUi: z.any(), // TRANSIENT UI MESSENGER (core/ui-signal.js): host-written { phase,text,color }. z.any() used because the vendored schemastery exposes object/any/string/number/boolean/array only (no record/unknown/chained .optional()); z.record(z.unknown()).optional() throws there and aborts the whole z.object(...), stranding the settings panel on "loading". Absence-by-default is inherent (no .default). readSettings ignores it — not a user preference.
     })
     return schema
   } catch {

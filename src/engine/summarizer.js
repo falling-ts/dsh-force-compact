@@ -189,7 +189,10 @@ export async function summarize(ctx, config, agent, input, signal, extra) {
   // plugin does not depend on `@deepseek-ai/dsh-llm` symbols (it ships as
   // plain JS outside the DSH workspace), so the assembly logic is inlined here
   // against the documented `StreamChunk` shape.
-  const collected = await collectChunks(llm.stream(options), signal)
+  // TEMPORARY: pass recordOnEmpty so a zero-text run dumps its raw chunk shape
+  // (see collectChunks probe) — the only reliable way to learn what the harness
+  // actually hands us vs the expected `chunk.type` literals.
+  const collected = await collectChunks(llm.stream(options), signal, { recordOnEmpty: true })
 
   // Terminal finish classification (fail-closed, mirroring the official
   // summarizer's `finishError`). `complete`/`length` are treated per spec:
@@ -334,7 +337,7 @@ export function headerPrefix(session) {
  * @param {AbortSignal} [signal]
  * @returns {Promise<{ blocks: Array, text: string, hasImage: boolean, finish: object|undefined, usage: object|undefined, finishReason: string|undefined }> }
  */
-async function collectChunks(stream, signal) {
+async function collectChunks(stream, signal, opts) {
   const blocks = []
   let text = ''
   let hasImage = false
@@ -355,8 +358,22 @@ async function collectChunks(stream, signal) {
     }
   }
 
+  // TEMPORARY CHUNK-SHAPE PROBE: when a stream finishes yet produced NO text
+  // blocks, record the raw shape (type + keys + first 120 chars of any text
+  // field) of the FIRST few chunks. This is the only reliable way to see what
+  // the harness actually hands us versus the `chunk.type` literals the switch
+  // below expects. Guarded: logging never propagates; self-limiting to ≤3 chunks
+  // so it cannot spam on a long stream.
+  let probeBuf = []
+  const recording = Boolean(opts && opts.recordOnEmpty)
+  let chunkCount = 0
+
   for await (const chunk of stream) {
     if (signal !== undefined && signal.aborted) break
+    chunkCount++
+    if (recording && probeBuf.length < 3 && chunkCount <= 3) {
+      probeBuf.push({ type: chunk && chunk.type, keys: Object.keys(chunk || {}).join(','), sample: typeof chunk.text === 'string' ? chunk.text.slice(0, 120) : JSON.stringify(chunk).slice(0, 160) })
+    }
     switch (chunk.type) {
       case 'text-delta':
         flushPending()
@@ -415,6 +432,12 @@ async function collectChunks(stream, signal) {
     }
   }
   flushPending()
+  // TEMPORARY CHUN K-SHAPE PROBE emission: only fires when the caller asked to
+  // record and this run produced ZERO text blocks (the exact failing case).
+  if (recording && !blocks.some(b => b && b.type === 'text')) {
+    const desc = probeBuf.map(p => `#${p.type}[${p.keys}] "${p.sample}"`).join(' | ')
+    process.stdout.write(`[force-compact] CHUNK-SHAPE PROBE (no text blocks): finish=${JSON.stringify(finish)} count=${chunkCount} :: ${desc}\n`)
+  }
   return { blocks, text, hasImage, finish, usage, finishReason }
 }
 
