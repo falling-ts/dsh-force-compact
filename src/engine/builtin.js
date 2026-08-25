@@ -221,15 +221,23 @@ export async function compactNowBuiltin(ctx, agent, signal) {
 
 /**
  * Compactor for a SPECIFIC region (the `compactRegion` analogue): run the full
- * transaction over `start..end`. Callers are responsible for choosing a
- * tool-pair-balanced span.
+ * transaction over EXACTLY `start..end`. Callers (the `agent/pre-step` guard,
+ * `/force-compact`, …) choose the span themselves — typically via
+ * `selectRetainingLatestTokens` priced from a live `tokenMeter.measure`
+ * snapshot. This backend RESPECTS that choice verbatim: it does NOT re-derive
+ * a region internally, mirroring the official `compaction` service contract
+ * where the caller owns region selection. Re-deriving here with a coarser
+ * estimator would silently downgrade the caller's precise region to a
+ * narrower char-heuristic one (observed live 2026-08-25: a meter-priced
+ * head-span shrinking to only the smallest user-boundary slice, shadowing a
+ * few thousand tokens instead of the intended tens of thousands).
  *
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @param {number} start first surface-node seq, inclusive.
  * @param {number} end last surface-node seq, inclusive.
  * @param {import('@deepseek-ai/dsh-agent').Agent} agent
  * @param {AbortSignal} [signal]
- * @returns {Promise<object|null>} the compaction result, or `null` when aborted/skipped.
+ * @returns {Promise<object|null>} the compaction result, or `null` when aborted/skippedped.
  */
 export async function compactRegionBuiltin(ctx, start, end, agent, signal) {
   const session = agent.session
@@ -540,17 +548,23 @@ function estimateSurfaceTokens(session) {
 }
 
 /**
- * Select the plugin's head-anchored compactable region given a session.
+ * Select a head-anchored compactable region for the MANUAL `compactNow` path
+ * (idle turn-end hook, `/force-compact`-when-idle). PRECEDENCE RULE: this is
+ * the SELF-SELECTING fallback only — every region-CARRYING caller routes its
+ * own span through `compactRegion` (see its doc) and this helper is NOT
+ * consulted. Using the coarser char heuristic here is acceptable because the
+ * manual path has no `tokenMeter` snapshot at hand and merely needs SOME safe
+ * balanced span; the precision-sensitive auto-guard keeps using
+ * `selectRetainingLatestTokens` directly.
  *
- * Semantics (new `retainLatestTokens` world): keep the latest
- * `settings.retainLatestTokens` tokens of the surface VERBATIM; everything
- * before that cutoff forms the head-anchored region compacted into a single
- * summary node. The head-side token budget is (surfaceSum − retain), so we
- * estimate the surface token sum with the char heuristic and subtract the
- * retention budget — passing the resulting absolute head budget to the
- * legacy selector (which walks from the head accumulating until it reaches
- * the budget). Snaps the end to a `user/message` boundary for
- * tool-pairing safety.
+ * Semantics: keep the latest `settings.retainLatestTokens` tokens of the
+ * surface VERBATIM; everything before that cutoff forms the head-anchored
+ * region compacted into a single summary node. The head-side token budget is
+ * (surfaceSum − retain), so we estimate the surface token sum with the char
+ * heuristic and subtract the retention budget — passing the resulting
+ * absolute head budget to the legacy selector (which walks from the head
+ * accumulating until it reaches the budget). Snaps the end to a
+ * `user/message` boundary for tool-pairing safety.
  *
  * Edge cases: if the estimated surface sum is smaller than the retention
  * budget (very short sessions), the head budget goes negative — we clamp to

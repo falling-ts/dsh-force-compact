@@ -205,14 +205,16 @@ export function selectEarliestByMeasurements(session, ratio, measurement, maxReg
  * model-visible head-to-tail surface, exactly the caliber that feeds
  * `totalTokens`), ACCUMULATE node tokens BACKWARD (newest → oldest) until the
  * accumulated sum REACHES OR EXCEEDS `retainLatestTokens` (stop condition:
- * `>=`, so the retained tail truly covers the configured budget). The cutoff
- * CUT POINT splits the window: nodes BEFORE the first fully-retained node form
- * the head-anchored SPAN TO COMPACT (sent to the summarizer as one batch,
- * recorded as a single summary node; the original span entries become shadowed
- * / skipped in derived history). The cutoff is then SNAPPED BACKWARD to the
- * nearest preceding `user/message` boundary (positionally before the retained
- * tail's start) so the compacted span ends at a balanced, tool-call-safe
- * point — the same invariant the other selectors maintain.
+ * `>=`). Because a node cannot be split, the retained tail may overshoot
+ * `budget` by UP TO ONE node's weight — that is the closest achievable
+ * "exactly N" boundary given the discrete node granularity. The cutoff CUT
+ * POINT splits the window: nodes BEFORE the first fully-retained node form
+ * the head-anchored SPAN TO COMPACT (sent to the summarizer as one batch;
+ * the original span entries become shadowed / skipped in derived history).
+ * The cutoff is then SNAPPED BACKWARD to the nearest preceding `user/message`
+ * boundary (positionally before the retained tail's start) so the compacted
+ * span ends at a balanced, tool-call-safe point — the same invariant the
+ * other selectors maintain.
  *
  * Why this supersedes ratio-of-total: budgeting the RETAINED side against a
  * FIXED absolute token amount (not `totalTokens × ratio`) decouples the cut
@@ -255,7 +257,9 @@ export function selectRetainingLatestTokens(session, retainLatestTokens, measure
   // Walk FROM THE TAIL toward the head, accumulating node tokens. Stop as soon
   // as the accumulated sum reaches OR EXCEEDS `budget` (the `>=` stop rule).
   // The first node included in the accumulated tail is the cutoff point:
-  // everything STRICTLY BEFORE it (positionally) is compacted.
+  // everything STRICTLY BEFORE it (positionally) is compacted. Because a node
+  // cannot be split, the retained tail may overshoot `budget` by UP TO ONE
+  // node's weight — that is the closest achievable "exactly N" boundary.
   let acc = 0
   let tailStartIdx = total // exclusive: index just AFTER the last retained node
   for (let i = total - 1; i >= 0; i -= 1) {
@@ -269,8 +273,14 @@ export function selectRetainingLatestTokens(session, retainLatestTokens, measure
   if (tailStartIdx <= 0) return null
 
   // Snap the compacted span's END BACKWARD to the nearest `user/message`
-  // boundary at or before index `tailStartIdx - 1`, so the span ends balanced.
-  // If no `user/message` exists anywhere in the prefix, fall back to the raw
+  // boundary strictly BEFORE the retained tail starts, so the span ends on a
+  // balanced, tool-call-safe node. Nodes BETWEEN the snapped boundary and the
+  // raw crossing point stay ON THE RETAINED SIDE: they are never dropped from
+  // the head nor lost from the tail — the retained tail can only GROW past the
+  // literal budget by the width of those boundary-alignment nodes. This makes
+  // the retention guarantee monotone: the verbatim tail is ALWAYS at least as
+  // large as `budget` in the common case and larger near boundaries. If no
+  // `user/message` exists anywhere in the prefix, fall back to the raw
   // crossing index so a valid region is preserved.
   let endIdx = tailStartIdx - 1
   while (endIdx > 0 && !userMessageSeqs.has(nodes[endIdx].seq)) {
@@ -285,8 +295,9 @@ export function selectRetainingLatestTokens(session, retainLatestTokens, measure
   if (start === end) return null
 
   // Report the ACTUAL retained tail's token sum (indices [endIdx+1 .. total-1]
-  // after the boundary snap — the snap may have pulled the end slightly
-  // earlier, enlarging the retained tail's true content).
+  // after the boundary snap — nodes pulled onto the retained side during the
+  // snap are INCLUDED here, so this figure is a faithful lower bound on what
+  // remains verbatim after compaction).
   let retainedTokens = 0
   for (let i = endIdx + 1; i < total; i += 1) {
     const t = Number(nodes[i].tokens) > 0 ? Number(nodes[i].tokens) : 0
