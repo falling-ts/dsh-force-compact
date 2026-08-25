@@ -43,7 +43,7 @@
  *   the official `compaction` service is reachable (host-global mount), it is
  *   always preferred; when unreachable (the standard preset realm-isolates it)
  *   the plugin falls back to the builtin engine — which runs the full durable
- *   transaction itself (own `fc-compact/*` event vocabulary, own checkpoint
+ *   transaction itself (reusing the OFFICIAL `compaction/*` event vocabulary, own checkpoint
  *   `user/message` shadowing a head-anchored span, own shrink gate). Setting
  *   this to `false` disables that fallback so ONLY the official backend is
  *   attempted.

@@ -31,17 +31,39 @@ resolveCompaction
 
 | 步骤 | 追加的事件 | 说明 |
 |------|-----------|------|
-| 打开锁 | `fc-compact/start` | `compactionId`（UUID），`turn`（当前 open turn 号或 null） |
+| 打开锁 | `compaction/start` | `compactionId`（UUID），`turn`（当前 open turn 号或 null） |
 | 摘要生成 | — | 通过 `ctx.llm.stream` 流式生成，受 `maxSummaryTokens` 上限约束；**对齐官方 `compaction-basic`**：注入会话最新请求头中的 `system` 提示词 + `tools` 模式做前缀缓存对齐、三级 target 解析（configured→routed header→agent.options）、`purpose:'compaction'` 标签、完整 StreamChunk 装配（文本/推理/图像/用量）、终止 finish 分类（error/aborted/max-tokens/image 均按 fail-closed 抛错） |
 | 收缩门禁 | — | `tokenMeter.estimateMessage` 判定摘要 tokens < 被遮蔽区间 tokens，否则中止 |
-| 提交摘要标记 | `fc-compact/summary` | 记录 `compactionId`、`shadowedRange`、`shadowedSeqs`、`shadowedTokenCount`、实测 `provider`/`model`/`maxTokens`、provider 上报的 `usage`（摘要调用真正观察到的 LLM 封装，而非预调用启发式猜测） |
-| Surface 替换 | `user/message` + `surfaceOp:{op:'replace',start,end}` | 带 `source={kind:'plugin',plugin:'force-compact-builtin'}`；`sourceEventSeqs` 指向 start+summary+shadowed |
-| 闭合锁 | `fc-compact/end` | 同上 `compactionId`；失败路径在此带 `error:` 字段 |
+| 提交摘要标记 | `compaction/summary` | 记录 `compactionId`、`shadowedRange`、`shadowedSeqs`、`shadowedTokenCount`、**必填** `provider`/`model`、实测 `maxTokens`/`usage`（摘要调用真正观察到的 LLM 封装，而非预调用启发式猜测） |
+| Surface 替换 | `user/message` + `surfaceOp:{op:'replace',start,end}` | 带规范的 compact 检查点 source `{kind:'plugin',plugin:'compact',compactionId}`；`sourceEventSeqs` 指向 start+summary+shadowed |
+| 闭合锁 | `compaction/end` | 同上 `compactionId`；失败路径在此带 `error:` 字段（可省略 summary） |
 
-**为什么事件名用 `fc-compact/*` 前缀而不复用官方 `compaction/*`：** 官方有全局
-`compaction/invariant` 监听器校验每一个落地的 `compaction/*` 事件的合法性；
-我们的事件如果复用同名词汇会被该监听器拒绝。用独立的前缀完全绕开了这条约束，
-使两套引擎可以在同一进程并存（官方挂了就走官方、没挂就内置接管），互不干扰。
+**为什么内置引擎改用官方 `compaction/*` 词汇（而非此前的 `fc-compact/*` 前缀）：**
+早期版本刻意用独立 `fc-compact/*` 前缀以规避官方 `compaction/invariant` 监听器。
+但该决策带来一个**致命的跨重建砖墙**：会话日志的重载门禁（
+`packages/session/session-persistence` coordinator 载入阶段）会把**任何未知且未标记
+`ignorable` 的事件类型**判定为"无法重建"而**拒绝整个日志加载**。`fc-compact/*`
+并不在 harness 生成的 `KNOWN_SESSION_EVENT_TYPES` 编目内（编目只收录官方
+`compaction/*` 等内置类型；下游插件自定义类型按构造就在编目之外），因此
+`fc-compact/*` 事件必须携带信封层的 `ignorable:true` 才能在新 build 里存活。可是
+`Session.append` 对非 surface 类型**不开放 `ignorable` 通道**——它把返回的事件包封
+深冻结，唯一接受的信封键只有 `surfaceOp`/`sourceEventSeqs`（仅 surface 事件可用）。
+结果：试图在冻结返回上挂 `ignorable` 直接抛
+`Cannot define property ignorable, object is not extensible`，事务在第一个
+append 即中断、什么都没落盘，还留下泄漏的锁遮住后续重试。**唯一的正解是把
+`markIgnorable` 彻底移除，改用官方 `compaction/*` 词汇**——官方类型天生在编目内，
+重载无需 `ignorable`，天然跨 build 持久。代价是要满足官方的全局
+`compaction/invariant` 监听器（它校验每一条落地的 `compaction/*`），为此内置事务
+严格遵守其全部不变量：三个括号事件共享同一个非空 `compactionId`；`turn` 在有
+open turn 时取该 turn 号、空闲路径取 `null`（与 `validateOwner` 一致）；
+`compaction/summary` 的 `shadowedSeqs` 非空且首尾等于 `shadowedRange` 起止、
+`provider`/`model` 必填；无错误的 `compaction/end` 必须跟在一条 `compaction/summary`
+之后（出错路径可省略 summary 并携带 `error`）；括号跨度内不与 `turn/start|end`
+交错（四条 append 是同步串，天然成立）。检查点 `user/message` 的 source 也换成
+规范的 `{kind:'plugin',plugin:'compact',compactionId}`（`isCompactCheckpointSource`
+据此识别，并要求 source 上的 `compactionId` 等于在途事务的 `compactionId`）。
+两引擎在同一进程仍可并存（官方服务可达就用官方、不可达才内置接管），共用同一套
+`compaction/*` 词汇与同一份 invariant 校验。
 
 ### 历史背景（为何需要内置引擎）
 
@@ -79,9 +101,9 @@ preset 把 `compaction-basic` 挂在了 `- isolate:{compaction:true,…}` 组里
 2. 建一个短会话并发送任意消息（哪怕 "Say hello"），等回合结束进入 `idle`。
 3. 看 `%USERPROFILE%\.dsh\logs\dsh-force-compact.log` 末行是否出现
    `idle compaction (builtin) shadowed N nodes (~M tokens)` 以及
-   `builtin fc-compact OK — replaced span seq[…] (N nodes, ~M tokens) with a P-char checkpoint`。
+   `builtin compaction OK — replaced span seq[…] (N nodes, ~M tokens) with a P-char checkpoint`。
 4. `session.history` 查该会话，应看到 4 个连续事件：
-   `fc-compact/start` → `fc-compact/summary` → `user/message`(replace) → `fc-compact/end`，
+   `compaction/start` → `compaction/summary` → `user/message`(replace) → `compaction/end`，
    共享同一个 `compactionId`。
 
 ### 如何将官方服务"赢回来"
@@ -164,8 +186,8 @@ DeepSeek 适配器（无独立的 llama.cpp 适配器包），再起一份 adapt
 | **Purpose** | `options.purpose = 'compaction'` 恒定标签（closed-union，adapter 据此路由生成策略）；**不用** agent 的自由文本 purpose。 |
 | **流式装配** | 对所有 `StreamChunk` 种类做完整装配（仿官方 `BlockAssembler`，但因插件以 plain JS 发布、无法解析 `@deepseek-ai/dsh-llm` 符号，此处**内联**一份等价装配逻辑，对照文档化的 `StreamChunk` 形状书写）：`text-delta` 累积为 `{type:'text'}` 块；`reasoning-delta`/`reasoning-chunks` 归并为 `{type:'reasoning'}` 块（**后续剔除**——推理是 UI 折叠区，不作 checkpoint 内容）；`image` 置 `hasImage=true` 并保留块；`usage` 捕获 provider 上报的 usage；`finish` 捕获终止事实。 |
 | **Finish 分类（fail-closed）** | 无终块 → `TypeError`；`error` → `PROVIDER_ERROR`（携带 provider 失败描述）；`aborted`/`abort` → `ABORTED`；`max-tokens`/`length` 且文本为空 → `MAX_TOKENS_EMPTY`；`max-tokens`/`length` 且有文本 → **接受为部分摘要**（交由下游收缩门禁决定是否有用）；图像输出 → `UNSUPPORTED_CONTENT`；纯白文本 → 抛错。 |
-| **错误语义** | `null` 仅表示"从未发出调用"（缺 target 或缺 `ctx.llm`）；其他一切失败一律**抛异常**，由 `runTransaction` 捕获并经 `closeWithError` 走带 `error:` 字段的 `fc-compact/end`。 |
-| **Usage 采集** | provider 上报的 usage 随结果上浮，落到 `fc-compact/summary` 事件的 `usage` 字段，供可观测性使用。 |
+| **错误语义** | `null` 仅表示"从未发出调用"（缺 target 或缺 `ctx.llm`）；其他一切失败一律**抛异常**，由 `runTransaction` 捕获并经 `closeWithError` 走带 `error:` 字段的 `compaction/end`。 |
+| **Usage 采集** | provider 上报的 usage 随结果上浮，落到 `compaction/summary` 事件的 `usage` 字段，供可观测性使用。 |
 | **`<compacted-summary>` 标签** | 指令尾部明确要求：若输入已含 `<compacted-summary>` 块（前次 checkpoint），不得逐字复制，须保留仍然成立的、丢弃过期信息、并入更新的信息。防二次压缩整段拷贝旧摘要导致雪球膨胀。 |
 | **向后兼容** | `summarize(ctx, config, agent, messagesOrInput, signal, extra)` 第 4 参既可传裸 `messages` 数组（旧形态，自动包装为 `{messages}`），也可传 `{messages, system?, tools?}`（新形态）。现有调用方零修改即可享受新能力；`builtin.js` 已切到新形态并喂入 `headerPrefix()` 提取的前缀。 |
 
@@ -200,10 +222,10 @@ DeepSeek 适配器（无独立的 llama.cpp 适配器包），再起一份 adapt
 
 ## 概览
 
-- 插件的持久效果是**追加到会话日志的压缩事务**——具体形态取决于实际走了哪条引擎：走官方时落 `compaction/*` 系列（`compaction/start`、`compaction/summary`、`compaction/end`）加一个 `surfaceOp:replace` 的 `user/message`；走内置时落 `fc-compact/*` 系列（`fc-compact/start`、`fc-compact/summary`、`fc-compact/end`）加同样形态的 `user/message`。两种事务都以"前置括号事件 + 后置 replace 表面节点"的形式落地。插件不引入 timer 或内存态存储；Host 半部保持是**核心模型请求缝**（`agent/request` / `agent/pre-step`）与 `session/flush` 上的纯 Host 监听器。**另有一个 web client 半部**（`web/client.js`，`package.json` 的 `exports["./client"]` + `dsh.client.platform: web`，经 client module 系统自动组成，无需改 web-app 组合）：仅注册一个 `settings.section`（设置页左侧菜单"强制压缩 / Force Compact"分区，order 30），经 `settingsScope.bind({ namespace: 'falling-ts-force-compact' })` 镜像成 uSES 安全的 `SnapshotStore` 并读写字段（`scope.set`/`scope.unset` 写回 `settings.yaml`），**不**引入 timer、内存态存储或额外订阅；client 半部 `inject: ['slots','locale','settingsScope']`（这三个 client 服务在 client 启动时即可用，与 Host 侧的 `compaction` 运行时依赖不同）。
+- 插件的持久效果是**追加到会话日志的压缩事务**——具体形态取决于实际走了哪条引擎：走官方时落 `compaction/*` 系列（`compaction/start`、`compaction/summary`、`compaction/end`）加一个 `surfaceOp:replace` 的 `user/message`；走内置时同样落 `compaction/*` 系列（`compaction/start`、`compaction/summary`、`compaction/end`，字段形状与官方完全一致）加同样形态的 `user/message`。两种事务都以"前置括号事件 + 后置 replace 表面节点"的形式落地。插件不引入 timer 或内存态存储；Host 半部保持是**核心模型请求缝**（`agent/request` / `agent/pre-step`）与 `session/flush` 上的纯 Host 监听器。**另有一个 web client 半部**（`web/client.js`，`package.json` 的 `exports["./client"]` + `dsh.client.platform: web`，经 client module 系统自动组成，无需改 web-app 组合）：仅注册一个 `settings.section`（设置页左侧菜单"强制压缩 / Force Compact"分区，order 30），经 `settingsScope.bind({ namespace: 'falling-ts-force-compact' })` 镜像成 uSES 安全的 `SnapshotStore` 并读写字段（`scope.set`/`scope.unset` 写回 `settings.yaml`），**不**引入 timer、内存态存储或额外订阅；client 半部 `inject: ['slots','locale','settingsScope']`（这三个 client 服务在 client 启动时即可用，与 Host 侧的 `compaction` 运行时依赖不同）。
 - **两条压缩引擎**（见上文"双引擎架构"节）：
   - **官方引擎**——`compaction` 服务提供的 `compactNow` / `compactRegion`，由 preset 平面（`include:agent-presets:compaction-basic`）挂载，**是运行时可选依赖**：插件**不**声明 `inject`——profile 层条目在进程启动时激活，彼时 preset 平面尚未挂载该服务，硬 `inject` 会导致 `assertEntriesActivated` 启动断言失败；各压缩路径在事件时经 `findOfficialService`（`engine/backend.js`）按 `compactionMode`（`realm` 先试 `agent.ctx` 再试 `ctx`；`global` 只试 `ctx`）定位。
-  - **内置引擎**——`src/engine/builtin.js` 自实现的完整压缩事务，只依赖 `ctx.sessions.append`、`ctx.llm.stream`、`ctx.tokenMeter.estimateMessage`（全部经 `ctx.get` 读取、可缺省、对 `undefined` 做守卫）。它追加独立命名的 `fc-compact/*` 事件与 `user/message`(replace)，**刻意不复用官方的 `compaction/*` 词汇表**——因为官方有全局 `compaction/invariant` 监听器校验每一条 `compaction/*` 事件的合法性，复用语义会让内置事务被拒收。两引擎并存时优先级：官方可达即用官方；官方不可达才落到内置（`builtinEnabled !== false` 且 `agent.session` / `llm.service/stream` 可用）。
+  - **内置引擎**——`src/engine/builtin.js` 自实现的完整压缩事务，只依赖 `ctx.sessions.append`、`ctx.llm.stream`、`ctx.tokenMeter.estimateMessage`（全部经 `ctx.get` 读取、可缺省、对 `undefined` 做守卫）。它追加**官方命名的 `compaction/*` 事件**（`compaction/start`、`compaction/summary`、`compaction/end`）与 `user/message`(replace)——**复用**官方词汇而非私造 `fc-compact/*`，因为官方类型天生在 `KNOWN_SESSION_EVENT_TYPES` 编目内，重载无需 `ignorable` 标记即可跨 build 持久（详见上文"为什么内置引擎改用官方 `compaction/*` 词汇"一节）。代价是须满足官方全局 `compaction/invariant` 监听器的全部不变量（共享 `compactionId`、owner/turn 一致、`shadowedSeqs` 对齐 `shadowedRange`、`provider`/`model` 必填、无错 `end` 需紧跟 `summary`）。两引擎并存时优先级：官方可达即用官方；官方不可达才落到内置（`builtinEnabled !== false` 且 `agent.session` / `llm.service/stream` 可用）。
 - `agents`、`settings`、`tokenMeter`、`commands`、`llm` 都是可选依赖（`ctx.get(...)`，对 `undefined` 做守卫）：`agents` 仅供 `session/flush` 路径（缺少 Agent 是记录日志后跳过）；缺少 `settings` 时所有参数回退到默认值；缺少 `tokenMeter` 时阈值门禁回退到粗略字符估算；缺少 `commands` 时 `/force-compact` 命令不注册（`src/hooks/command.js` 是 no-op）；缺少 `llm` 时内置引擎不可用（官方引擎不受影响）。
 - **钩住核心模型请求（`agent/request` / `agent/pre-step`）：** 插件的核心行为是钩住官方模型请求缝，**每次请求模型前**读取设置：
   - **`agent/request`**（围绕冻结调用配置的 Waterfall）——`disableThinking` 为 `true` 时，返回的 `LlmCallConfig` 携带 `reasoningEffort: 'off'`（适配器映射为 `thinking: { type: 'disabled' }`），即**每次模型请求**都关闭思考。监听器 `await next()` 取得机器本会使用的配置，再返回替换值；**不得**在缺少 `next()` 时短路（必须调用 `next()`）。
@@ -229,7 +251,7 @@ DeepSeek 适配器（无独立的 llama.cpp 适配器包），再起一份 adapt
   - `src/core/` —— 基础设施：`policy.js`（可调参数，固定常量）、`settings.js`（设置命名空间）、`log.js`（调试日志 sink）。
   - `src/engine/` —— 压缩引擎层：`selectRegion`（按 surface 节点数保留最近尾段，检查点路径用）与 `selectEarliestByTokens`（按 `tokenMeter` 测量的总 tokens 的 `ratio` 比例从头累计至预算后截断，末端对齐 `user/message` 边界，供 `agent/pre-step` 使用；`idle` / `/force-compact` 路径改用 `compactNow` 的引擎自身区间选择）。
   - `summarizer.js` —— 插件自己的一次性 LLM 摘要器（回放区间，追加压缩指令，通过 `ctx.llm` 流式生成）。
-  - `builtin.js` —— 内置压缩引擎（`fc-compact/*` 事务链，见上文）。
+  - `builtin.js` —— 内置压缩引擎（复用官方 `compaction/*` 事务链，见上文）。
   - `backend.js` —— 统一后端 facade：官方 `compaction` 服务优先、内置引擎后备（`resolveCompaction`，两条路径形状一致）。
   - `checkpoint.js` —— 检查点编排器：选区间 → 投影区间消息 → 运行预览 + 收缩门禁 → 把持久变更委托给 compaction 服务的 `compactRegion(start, end, agent, signal)`（经 `ctx.get('compaction')` 实时读取；不可用时跳过检查点）。
   - `src/hooks/` —— Cordis 触发钩子：
@@ -250,4 +272,4 @@ DeepSeek 适配器（无独立的 llama.cpp 适配器包），再起一份 adapt
 
 **落盘。** 每个事件一行 JSONL，默认包裹在拼接的带校验和 zstd 帧中（每个追加批次一帧）；SQLite 后端改存打包的 chunk 行。`SESSION_FORMAT_VERSION = 0`——预发布，无迁移；后端拒绝任何其它版本。崩溃恢复从不截断：未闭合的 `turn/start` 以合成 `turn/end { reason: { kind: 'interrupted' } }` 闭合。
 
-**dsh-force-compact 追加的内容**（其全部持久效果）：一组 log-only 的事务括号事件——官方路径是 `compaction/*`（如 `compaction/summary`，含 `shadowedRange` / `shadowedSeqs` / `shadowedTokenCount`），内置路径是 `fc-compact/*`（`fc-compact/summary` 字段形状相同）——它们不带 `surfaceOp`，因此自身从不进入模型历史；随后同步追加一个 **surface `user/message`**，携带 `surfaceOp: { op: 'replace', start, end }` 遮蔽被压缩区间——该 `replace` 才是真正的 surface 替换。内置引擎的 `user/message` 额外带 `source: { kind: 'plugin', plugin: 'force-compact-builtin' }` 便于追溯。推理/"思考"是**内容块类型**（`ContentBlock.type === 'reasoning'`），不是事件类型：它存在于 `assistant/message.content` 内（由 `reasoning-delta` 流块 / `reasoning-chunks` 行组装），UI 通过 `toAssistantBlock()` 把它渲染为可折叠区域。
+**dsh-force-compact 追加的内容**（其全部持久效果）：一组 log-only 的事务括号事件——官方路径是 `compaction/*`（如 `compaction/summary`，含 `shadowedRange` / `shadowedSeqs` / `shadowedTokenCount`），内置路径现在与官方共用同一套 `compaction/*` 词汇（字段形状完全一致，区别仅在 `compactionId` 来源：官方 backend 铸造 vs 内置 `mintCompactionId` 铸造）——它们不带 `surfaceOp`，因此自身从不进入模型历史；随后同步追加一个 **surface `user/message`**，携带 `surfaceOp: { op: 'replace', start, end }` 遮蔽被压缩区间——该 `replace` 才是真正的 surface 替换。两条路径的 `user/message` 均带 `source: { kind: 'plugin', plugin: 'compact', compactionId }`（规范 checkpoint marker，`isCompactCheckpointSource` 据此识别）便于追溯。推理/"思考"是**内容块类型**（`ContentBlock.type === 'reasoning'`），不是事件类型：它存在于 `assistant/message.content` 内（由 `reasoning-delta` 流块 / `reasoning-chunks` 行组装），UI 通过 `toAssistantBlock()` 把它渲染为可折叠区域。

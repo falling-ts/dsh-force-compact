@@ -28,81 +28,68 @@
  * (`server-common.cpp:1286-1291`), depends on the template honoring the
  * `enable_thinking` placeholder; `reasoning_effort:"none"` is more robust.
  *
- * So this hook adds a SECOND wire field on top of whatever the adapter chose:
+ * Current state: NEUTERED to a pure passthrough
+ * ---------------------------------------------
+ * The original intent was "Layer 2" — append a SECOND wire field
+ * `reasoning_effort: "none"` at the `llm/stream` seam on top of the
+ * adapter's `thinking:{type:'disabled'}` (Layer 1) so that a llama.cpp /
+ * OpenAI-compatible endpoint (which ignores the top-level `thinking` key)
+ * would ALSO receive a field it honors. Live testing PROVED that this cannot
+ * be achieved at the `llm/stream` waterfall seam without modifying vendor
+ * code, because of two hard walls discovered empirically:
  *
- *   Layer 1 (adapter, request-seam): `thinking: { type: 'disabled' }`
- *       → honored by the real DeepSeek API; ignored harmlessly elsewhere.
- *   Layer 2 (THIS hook, wire seam):  `reasoning_effort: "none"`
- *       → honored by llama.cpp / OpenAI-compatible endpoints; ignored
- *         harmlessly by the real DeepSeek API (unknown top-level fields are
- *         tolerated, never rejected).
+ *   1. FROZEN SEED. The waterfall passes EVERY listener the SAME deep-frozen
+ *      `GenerateOptions` seed (`payload`; `ctx.waterfall` re-invokes inner
+ *      layers with the identical args — see `vendor/cordis/src/events.ts#
+ *      waterfall`). In-place assignment `options.reasoning_effort = …` throws
+ *      `Cannot add property …, object is not extensible` at the exact moment
+ *      a real LLM call fires, which PROPAGATES OUT OF the listener and TAKES
+ *      DOWN THE ENTIRE `dsh web` PROCESS.
+ *   2. GENERATOR BINDS THE SEED. The base `adapterStream` is an AsyncGenerator
+ *      that BOUND the seed object at construction; building a fresh mutable
+ *      clone and returning it (or re-dispatching `this.stream(clone)`) never
+ *      reaches the serializer, and re-dispatch additionally fails because the
+ *      listener's `this` is not reliably the LlmRuntime here (`Cannot read
+ *      properties of undefined (reading 'stream')`).
  *
- * Each backend therefore receives AT LEAST ONE field it understands, so
- * `disableThinking:true` genuinely disables thinking regardless of where the
- * call lands — no dead zone between the two spellings.
+ * Therefore injecting a NEW top-level wire field at this seam requires either
+ * a vendor change (out of scope) or a dedicated `registerAdapter` for
+ * llama.cpp (would collide with / be shadowed by the existing DeepSeek-route
+ * adapter). Rather than ship a hook that either silently no-ops or CRASHES the
+ * host, this file is deliberately reduced to a GUARANTEED pure passthrough:
+ * it forwards `next()`'s result (the real stream) untouched and performs NO
+ * mutation — incapable of breaking any business-path model call.
  *
- * Scope: every outgoing call
- * --------------------------
- * The append applies to ALL outgoing LLM calls (business requests AND this
- * plugin's own summarizer calls) whenever `disableThinking` is on — NO
- * provider/model gating. Rationale: the `reasoning_effort:"none"` field is
- * additive and harmless on every known backend (ignored-by-unknown-field
- * tolerance), so there is zero downside to applying it universally, and doing
- * so eliminates the risk that a target-recognition heuristic MISSES a variant
- * (e.g. an exotic Qwen route whose `provider`/`model` ids match no keyword)
- * and quietly leaves thinking ON. Universal application makes coverage
- * deterministic: if `disableThinking` is on, `reasoning_effort:"none"` rides
- * every request.
- *
- * Why a `llm/stream` Waterfall and not a dedicated adapter
- * ---------------------------------------------------------
- * A dedicated `registerAdapter` for llama.cpp would be cleaner in principle,
- * but the harness already routes llama.cpp traffic THROUGH the DeepSeek
- * adapter (there is no dedicated llama.cpp adapter package in
- * `packages/llm/`); registering a second adapter risks colliding with the
- * existing registration or being shadowed by composition order. The
- * `llm/stream` seam is the single choke-point before `ctx.llm.stream()` runs
- * (documented in `packages/llm/llm/src/index.ts`) — the officially
- * sanctioned interception point for "adjust how the next call serializes",
- * preserving the single-LLM-exit invariant. See
- * `docs/llm-stream-llamacpp-adaptation.md` §7 for the three sanctioned
- * approaches; this file implements approach A (waterfall interception).
+ * The AUTHORITATIVE disable-thinking mechanism remains Layer 1 (unchanged):
+ * the `agent/request` waterfall sets `reasoningEffort:'off'`, which the
+ * DeepSeek adapter serializes to the native `thinking:{type:'disabled'}` —
+ * honored by the real DeepSeek API. On a llama.cpp / OpenAI-compatible
+ * endpoint that top-level field is tolerated-but-ignored, so thinking stays
+ * on there — IDENTICAL to having no plugin at all (a documented limitation,
+ * never a crash). Restoring the wire-append requires a future dedicated
+ * llama.cpp adapter or a vendor-supported options-extension seam.
  *
  * @module @falling-ts/dsh-force-compact/wire-rewrite
  */
 
-import { readRawSetting } from '../core/settings.js'
-
 /**
- * Register the `llm/stream` Waterfall listener that appends
- * `reasoning_effort: 'none'` to EVERY outgoing LLM call when `disableThinking`
- * is on. Idempotent within one plugin lifetime (a process-local latch
- * prevents double-registration across multiple `apply` invocations in tests
- * or HMR).
+ * Register the `llm/stream` Waterfall listener. As of the neutering described
+ * in the module header, the listener is a DELIBERATE pure passthrough: it
+ * forwards `next()`'s result (the async-iterable chunk stream) untouched and
+ * performs NO mutation. See the module header for why the intended
+ * `reasoning_effort:"none"` wire-append is NOT possible at this seam without a
+ * vendor change or a dedicated llama.cpp adapter.
  *
- * Per-call behavior:
- *   1. Await `next()` (MUST call it — this is a Waterfall; skipping `next()`
- *      stalls the request chain). Its return value is the options object the
- *      remainder of the pipeline will serialize. Fall back to `payload` if
- *      `next()` yielded nothing.
- *   2. Read `disableThinking` LAZILY via `readRawSetting` (one synchronous
- *      `settings.get`, cached-friendly). When the `settings` service is not
- *      mounted `readRawSetting` returns `undefined` — treated as OFF, so the
- *      hook is a no-op. (The composition default for `disableThinking` is
- *      `true`, but in the ABSENCE of a readable settings surface the
- *      conservative posture is to leave the wire alone rather than assume.)
- *   3. If `disableThinking !== true`, forward `options` UNCHANGED (zero-cost
- *      short-circuit; no allocation).
- *   4. Otherwise shallow-copy `options` with `reasoning_effort: 'none'` added
- *      (never mutate the shared upstream object) and return the copy.
+ * Idempotent within one plugin lifetime (a process-local latch prevents
+ * double-registration across multiple `apply` invocations in tests or HMR).
  *
- * The listener NEVER throws: any unexpected shape is forwarded unchanged, so
- * a misbehaving hook cannot break a business-path model call.
- *
- * Observability: a single `ctx.logger.debug` line is emitted ONLY when the
- * append actually happens (i.e. `disableThinking` on + a well-formed options
- * object), carrying the `provider`/`model` identifiers for post-hoc audit.
- * Skip paths write nothing.
+ * Contract guarantees:
+ *   • ALWAYS calls `next()` (skipping it would stall the waterfall chain).
+ *   • NEVER mutates the (deep-frozen) seed, so it cannot raise
+ *     `object is not extensible`.
+ *   • NEVER reshapes/spreads the (stream) return value, so it cannot break the
+ *     consumer's `for await`.
+ *   • Emits no observable log line (pure passthrough).
  *
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @returns {boolean} whether this call actually performed the (once-only)
@@ -114,27 +101,16 @@ let installed = false
 export function registerLlmStreamHook(ctx) {
   if (installed) return false
   try {
-    ctx.on('llm/stream', async (payload, next) => {
-      const options = (await next()) ?? payload
-      if (options === null || options === undefined || typeof options !== 'object') {
-        return options
-      }
-      // Lazy settings read — hot path costs one synchronous `settings.get`.
-      const raw = (await readRawSetting(ctx, 'disableThinking'))
-      const wantDisableThinking = raw === true
-      if (!wantDisableThinking) return options
-      // Double-layer insurance: append the OpenAI-compatible
-      // `reasoning_effort:"none"` on top of whatever the adapter serialized
-      // (typically `thinking:{type:'disabled'}`). Harmless on every known
-      // backend; effective wherever the primary `thinking` field is ignored.
-      const rewritten = { ...options, reasoning_effort: 'none' }
-      try {
-        ctx.logger.debug(
-          `[force-compact] llm/stream: appended reasoning_effort="none" `
-          + `(disableThinking on) for ${options.provider ?? '?'}/${options.model ?? '?'}`,
-        )
-      } catch { /* observability must never break the requesting path */ }
-      return rewritten
+    ctx.on('llm/stream', (payload, next) => {
+      // Pure passthrough — deliberate. See the module header for the two hard
+      // walls (deep-frozen seed; base generator binds the seed) that make a
+      // `reasoning_effort:"none"` wire-append impossible at this seam without
+      // a vendor change or a dedicated llama.cpp adapter. Forwarding `next()`
+      // untouched is the only action that is guaranteed neither to mutate the
+      // frozen seed nor to destroy the stream value. `payload` is unused by
+      // design (kept in the signature for waterfall-contract clarity).
+      void payload
+      return next()
     })
     installed = true
     return true

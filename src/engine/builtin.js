@@ -4,16 +4,26 @@
  * A SELF-CONTAINED, durable compaction that does NOT depend on the `compaction`
  * service (which the standard preset realm-isolates away from this plugin). It
  * performs the full persistent effect — a summary node that shadows a head-anchored
- * conversation span — by appending its OWN log-only bracket events and a single
+ * conversation span — by appending log-only bracket events and a single
  * `user/message` whose `surfaceOp:{op:'replace'}` shadows the range.
  *
- * Naming: all bracket events carry the plugin-specific `fc-compact/*` prefix so
- * they COEXIST side-by-side with the official `compaction/*` service (when both
- * are mounted) without fighting its global `compaction/invariant` listener.
+ * Naming: the brackets reuse the OFFICIAL `compaction/start|summary|end`
+ * vocabulary (already in `KNOWN_SESSION_EVENT_TYPES`) rather than a
+ * plugin-private event-type prefix. Rationale: `Session.append` offers no
+ * channel to persist
+ * the `ignorable` marker, so a CUSTOM event type written through `append` lands
+ * WITHOUT it — which would brick the log on a future harness rebuild that does
+ * not recognize the type (the persistence load gate refuses an unknown, non-
+ * ignorable event). The official `compaction/*` types are already in the catalog,
+ * so no marker is needed and the transaction stays durable across rebuilds.
+ * The global `compaction/invariant` listener validates these brackets; the
+ * bracket payloads are shaped to satisfy it (matching ids/owners/turns, a
+ * non-empty `shadowedSeqs` aligned with `shadowedRange`, and — for a successful
+ * `compaction/end` — a preceding `compaction/summary`).
  *
  * The transaction mirrors the official backend's structure:
- *   fc-compact/start → (LLM summarize) → fc-compact/summary →
- *   user/message{surfaceOp:replace} → fc-compact/end
+ *   compaction/start → (LLM summarize) → compaction/summary →
+ *   user/message{surfaceOp:replace} → compaction/end
  *
  * `seq` is auto-assigned by the session (`log.length`); the `replace` bounds
  * and provenance (`sourceEventSeqs`) are enforced by the session core at append
@@ -30,8 +40,19 @@ import { readSettings, DEFAULTS } from '../core/settings.js'
 /** Characters per token — mirrors the token meter's coarse estimator. */
 const CHARS_PER_TOKEN = 4
 
-/** Provenance tag carried on the checkpoint message's `source`. */
-const CHECKPOINT_SOURCE = Object.freeze({ kind: 'plugin', plugin: 'force-compact-builtin' })
+/**
+ * Checkpoint provenance carried on the replacement `user/message`'s `source`.
+ * Uses the CANONICAL compaction-checkpoint marker (`{kind:'plugin',
+ * plugin:'compact'}`) that `isCompactCheckpointSource` recognizes — so the
+ * official `compaction/invariant` validator treats our replacement as a real
+ * compaction checkpoint and enforces its correlation with the open
+ * `compaction/start`. The plugin-specific identity rides on `compactionId`
+ * (see `mintCompactionId`) and the bracket events, not on `source.plugin`,
+ * keeping the checkpoint universally recognizable across all backends.
+ * `CHECKPOINT_SOURCE_BASE` is spread together with `compactionId` per
+ * transaction (below).
+ */
+const CHECKPOINT_SOURCE_BASE = Object.freeze({ kind: 'plugin', plugin: 'compact' })
 
 /** Mint a stable transaction identity (opaque string; branded conceptually). */
 function mintCompactionId() {
@@ -60,9 +81,9 @@ export async function compactNowBuiltin(ctx, agent, signal) {
   const settings = (await readSettings(ctx)) ?? DEFAULTS
   if (!(settings.builtinEnabled !== false)) return null
 
-  // Guard: refuse while a prior fc-compact transaction is still open (durable lock).
+  // Guard: refuse while a prior compaction transaction is still open (durable lock).
   if (hasOpenFctLock(session)) {
-    warn(ctx, `${session.id}: builtin fc-compact skipped — a prior fc-compact transaction is still open`)
+    warn(ctx, `${session.id}: builtin compaction skipped — a prior compaction transaction is still open`)
     return null
   }
 
@@ -76,7 +97,7 @@ export async function compactNowBuiltin(ctx, agent, signal) {
     const nodes = session.surface.nodes
     const headIsCheckpoint = nodes.length > 0 && session.events[nodes[0]]?.data?.source?.plugin === 'force-compact-builtin'
     info(ctx,
-      `${session.id}: builtin fc-compact — no compactable region; skipping `
+      `${session.id}: builtin compaction — no compactable region; skipping `
       + `(${nodes.length} surface nodes, head=${headIsCheckpoint ? 'previous checkpoint' : 'ordinary history'}, `
       + `estimated ~${estimateSurfaceTokens(session)} surface tokens)`,
     )
@@ -109,14 +130,14 @@ export async function compactRegionBuiltin(ctx, start, end, agent, signal) {
 
 /**
  * The core transaction: append the durable bracket + a replace node shadowing
- * the region. Every step is guarded; any failure appends `fc-compact/end` with
+ * the region. Every step is guarded; any failure appends `compaction/end` with
  * an `error` and returns `null` (leaving exactly one closed-or-orphaned marker
  * pair so the log stays interpretable on reload).
  */
 async function runTransaction(ctx, agent, session, region, signal, settings) {
   const llm = ctx.get('llm')
   if (llm === undefined || typeof llm.stream !== 'function') {
-    warn(ctx, `${session.id}: builtin fc-compact unavailable — no LLM service`)
+    warn(ctx, `${session.id}: builtin compaction unavailable — no LLM service`)
     return null
   }
   const meter = ctx.get('tokenMeter')
@@ -124,7 +145,7 @@ async function runTransaction(ctx, agent, session, region, signal, settings) {
   // ---- Prepare the replay input ------------------------------------------
   const { shadowedSeqs, messages } = projectRegion(session, region)
   if (messages.length === 0) {
-    info(ctx, `${session.id}: builtin fc-compact — region has no surface messages; skipping`)
+    info(ctx, `${session.id}: builtin compaction — region has no surface messages; skipping`)
     return null
   }
   const shadowedTokenCount = estimateTokens(messages)
@@ -133,12 +154,12 @@ async function runTransaction(ctx, agent, session, region, signal, settings) {
   const compactionId = mintCompactionId()
   let startEvent
   try {
-    startEvent = markIgnorable(session.append('fc-compact/start', {
+    startEvent = session.append('compaction/start', {
       compactionId,
       turn: currentOpenTurn(session),
-    }))
+    })
   } catch (error) {
-    warn(ctx, `${session.id}: builtin fc-compact — failed to append fc-compact/start: ${messageOf(error)}`)
+    warn(ctx, `${session.id}: builtin compaction — failed to append compaction/start: ${messageOf(error)}`)
     return null
   }
   if (signal !== undefined) signal.throwIfAborted()
@@ -189,13 +210,13 @@ async function runTransaction(ctx, agent, session, region, signal, settings) {
     try {
       const framedEstimate = meter.estimateMessage({ role: 'user', content: summaryBlocks })
       if (framedEstimate >= shadowedTokenCount) {
-        warn(ctx, `${session.id}: builtin fc-compact — summary (~${framedEstimate} tokens) is not smaller than the shadowed span (~${shadowedTokenCount}); aborting to avoid bloat`)
+        warn(ctx, `${session.id}: builtin compaction — summary (~${framedEstimate} tokens) is not smaller than the shadowed span (~${shadowedTokenCount}); aborting to avoid bloat`)
         closeWithError(session, startEvent, compactionId, new Error('summary-not-smaller'), ctx)
         return null
       }
     } catch { /* estimator unavailable — proceed best-effort */ }
   } else if (summaryTextLen >= shadowedTokenCount * CHARS_PER_TOKEN) {
-    warn(ctx, `${session.id}: builtin fc-compact — summary characters (${summaryTextLen}) not clearly smaller than the shadowed span (${shadowedTokenCount} est-tokens ≈ ${shadowedTokenCount * CHARS_PER_TOKEN} chars); aborting`)
+    warn(ctx, `${session.id}: builtin compaction — summary characters (${summaryTextLen}) not clearly smaller than the shadowed span (${shadowedTokenCount} est-tokens ≈ ${shadowedTokenCount * CHARS_PER_TOKEN} chars); aborting`)
     closeWithError(session, startEvent, compactionId, new Error('summary-not-smaller'), ctx)
     return null
   }
@@ -221,15 +242,24 @@ async function runTransaction(ctx, agent, session, region, signal, settings) {
   // authoritative source, replacing the previous pre-call header/options
   // label heuristic. We only reach this point after a successful summarization,
   // so the observed fields are defined whenever the provider carried them.
-  if (summarizationProvider) summaryData.provider = summarizationProvider
-  if (summarizationModel) summaryData.model = summarizationModel
+  // DEFENSE-IN-DEPTH: the official `compaction/summary` validator marks
+  // `provider` and `model` REQUIRED. If the summarization envelope somehow
+  // lacked either (degraded provider metadata), fall back to a non-empty
+  // placeholder rather than emitting `undefined`, which the invariant listener
+  // would reject. Live runs carry the real ids; this only guards edge cases.
+  summaryData.provider = (typeof summarizationProvider === 'string' && summarizationProvider.length > 0)
+    ? summarizationProvider
+    : 'unknown'
+  summaryData.model = (typeof summarizationModel === 'string' && summarizationModel.length > 0)
+    ? summarizationModel
+    : 'unknown'
   if (Number.isFinite(summarizationMaxTokens) && summarizationMaxTokens > 0) {
     summaryData.maxTokens = summarizationMaxTokens
   }
   if (summarizationUsage !== undefined) summaryData.usage = summarizationUsage
 
   try {
-    summaryEvent = markIgnorable(session.append('fc-compact/summary', summaryData))
+    summaryEvent = session.append('compaction/summary', summaryData)
   } catch (error) {
     closeWithError(session, startEvent, compactionId, error, ctx)
     return null
@@ -242,7 +272,7 @@ async function runTransaction(ctx, agent, session, region, signal, settings) {
   try {
     replaceEvent = session.append('user/message', {
       content: checkpointContent,
-      source: CHECKPOINT_SOURCE,
+      source: Object.freeze({ ...CHECKPOINT_SOURCE_BASE, compactionId }),
     }, {
       surfaceOp: { op: 'replace', start: targetRange.start, end: targetRange.end },
       sourceEventSeqs: [startEvent.seq, summaryEvent.seq, ...shadowedSeqs],
@@ -255,18 +285,18 @@ async function runTransaction(ctx, agent, session, region, signal, settings) {
   // ---- Close the lock ----------------------------------------------------
   let endSeq
   try {
-    const endEvent = markIgnorable(session.append('fc-compact/end', {
+    const endEvent = session.append('compaction/end', {
       compactionId,
       turn: currentOpenTurn(session),
-    }))
+    })
     endSeq = endEvent.seq
   } catch {
     // Non-fatal: the summary already landed durably; the missing end marker is
     // tolerated as a (rarely orphaned) lock on next reload.
-    info(ctx, `${session.id}: builtin fc-compact — warning: could not append fc-compact/end (lock may appear open on next reload)`)
+    info(ctx, `${session.id}: builtin compaction — warning: could not append compaction/end (lock may appear open on next reload)`)
   }
 
-  info(ctx, `${session.id}: builtin fc-compact OK — replaced span seq[${targetRange.start}..${targetRange.end}] (${shadowedSeqs.length} nodes, ~${shadowedTokenCount} tokens) with a ${summaryTextLen}-char checkpoint`)
+  info(ctx, `${session.id}: builtin compaction OK — replaced span seq[${targetRange.start}..${targetRange.end}] (${shadowedSeqs.length} nodes, ~${shadowedTokenCount} tokens) with a ${summaryTextLen}-char checkpoint`)
   return {
     kind: 'builtin',
     compactionId,
@@ -280,12 +310,12 @@ async function runTransaction(ctx, agent, session, region, signal, settings) {
   }
 }
 
-/** Append `fc-compact/end` carrying the error so the lock is released explicitly. */
+/** Append `compaction/end` carrying the error so the lock is released explicitly. */
 function closeWithError(session, startEvent, compactionId, error, ctx) {
   try {
-    markIgnorable(session.append('fc-compact/end', { compactionId, turn: currentOpenTurn(session), error: messageOf(error) }))
+    session.append('compaction/end', { compactionId, turn: currentOpenTurn(session), error: messageOf(error) })
   } catch { /* best effort */ }
-  warn(ctx, `builtin fc-compact transaction ended in error: ${messageOf(error)}`)
+  warn(ctx, `builtin compaction transaction ended in error: ${messageOf(error)}`)
 }
 
 /** Total surface-content token estimate for diagnostics (4 chars/token). */
@@ -386,13 +416,13 @@ function validateReplacementBounds(session, region) {
   return { start: region.start, end: region.end }
 }
 
-/** Whether an open fc-compact transaction is present (durant lock check). */
+/** Whether an open compaction transaction is present (durant lock check). */
 function hasOpenFctLock(session) {
   const events = session.events
   for (let i = events.length - 1; i >= 0; i--) {
     const t = events[i].type
-    if (t === 'fc-compact/start') return true
-    if (t === 'fc-compact/end') return false
+    if (t === 'compaction/start') return true
+    if (t === 'compaction/end') return false
   }
   return false
 }
@@ -446,27 +476,3 @@ function messageOf(error) {
 function info(ctx, msg) { try { ctx.logger.debug('[force-compact] ' + msg) } catch {} }
 function warn(ctx, msg) { try { ctx.logger.warn('[force-compact] ' + msg) } catch {} }
 
-/**
- * Mark every `fc-compact/*` bracket event as envelope-ignorable BEFORE it lands
- * in the log. These transaction markers are pure bookkeeping: the durable
- * effect lives entirely in the separate `user/message` replace node (which
- * stays required and surfaces normally), so dropping an unrecognized marker can
- * never change how the rest of the log is reconstructed. Without the marker,
- * a session log carrying our custom event types REFUSES TO LOAD on any
- * harness build whose generated `KNOWN_SESSION_EVENT_TYPES` catalog predates
- * this plugin ("event type … unknown to this harness and not marked
- * ignorable") — permanently bricking those logs across version upgrades and
- * making them unreadable even by `session.history` after a process restart.
- * `ignorable` is part of the event ENVELOPE (not `data`), and
- * `Session.append` only accepts `surfaceOp`/`sourceEventSeqs` there, so the
- * flag is attached on the returned deep-freeze-bound copy before it publishes.
- */
-function markIgnorable(event) {
-  if (event === undefined) return undefined
-  if (Object.isFrozen(event)) {
-    Object.defineProperty(event, 'ignorable', { value: true, enumerable: true, writable: false, configurable: false })
-  } else {
-    event.ignorable = true
-  }
-  return event
-}

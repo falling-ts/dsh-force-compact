@@ -242,7 +242,7 @@ export async function summarize(ctx, config, agent, input, signal, extra) {
     maxTokens: options.maxTokens,
   }
   // Surface provider-reported usage when the adapter carried it; callers can
-  // record it alongside `fc-compact/summary` for observability.
+  // record it alongside `compaction/summary` for observability.
   if (collected.usage !== undefined) result.usage = collected.usage
   return result
 }
