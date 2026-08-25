@@ -17,6 +17,7 @@ import { resolveConfig } from '../core/policy.js'
 import { selectRegion } from './region.js'
 import { readSettings, DEFAULTS } from '../core/settings.js'
 import { resolveCompaction } from './backend.js'
+import { getProjectedTokens, diagnoseProjectedTokensAbsence } from '../core/projected.js'
 import { guardFn, renderCrash, captureThrowSite, appendCrashLine as appendDiag } from '../core/crashnet.js'
 
 /** Characters per token, mirroring the token meter's coarse estimate. */
@@ -66,11 +67,50 @@ async function __compactSessionBody(ctx, agent, controller, mode) {
   // service is not mounted.
   const settings = (await readSettings(ctx)) ?? DEFAULTS
 
-  // Automatic compaction trigger gate: only compact when the session's
-  // estimated total context reaches the configured threshold. Below it, the
-  // checkpoint is skipped so short sessions are never force-compacted.
-  const sessionTokens = estimateSessionTokens(session)
-  ctx.logger.debug(`[force-compact] ${session.id}: session/flush checkpoint fired — session ~${sessionTokens} tokens (threshold ${settings.autoThresholdTokens})`)
+  // Automatic compaction trigger gate: only compact when the session's context
+  // occupancy reaches the configured threshold. Below it, the checkpoint is
+  // skipped so short sessions are never force-compacted.
+  //
+  // BASIS (same caliber as the harness bottom-right occupancy display): the
+  // primary reading is the official `projectedTokens` — the EXACT figure the
+  // GUI renders (provider-anchored, reacts instantly when a compaction shadows
+  // a span). Keying the gate off it means "what the user SEEs in the corner is
+  // what decides whether we compact", eliminating the historic cognitive gap
+  // where this gate ran a raw `estimateSessionTokens` sweep of `session.events`
+  // (a "gross weight" that re-counts already-shadowed spans and climbs to
+  // several multiples of the honest net) and therefore misfired far below the
+  // displayed occupancy. The raw char-based estimate is kept ONLY as a degraded
+  // fallback for sessions that have no usage sample yet (no `projectedTokens`),
+  // mirroring the pre-step gate in `hooks/guard.js`.
+  const projected = getProjectedTokens(ctx, session)
+  const grossEstimate = estimateSessionTokens(session)
+  const gateUsesProjectedList = (typeof projected === 'number' && Number.isFinite(projected) && projected >= 0)
+  const sessionTokens = gateUsesProjectedList ? projected : grossEstimate
+  // RECONCILIATION FACET (diagnostic only): when the official meter is
+  // mounted, take ONE snapshot and record BOTH sides of the caliber split —
+  // the projection-derived gate basis next to the meter's own figures — so a
+  // future operator can eyeball "corner figure vs meter total vs raw sweep"
+  // on a single line. Defensive: a `measure` fault degrades the facet to a
+  // bare basis label, never the gate decision.
+  const meter = ctx.get('tokenMeter')
+  let reconciliationFacet = ''
+  if (typeof meter?.measure === 'function') {
+    try {
+      const m = meter.measure(session)
+      if (m && typeof m === 'object') {
+        const projectedDisplay = gateUsesProjectedList ? String(projected) : 'absent'
+        reconciliationFacet = ` [facet: corner=${projectedDisplay} meter.total=${m.totalTokens} meter.surface=${m.surfaceTokens} rawSweep=${grossEstimate}]`
+      }
+    } catch { /* facet is decorative; a meter fault must not degrade the gate */ }
+  }
+  // On the degraded path, append the CLASSIFIED reason `projectedTokens` was
+  // absent, so a future log can distinguish "service unreachable from this
+  // listener context" (needs a different access path) from "reachable but no
+  // usage sample yet" (expected, benign).
+  const basisLabel = gateUsesProjectedList
+    ? 'projectedTokens (corner-identical)'
+    : `char-estimate (projectedTokens absent: ${diagnoseProjectedTokensAbsence(ctx, session)})`
+  ctx.logger.debug(`[force-compact] ${session.id}: session/flush checkpoint fired — session ~${sessionTokens} tokens via ${basisLabel}${reconciliationFacet} (threshold ${settings.autoThresholdTokens})`)
   if (sessionTokens < settings.autoThresholdTokens) {
     ctx.logger.debug(`[force-compact] ${session.id}: context ~${sessionTokens} tokens below threshold ${settings.autoThresholdTokens}; skipping`)
     return null
@@ -127,10 +167,20 @@ async function __compactSessionBody(ctx, agent, controller, mode) {
 export const compactSession = guardFn('checkpoint.compactSession', __compactSessionBody)
 
 /**
- * Coarse token estimate for a session's whole surface content (user +
- * assistant + tool-result messages). Used only for the automatic compaction
- * trigger GATE — the authoritative token accounting happens inside the
- * backend's `compactRegion`.
+ * DEGRADED FALLBACK — coarse raw-char token estimate for a session's WHOLE
+ * `session.events` content (user + assistant + tool-result message text, ÷4).
+ *
+ * Role change (2026-08-25): this sweep is NO LONGER the automatic compaction
+ * trigger GATE's primary basis. That basis is now the official `projectedTokens`
+ * (the exact figure the harness renders in the bottom-right corner, read
+ * through {@link getProjectedTokens}), so the gate no longer misfires on the
+ * "gross weight" artifact of this function — it sums the RAW durable log rows
+ * and RE-COUNTS spans already shadowed by a compaction, so it monotonically
+ * climbs to several multiples of the honest net occupancy. This function is
+ * retained SOLELY as the degraded fallback for sessions that have not yet
+ * reported a usage sample (where `projectedTokens` is absent), and for the
+ * backend's `compactRegion` authoritative accounting which prices from its own
+ * meter snapshot.
  * @param {import('@deepseek-ai/dsh-session').Session} session
  * @returns {number}
  */

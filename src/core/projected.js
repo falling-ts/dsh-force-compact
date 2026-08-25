@@ -99,3 +99,41 @@ export function getProjectedTokens(ctx, session) {
     return undefined
   }
 }
+
+/**
+ * Classify WHY {@link getProjectedTokens} resolved to `undefined` for one
+ * session — a DIAGNOSTIC aid that reproduces the same read but labels the exact
+ * failure tier, so an operator can tell apart "registry/service not reachable
+ * from this context" from "reachable but the session simply has no usage sample
+ * yet". Pure, sync, never throws, returns a short stable reason string (or
+ * `'available'` with the numeric reading attached when the read succeeds).
+ *
+ * @param {object} ctx cordis context.
+ * @param {object|undefined} session live session handle.
+ * @returns {string} one of: `available:<n>` / `no-ctx.get` / `registry-absent` /
+ *   `registry-no-snapshot` / `session-unusable` / `snap-threw` /
+ *   `unit-not-folded` / `no-usage-sample-yet`.
+ */
+export function diagnoseProjectedTokensAbsence(ctx, session) {
+  try {
+    if (typeof ctx?.get !== 'function') return 'no-ctx.get'
+    const registry = ctx.get('sessionProjections')
+    if (registry === undefined || registry === null) return 'registry-absent'
+    if (typeof registry.snapshot !== 'function') return 'registry-no-snapshot'
+    if (session === undefined || session === null) return 'session-unusable'
+    let snap
+    try {
+      snap = registry.snapshot(session)
+    } catch {
+      return 'snap-threw'
+    }
+    const cp = snap && snap.values && snap.values.contextPressure
+    if (cp === undefined || cp === null) return 'unit-not-folded'
+    const projected = cp.projectedTokens
+    return (typeof projected === 'number' && Number.isFinite(projected))
+      ? `available:${projected}`
+      : 'no-usage-sample-yet'
+  } catch {
+    return 'unexpected-throw'
+  }
+}
