@@ -638,48 +638,73 @@ window.__ModuleLoader__.load({
      *
      * @param liveUi - 宿主写入的 { phase, text, color }；缺省/null 时 no-op。
      */
-    // 当前注入规则所针对的相位与颜色（闭包内单例，随每次 paintTurnStatus 更新）。
-    let activePhase = "";
-    let activeColor = "";
-    function ensurePhaseStyleSheet(phase, color) {
-      const head = document.head;
-      let styleEl = head.querySelector("style[data-dsh-fc-ui]");
-      if (!styleEl) {
-        styleEl = document.createElement("style");
-        styleEl.setAttribute("data-dsh-fc-ui", "");
-        head.appendChild(styleEl);
-      }
-      // 仅当相位或颜色真正变化时重写规则文本（单次 30µs 级字符串赋值，幂等去抖）。
-      if (phase === activePhase && color === activeColor) return;
-      activePhase = phase;
-      activeColor = color;
-      // 单条规则整体重写：sheet 永远至多一条 fc 规则，文本通道对 CSSOM 最稳健
-      // （不依赖 cssRules 遍历/deleteRule 索引语义），开销可忽略。
-      styleEl.textContent = '[role="status"][data-fc-phase="' + phase + '"{'
-        + "background:none!important;"
-        + "-webkit-background-clip:border!important;background-clip:border!important;"
-        + "-webkit-text-fill-color:" + color + "!important;"
-        + "color:" + color + "!important;"
-        + "animation:none!important}";
+    // ── 扫光配色表：20 个工作态颜色 + 2 个钉住颜色（compressing 红 / done 绿）──
+    // 每条对应 web/swish.css 里的 .falling-ts-swish-NN（@keyframes falling-ts-swish-NN），
+    // 色值单一事实源在 src/core/ui-signal.js 的 WORKING_COLORS（20 项）与
+    // PINNED_COLORS（2 项），此处仅做"hex → 编号"映射，不做任何样式计算。
+    const SWISH_HEXES = [
+      "#4f9cf9","#5b8def","#6a5bff","#8b5cf6","#a855f7",
+      "#c45bf9","#db6bd4","#e86bb0","#f06b8b","#f76b5b",
+      "#fb8c5b","#fca95b","#fdc35b","#d8e05b","#aede5b",
+      "#7ee083","#5be0a0","#5becd8","#5bcdf9","#7ba8f9",
+      "#ff4d4f","#52c41a",
+    ];
+    const SWISH_CLASS_PREFIX = "falling-ts-swish-";
+    function swishClassForColor(hex) {
+      const norm = String(hex || "").trim().toLowerCase();
+      const idx = SWISH_HEXES.findIndex(c => c.toLowerCase() === norm);
+      // 未识别色 → 回落到第一档（最冷蓝），避免误贴错误相位色
+      const slot = idx >= 0 ? idx : 0;
+      return SWISH_CLASS_PREFIX + String(slot).padStart(2, "0");
     }
     function paintTurnStatus(liveUi) {
       if (typeof document === "undefined") return;
       if (!liveUi || typeof liveUi.text !== "string" || liveUi.text.length === 0) return;
       const color = typeof liveUi.color === "string" && liveUi.color !== "" ? liveUi.color : null;
-      const phase = typeof liveUi.phase === "string" && liveUi.phase !== "" ? liveUi.phase : "fc";
       const nodes = document.querySelectorAll('[role="status"][aria-live="polite"]');
       if (nodes.length === 0) return; // 没有 running 会话 → 没有 TurnStatus
+      const targetCls = color !== null ? swishClassForColor(color) : null;
       for (const node of nodes) {
-        // 第一个文本型子节点（"Deep diving..." 本体；时钟 span 是其后兄弟,不受影响）。
         let textChild = null;
         for (const child of node.childNodes) {
           if (child.nodeType === Node.TEXT_NODE && child.nodeValue.trim() !== "") { textChild = child; break; }
         }
-        if (textChild === null) continue; // 结构不符预期 → 跳过,绝不破坏官方布局
+        if (textChild === null) continue;
         textChild.nodeValue = liveUi.text;
-        node.setAttribute("data-fc-phase", phase);
-        if (color !== null) ensurePhaseStyleSheet(phase, color);
+        // class 化：先清掉所有上一轮的 swish class，再贴本次（target 为空时只清不加）。
+        for (const cls of [...node.classList]) {
+          if (cls.startsWith(SWISH_CLASS_PREFIX)) node.classList.remove(cls);
+        }
+        if (targetCls) node.classList.add(targetCls);
       }
+    }
+
+    /**
+     * 把 web/swish.css 的全部内容内联注入到 <head>（一次性，幂等）。
+     *
+     * 为什么走内联而不是 <link>：宿主 registry 只暴露已知 artifact（client.js 等），
+     * 插件新增的同名 .css 不会出现在 /plugins/<id>/ 下（实测 404），也没有别的
+     * 合法入口把静态 CSS 资产带进 DOM。plain-JS 插件无构建步骤的约束决定了唯一
+     * 可行路径就是把 CSS 文本直接内联成 <style> 注入。
+     *
+     * 同步纪律：此字符串必须与仓库内的 web/swish.css 逐字一致——后者是给人读的
+     * 可读版本（带注释、格式化），前者是给浏览器执行的紧凑版本。改动任意一边
+     * 都要同步另一边（review checklist：swish.css 行数 == 此处规则数 × 固定倍数）。
+     * 22 段 @keyframes + 22 个 class，全部 !important（见 web/swish.css 头注释）。
+     */
+    const SWISH_CSS = "@keyframes falling-ts-swish-00{from{background-position:100% 0}to{background-position:0 0}}.falling-ts-swish-00{animation-name:falling-ts-swish-00!important;background-image:linear-gradient(90deg,var(--dsw-static-deepseek-500,#0b5cff) 0%,var(--dsw-static-deepseek-500,#0b5cff) 40%,#4f9cf9 50%,var(--dsw-static-deepseek-500,#0b5cff) 60%,var(--dsw-static-deepseek-500,#0b5cff) 100%)!important}@keyframes falling-ts-swish-01{from{background-position:100% 0}to{background-position:0 0}}.falling-ts-swish-01{animation-name:falling-ts-swish-01!important;background-image:linear-gradient(90deg,var(--dsw-static-deepseek-500,#0b5cff) 0%,var(--dsw-static-deepseek-500,#0b5cff) 40%,#5b8def 50%,var(--dsw-static-deepseek-500,#0b5cff) 60%,var(--dsw-static-deepseek-500,#0b5cff) 100%)!important}@keyframes falling-ts-swish-02{from{background-position:100% 0}to{background-position:0 0}}.falling-ts-swish-02{animation-name:falling-ts-swish-02!important;background-image:linear-gradient(90deg,var(--dsw-static-deepseek-500,#0b5cff) 0%,var(--dsw-static-deepseek-500,#0b5cff) 40%,#6a5bff 50%,var(--dsw-static-deepseek-500,#0b5cff) 60%,var(--dsw-static-deepseek-500,#0b5cff) 100%)!important}@keyframes falling-ts-swish-03{from{background-position:100% 0}to{background-position:0 0}}.falling-ts-swish-03{animation-name:falling-ts-swish-03!important;background-image:linear-gradient(90deg,var(--dsw-static-deepseek-500,#0b5cff) 0%,var(--dsw-static-deepseek-500,#0b5cff) 40%,#8b5cf6 50%,var(--dsw-static-deepseek-500,#0b5cff) 60%,var(--dsw-static-deepseek-500,#0b5cff) 100%)!important}@keyframes falling-ts-swish-04{from{background-position:100% 0}to{background-position:0 0}}.falling-ts-swish-04{animation-name:falling-ts-swish-04!important;background-image:linear-gradient(90deg,var(--dsw-static-deepseek-500,#0b5cff) 0%,var(--dsw-static-deepseek-500,#0b5cff) 40%,#a855f7 50%,var(--dsw-static-deepseek-500,#0b5cff) 60%,var(--dsw-static-deepseek-500,#0b5cff) 100%)!important}@keyframes falling-ts-swish-05{from{background-position:100% 0}to{background-position:0 0}}.falling-ts-swish-05{animation-name:falling-ts-swish-05!important;background-image:linear-gradient(90deg,var(--dsw-static-deepseek-500,#0b5cff) 0%,var(--dsw-static-deepseek-500,#0b5cff) 40%,#c45bf9 50%,var(--dsw-static-deepseek-500,#0b5cff) 60%,var(--dsw-static-deepseek-500,#0b5cff) 100%)!important}@keyframes falling-ts-swish-06{from{background-position:100% 0}to{background-position:0 0}}.falling-ts-swish-06{animation-name:falling-ts-swish-06!important;background-image:linear-gradient(90deg,var(--dsw-static-deepseek-500,#0b5cff) 0%,var(--dsw-static-deepseek-500,#0b5cff) 40%,#db6bd4 50%,var(--dsw-static-deepseek-500,#0b5cff) 60%,var(--dsw-static-deepseek-500,#0b5cff) 100%)!important}@keyframes falling-ts-swish-07{from{background-position:100% 0}to{background-position:0 0}}.falling-ts-swish-07{animation-name:falling-ts-swish-07!important;background-image:linear-gradient(90deg,var(--dsw-static-deepseek-500,#0b5cff) 0%,var(--dsw-static-deepseek-500,#0b5cff) 40%,#e86bb0 50%,var(--dsw-static-deepseek-500,#0b5cff) 60%,var(--dsw-static-deepseek-500,#0b5cff) 100%)!important}@keyframes falling-ts-swish-08{from{background-position:100% 0}to{background-position:0 0}}.falling-ts-swish-08{animation-name:falling-ts-swish-08!important;background-image:linear-gradient(90deg,var(--dsw-static-deepseek-500,#0b5cff) 0%,var(--dsw-static-deepseek-500,#0b5cff) 40%,#f06b8b 50%,var(--dsw-static-deepseek-500,#0b5cff) 60%,var(--dsw-static-deepseek-500,#0b5cff) 100%)!important}@keyframes falling-ts-swish-09{from{background-position:100% 0}to{background-position:0 0}}.falling-ts-swish-09{animation-name:falling-ts-swish-09!important;background-image:linear-gradient(90deg,var(--dsw-static-deepseek-500,#0b5cff) 0%,var(--dsw-static-deepseek-500,#0b5cff) 40%,#f76b5b 50%,var(--dsw-static-deepseek-500,#0b5cff) 60%,var(--dsw-static-deepseek-500,#0b5cff) 100%)!important}@keyframes falling-ts-swish-10{from{background-position:100% 0}to{background-position:0 0}}.falling-ts-swish-10{animation-name:falling-ts-swish-10!important;background-image:linear-gradient(90deg,var(--dsw-static-deepseek-500,#0b5cff) 0%,var(--dsw-static-deepseek-500,#0b5cff) 40%,#fb8c5b 50%,var(--dsw-static-deepseek-500,#0b5cff) 60%,var(--dsw-static-deepseek-500,#0b5cff) 100%)!important}@keyframes falling-ts-swish-11{from{background-position:100% 0}to{background-position:0 0}}.falling-ts-swish-11{animation-name:falling-ts-swish-11!important;background-image:linear-gradient(90deg,var(--dsw-static-deepseek-500,#0b5cff) 0%,var(--dsw-static-deepseek-500,#0b5cff) 40%,#fca95b 50%,var(--dsw-static-deepseek-500,#0b5cff) 60%,var(--dsw-static-deepseek-500,#0b5cff) 100%)!important}@keyframes falling-ts-swish-12{from{background-position:100% 0}to{background-position:0 0}}.falling-ts-swish-12{animation-name:falling-ts-swish-12!important;background-image:linear-gradient(90deg,var(--dsw-static-deepseek-500,#0b5cff) 0%,var(--dsw-static-deepseek-500,#0b5cff) 40%,#fdc35b 50%,var(--dsw-static-deepseek-500,#0b5cff) 60%,var(--dsw-static-deepseek-500,#0b5cff) 100%)!important}@keyframes falling-ts-swish-13{from{background-position:100% 0}to{background-position:0 0}}.falling-ts-swish-13{animation-name:falling-ts-swish-13!important;background-image:linear-gradient(90deg,var(--dsw-static-deepseek-500,#0b5cff) 0%,var(--dsw-static-deepseek-500,#0b5cff) 40%,#d8e05b 50%,var(--dsw-static-deepseek-500,#0b5cff) 60%,var(--dsw-static-deepseek-500,#0b5cff) 100%)!important}@keyframes falling-ts-swish-14{from{background-position:100% 0}to{background-position:0 0}}.falling-ts-swish-14{animation-name:falling-ts-swish-14!important;background-image:linear-gradient(90deg,var(--dsw-static-deepseek-500,#0b5cff) 0%,var(--dsw-static-deepseek-500,#0b5cff) 40%,#aede5b 50%,var(--dsw-static-deepseek-500,#0b5cff) 60%,var(--dsw-static-deepseek-500,#0b5cff) 100%)!important}@keyframes falling-ts-swish-15{from{background-position:100% 0}to{background-position:0 0}}.falling-ts-swish-15{animation-name:falling-ts-swish-15!important;background-image:linear-gradient(90deg,var(--dsw-static-deepseek-500,#0b5cff) 0%,var(--dsw-static-deepseek-500,#0b5cff) 40%,#7ee083 50%,var(--dsw-static-deepseek-500,#0b5cff) 60%,var(--dsw-static-deepseek-500,#0b5cff) 100%)!important}@keyframes falling-ts-swish-16{from{background-position:100% 0}to{background-position:0 0}}.falling-ts-swish-16{animation-name:falling-ts-swish-16!important;background-image:linear-gradient(90deg,var(--dsw-static-deepseek-500,#0b5cff) 0%,var(--dsw-static-deepseek-500,#0b5cff) 40%,#5be0a0 50%,var(--dsw-static-deepseek-500,#0b5cff) 60%,var(--dsw-static-deepseek-500,#0b5cff) 100%)!important}@keyframes falling-ts-swish-17{from{background-position:100% 0}to{background-position:0 0}}.falling-ts-swish-17{animation-name:falling-ts-swish-17!important;background-image:linear-gradient(90deg,var(--dsw-static-deepseek-500,#0b5cff) 0%,var(--dsw-static-deepseek-500,#0b5cff) 40%,#5becd8 50%,var(--dsw-static-deepseek-500,#0b5cff) 60%,var(--dsw-static-deepseek-500,#0b5cff) 100%)!important}@keyframes falling-ts-swish-18{from{background-position:100% 0}to{background-position:0 0}}.falling-ts-swish-18{animation-name:falling-ts-swish-18!important;background-image:linear-gradient(90deg,var(--dsw-static-deepseek-500,#0b5cff) 0%,var(--dsw-static-deepseek-500,#0b5cff) 40%,#5bcdf9 50%,var(--dsw-static-deepseek-500,#0b5cff) 60%,var(--dsw-static-deepseek-500,#0b5cff) 100%)!important}@keyframes falling-ts-swish-19{from{background-position:100% 0}to{background-position:0 0}}.falling-ts-swish-19{animation-name:falling-ts-swish-19!important;background-image:linear-gradient(90deg,var(--dsw-static-deepseek-500,#0b5cff) 0%,var(--dsw-static-deepseek-500,#0b5cff) 40%,#7ba8f9 50%,var(--dsw-static-deepseek-500,#0b5cff) 60%,var(--dsw-static-deepseek-500,#0b5cff) 100%)!important}@keyframes falling-ts-swish-20{from{background-position:100% 0}to{background-position:0 0}}.falling-ts-swish-20{animation-name:falling-ts-swish-20!important;background-image:linear-gradient(90deg,var(--dsw-static-deepseek-500,#0b5cff) 0%,var(--dsw-static-deepseek-500,#0b5cff) 40%,#ff4d4f 50%,var(--dsw-static-deepseek-500,#0b5cff) 60%,var(--dsw-static-deepseek-500,#0b5cff) 100%)!important}@keyframes falling-ts-swish-21{from{background-position:100% 0}to{background-position:0 0}}.falling-ts-swish-21{animation-name:falling-ts-swish-21!important;background-image:linear-gradient(90deg,var(--dsw-static-deepseek-500,#0b5cff) 0%,var(--dsw-static-deepseek-500,#0b5cff) 40%,#52c41a 50%,var(--dsw-static-deepseek-500,#0b5cff) 60%,var(--dsw-static-deepseek-500,#0b5cff) 100%)!important}";
+
+    /**
+     * 确保 <style id="falling-ts-swish-inline"> 已挂在 <head>（幂等，至多一次）。
+     * @returns void
+     */
+    function ensureSwishStylesheetInlined() {
+      if (typeof document === "undefined") return;
+      if (document.getElementById("falling-ts-swish-inline")) return;
+      const el = document.createElement("style");
+      el.id = "falling-ts-swish-inline";
+      el.textContent = SWISH_CSS;
+      document.head.appendChild(el);
     }
 
     /**
@@ -690,6 +715,8 @@ window.__ModuleLoader__.load({
       ctx.effect(() => ctx.locale.register(NS, { zh, en }), "force-compact: dictionaries");
       const t = ctx.locale.bind(NS);
       const scope = ctx.settingsScope.bind({ namespace: NS_SETTINGS });
+      // 挂载 swish 调色板样式表（首次 apply 时执行一次；effect 登记便于 fiber 卸载时清理）。
+      ctx.effect(() => ensureSwishCssLoaded(), "force-compact: swish stylesheets");
       // 把 settingsScope 镜像成 uSES 安全的 SnapshotStore（hooks 分区的可观察源）。
       const store = createSnapshotStore({ status: "loading", value: undefined, writable: false });
       const derive = () => {

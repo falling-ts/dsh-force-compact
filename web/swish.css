@@ -1,0 +1,173 @@
+/**
+ * falling-ts swish palette — 22 pre-authored scan animations for the
+ * force-compact live badge on the chat TurnStatus.
+ *
+ * Each `.falling-ts-swish-NN` overrides the official `.turnStatus` shimmer
+ * with the SAME three-segment sweep skeleton (brand-blue → phase-color →
+ * brand-blue, left-to-right) but with a phase-controlled middle band.
+ * Everything is `!important` so it wins regardless of whether the node also
+ * carries the official `.turnStatus` class, a CSS-module hash suffix, or a
+ * higher-specificity theme alias. The animation duration/easing/timing-function
+ * inherit from the official declaration (we only override `animation-name` and
+ * `background-image`), preserving the familiar 1.8s linear infinite feel.
+ *
+ * Color index ↔ phase mapping (single source of truth lives in
+ * `src/core/ui-signal.js` — keep in sync manually if either side grows):
+ *   00..19  = WORKING_COLORS[0..19]   (random working states)
+ *   20      = PINNED_COLORS.compressing (#ff4d4f red)
+ *   21      = PINNED_COLORS.done        (#52c41a green)
+ */
+
+/* ---------- 00 · working · #4f9cf9 (calm blue) ---------- */
+@keyframes falling-ts-swish-00 { from { background-position: 100% 0; } to { background-position: 0 0; } }
+.falling-ts-swish-00 {
+  animation-name: falling-ts-swish-00 !important;
+  background-image: linear-gradient(90deg, var(--dsw-static-deepseek-500, #0b5cff) 0%, var(--dsw-static-deepseek-500, #0b5cff) 40%, #4f9cf9 50%, var(--dsw-static-deepseek-500, #0b5cff) 60%, var(--dsw-static-deepseek-500, #0b5cff) 100%) !important;
+}
+
+/* ---------- 01 · working · #5b8def (indigo) ---------- */
+@keyframes falling-ts-swish-01 { from { background-position: 100% 0; } to { background-position: 0 0; } }
+.falling-ts-swish-01 {
+  animation-name: falling-ts-swish-01 !important;
+  background-image: linear-gradient(90deg, var(--dsw-static-deepseek-500, #0b5cff) 0%, var(--dsw-static-deepseek-500, #0b5cff) 40%, #5b8def 50%, var(--dsw-static-deepseek-500, #0b5cff) 60%, var(--dsw-static-deepseek-500, #0b5cff) 100%) !important;
+}
+
+/* ---------- 02 · working · #6a5bff (violet) ---------- */
+@keyframes falling-ts-swish-02 { from { background-position: 100% 0; } to { background-position: 0 0; } }
+.falling-ts-swish-02 {
+  animation-name: falling-ts-swish-02 !important;
+  background-image: linear-gradient(90deg, var(--dsw-static-deepseek-500, #0b5cff) 0%, var(--dsw-static-deepseek-500, #0b5cff) 40%, #6a5bff 50%, var(--dsw-static-deepseek-500, #0b5cff) 60%, var(--dsw-static-deepseek-500, #0b5cff) 100%) !important;
+}
+
+/* ---------- 03 · working · #8b5cf6 (purple) ---------- */
+@keyframes falling-ts-swish-03 { from { background-position: 100% 0; } to { background-position: 0 0; } }
+.falling-ts-swish-03 {
+  animation-name: falling-ts-swish-03 !important;
+  background-image: linear-gradient(90deg, var(--dsw-static-deepseek-500, #0b5cff) 0%, var(--dsw-static-deepseek-500, #0b5cff) 40%, #8b5cf6 50%, var(--dsw-static-deepseek-500, #0b5cff) 60%, var(--dsw-static-deepseek-500, #0b5cff) 100%) !important;
+}
+
+/* ---------- 04 · working · #a855f7 (bright violet) ---------- */
+@keyframes falling-ts-swish-04 { from { background-position: 100% 0; } to { background-position: 0 0; } }
+.falling-ts-swish-04 {
+  animation-name: falling-ts-swish-04 !important;
+  background-image: linear-gradient(90deg, var(--dsw-static-deepseek-500, #0b5cff) 0%, var(--dsw-static-deepseek-500, #0b5cff) 40%, #a855f7 50%, var(--dsw-static-deepseek-500, #0b5cff) 60%, var(--dsw-static-deepseek-500, #0b5cff) 100%) !important;
+}
+
+/* ---------- 05 · working · #c45bf9 (magenta) ---------- */
+@keyframes falling-ts-swish-05 { from { background-position: 100% 0; } to { background-position: 0 0; } }
+.falling-ts-swish-05 {
+  animation-name: falling-ts-swish-05 !important;
+  background-image: linear-gradient(90deg, var(--dsw-static-deepseek-500, #0b5cff) 0%, var(--dsw-static-deepseek-500, #0b5cff) 40%, #c45bf9 50%, var(--dsw-static-deepseek-500, #0b5cff) 60%, var(--dsw-static-deepseek-500, #0b5cff) 100%) !important;
+}
+
+/* ---------- 06 · working · #db6bd4 (pink-magenta) ---------- */
+@keyframes falling-ts-swish-06 { from { background-position: 100% 0; } to { background-position: 0 0; } }
+.falling-ts-swish-06 {
+  animation-name: falling-ts-swish-06 !important;
+  background-image: linear-gradient(90deg, var(--dsw-static-deepseek-500, #0b5cff) 0%, var(--dsw-static-deepseek-500, #0b5cff) 40%, #db6bd4 50%, var(--dsw-static-deepseek-500, #0b5cff) 60%, var(--dsw-static-deepseek-500, #0b5cff) 100%) !important;
+}
+
+/* ---------- 07 · working · #e86bb0 (rose pink) ---------- */
+@keyframes falling-ts-swish-07 { from { background-position: 100% 0; } to { background-position: 0 0; } }
+.falling-ts-swish-07 {
+  animation-name: falling-ts-swish-07 !important;
+  background-image: linear-gradient(90deg, var(--dsw-static-deepseek-500, #0b5cff) 0%, var(--dsw-static-deepseek-500, #0b5cff) 40%, #e86bb0 50%, var(--dsw-static-deepseek-500, #0b5cff) 60%, var(--dsw-static-deepseek-500, #0b5cff) 100%) !important;
+}
+
+/* ---------- 08 · working · #f06b8b (salmon rose) ---------- */
+@keyframes falling-ts-swish-08 { from { background-position: 100% 0; } to { background-position: 0 0; } }
+.falling-ts-swish-08 {
+  animation-name: falling-ts-swish-08 !important;
+  background-image: linear-gradient(90deg, var(--dsw-static-deepseek-500, #0b5cff) 0%, var(--dsw-static-deepseek-500, #0b5cff) 40%, #f06b8b 50%, var(--dsw-static-deepseek-500, #0b5cff) 60%, var(--dsw-static-deepseek-500, #0b5cff) 100%) !important;
+}
+
+/* ---------- 09 · working · #f76b5b (warm coral) ---------- */
+@keyframes falling-ts-swish-09 { from { background-position: 100% 0; } to { background-position: 0 0; } }
+.falling-ts-swish-09 {
+  animation-name: falling-ts-swish-09 !important;
+  background-image: linear-gradient(90deg, var(--dsw-static-deepseek-500, #0b5cff) 0%, var(--dsw-static-deepseek-500, #0b5cff) 40%, #f76b5b 50%, var(--dsw-static-deepseek-500, #0b5cff) 60%, var(--dsw-static-deepseek-500, #0b5cff) 100%) !important;
+}
+
+/* ---------- 10 · working · #fb8c5b (orange) ---------- */
+@keyframes falling-ts-swish-10 { from { background-position: 100% 0; } to { background-position: 0 0; } }
+.falling-ts-swish-10 {
+  animation-name: falling-ts-swish-10 !important;
+  background-image: linear-gradient(90deg, var(--dsw-static-deepseek-500, #0b5cff) 0%, var(--dsw-static-deepseek-500, #0b5cff) 40%, #fb8c5b 50%, var(--dsw-static-deepseek-500, #0b5cff) 60%, var(--dsw-static-deepseek-500, #0b5cff) 100%) !important;
+}
+
+/* ---------- 11 · working · #fca95b (amber orange) ---------- */
+@keyframes falling-ts-swish-11 { from { background-position: 100% 0; } to { background-position: 0 0; } }
+.falling-ts-swish-11 {
+  animation-name: falling-ts-swish-11 !important;
+  background-image: linear-gradient(90deg, var(--dsw-static-deepseek-500, #0b5cff) 0%, var(--dsw-static-deepseek-500, #0b5cff) 40%, #fca95b 50%, var(--dsw-static-deepseek-500, #0b5cff) 60%, var(--dsw-static-deepseek-500, #0b5cff) 100%) !important;
+}
+
+/* ---------- 12 · working · #fdc35b (golden yellow) ---------- */
+@keyframes falling-ts-swish-12 { from { background-position: 100% 0; } to { background-position: 0 0; } }
+.falling-ts-swish-12 {
+  animation-name: falling-ts-swish-12 !important;
+  background-image: linear-gradient(90deg, var(--dsw-static-deepseek-500, #0b5cff) 0%, var(--dsw-static-deepseek-500, #0b5cff) 40%, #fdc35b 50%, var(--dsw-static-deepseek-500, #0b5cff) 60%, var(--dsw-static-deepseek-500, #0b5cff) 100%) !important;
+}
+
+/* ---------- 13 · working · #d8e05b (lime chartreuse) ---------- */
+@keyframes falling-ts-swish-13 { from { background-position: 100% 0; } to { background-position: 0 0; } }
+.falling-ts-swish-13 {
+  animation-name: falling-ts-swish-13 !important;
+  background-image: linear-gradient(90deg, var(--dsw-static-deepseek-500, #0b5cff) 0%, var(--dsw-static-deepseek-500, #0b5cff) 40%, #d8e05b 50%, var(--dsw-static-deepseek-500, #0b5cff) 60%, var(--dsw-static-deepseek-500, #0b5cff) 100%) !important;
+}
+
+/* ---------- 14 · working · #aede5b (spring green-yellow) ---------- */
+@keyframes falling-ts-swish-14 { from { background-position: 100% 0; } to { background-position: 0 0; } }
+.falling-ts-swish-14 {
+  animation-name: falling-ts-swish-14 !important;
+  background-image: linear-gradient(90deg, var(--dsw-static-deepseek-500, #0b5cff) 0%, var(--dsw-static-deepseek-500, #0b5cff) 40%, #aede5b 50%, var(--dsw-static-deepseek-500, #0b5cff) 60%, var(--dsw-static-deepseek-500, #0b5cff) 100%) !important;
+}
+
+/* ---------- 15 · working · #7ee083 (fresh green) ---------- */
+@keyframes falling-ts-swish-15 { from { background-position: 100% 0; } to { background-position: 0 0; } }
+.falling-ts-swish-15 {
+  animation-name: falling-ts-swish-15 !important;
+  background-image: linear-gradient(90deg, var(--dsw-static-deepseek-500, #0b5cff) 0%, var(--dsw-static-deepseek-500, #0b5cff) 40%, #7ee083 50%, var(--dsw-static-deepseek-500, #0b5cff) 60%, var(--dsw-static-deepseek-500, #0b5cff) 100%) !important;
+}
+
+/* ---------- 16 · working · #5be0a0 (mint teal-green) ---------- */
+@keyframes falling-ts-swish-16 { from { background-position: 100% 0; } to { background-position: 0 0; } }
+.falling-ts-swish-16 {
+  animation-name: falling-ts-swish-16 !important;
+  background-image: linear-gradient(90deg, var(--dsw-static-deepseek-500, #0b5cff) 0%, var(--dsw-static-deepseek-500, #0b5cff) 40%, #5be0a0 50%, var(--dsw-static-deepseek-500, #0b5cff) 60%, var(--dsw-static-deepseek-500, #0b5cff) 100%) !important;
+}
+
+/* ---------- 17 · working · #5becd8 (cyan teal) ---------- */
+@keyframes falling-ts-swish-17 { from { background-position: 100% 0; } to { background-position: 0 0; } }
+.falling-ts-swish-17 {
+  animation-name: falling-ts-swish-17 !important;
+  background-image: linear-gradient(90deg, var(--dsw-static-deepseek-500, #0b5cff) 0%, var(--dsw-static-deepseek-500, #0b5cff) 40%, #5becd8 50%, var(--dsw-static-deepseek-500, #0b5cff) 60%, var(--dsw-static-deepseek-500, #0b5cff) 100%) !important;
+}
+
+/* ---------- 18 · working · #5bcdf9 (sky cyan) ---------- */
+@keyframes falling-ts-swish-18 { from { background-position: 100% 0; } to { background-position: 0 0; } }
+.falling-ts-swish-18 {
+  animation-name: falling-ts-swish-18 !important;
+  background-image: linear-gradient(90deg, var(--dsw-static-deepseek-500, #0b5cff) 0%, var(--dsw-static-deepseek-500, #0b5cff) 40%, #5bcdf9 50%, var(--dsw-static-deepseek-500, #0b5cff) 60%, var(--dsw-static-deepseek-500, #0b5cff) 100%) !important;
+}
+
+/* ---------- 19 · working · #7ba8f9 (periwinkle blue) ---------- */
+@keyframes falling-ts-swish-19 { from { background-position: 100% 0; } to { background-position: 0 0; } }
+.falling-ts-swish-19 {
+  animation-name: falling-ts-swish-19 !important;
+  background-image: linear-gradient(90deg, var(--dsw-static-deepseek-500, #0b5cff) 0%, var(--dsw-static-deepseek-500, #0b5cff) 40%, #7ba8f9 50%, var(--dsw-static-deepseek-500, #0b5cff) 60%, var(--dsw-static-deepseek-500, #0b5cff) 100%) !important;
+}
+
+/* ---------- 20 · compressing · #ff4d4f (alert red, pinned) ---------- */
+@keyframes falling-ts-swish-20 { from { background-position: 100% 0; } to { background-position: 0 0; } }
+.falling-ts-swish-20 {
+  animation-name: falling-ts-swish-20 !important;
+  background-image: linear-gradient(90deg, var(--dsw-static-deepseek-500, #0b5cff) 0%, var(--dsw-static-deepseek-500, #0b5cff) 40%, #ff4d4f 50%, var(--dsw-static-deepseek-500, #0b5cff) 60%, var(--dsw-static-deepseek-500, #0b5cff) 100%) !important;
+}
+
+/* ---------- 21 · done · #52c41a (success green, pinned) ---------- */
+@keyframes falling-ts-swish-21 { from { background-position: 100% 0; } to { background-position: 0 0; } }
+.falling-ts-swish-21 {
+  animation-name: falling-ts-swish-21 !important;
+  background-image: linear-gradient(90deg, var(--dsw-static-deepseek-500, #0b5cff) 0%, var(--dsw-static-deepseek-500, #0b5cff) 40%, #52c41a 50%, var(--dsw-static-deepseek-500, #0b5cff) 60%, var(--dsw-static-deepseek-500, #0b5cff) 100%) !important;
+}
