@@ -25,7 +25,7 @@
 
 import { summarize } from './summarizer.js'
 import { selectEarliestByTokens } from './region.js'
-import { readSettings, DEFAULTS } from './settings.js'
+import { readSettings, DEFAULTS } from '../core/settings.js'
 
 /** Characters per token — mirrors the token meter's coarse estimator. */
 const CHARS_PER_TOKEN = 4

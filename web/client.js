@@ -3,7 +3,7 @@
  *
  * 这是一个闭包工厂 artifact：调用 window.__ModuleLoader__.load({ id, factory })，
  * factory(require) 通过注入的 require 解析外部模块（这里只有基线 react），并返回
- * 插件面 { name, inject, apply }。宿主半部（src/index.js）与本文件是同一 package
+ * 插件面 { name, inject, apply }。宿主半部（根 index.js）与本文件是同一 package
  * 的两个面：宿主半部由 main 入口加载，本文件由 exports["./client"] 导出，经
  * dsh.client 声明被 client module 系统自动组成并服务（/plugins/<id>/client.js）。
  *

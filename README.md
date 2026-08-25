@@ -51,25 +51,25 @@ requirement), plus the durability checkpoint:
 
 Supporting modules:
 
-- **`src/request-guard.js`** — the per-request guard: `agent/request`
+- **`src/hooks/guard.js`** — the per-request guard: `agent/request`
   thinking-off + `agent/pre-step` threshold gate + forced compaction + the
   `/force-compact` process-local force flag.
-- **`src/command.js`** — the `/force-compact` slash command: compacts
+- **`src/hooks/command.js`** — the `/force-compact` slash command: compacts
   immediately through `compactNow` when the agent is idle; when `compactNow`
   throws (busy) it queues the force flag for the next model step.
-- **`src/turn-end.js`** — the turn-end forced compaction: an `agent/status`
+- **`src/hooks/idle.js`** — the turn-end forced compaction: an `agent/status`
   listener that compacts through `compactNow` when the agent transitions to
   `idle` and `turnEndForceCompactionEnabled` is on.
-- **`src/region.js`** — the plugin's own head-anchored region selection:
+- **`src/engine/region.js`** — the plugin's own head-anchored region selection:
   `selectRegion` (checkpoint path: retain a recent tail by surface-node count,
   end on a `user/message` boundary) and `selectEarliestByTokens` (used by
   `agent/pre-step`: accumulate tokens from the head to a ratio budget, snap the
   end to a `user/message` boundary). The `idle` and `/force-compact` paths use
   `compactNow`'s engine range selection instead.
-- **`src/summarizer.js`** — the plugin's own one-shot LLM summarizer: replays
+- **`src/engine/summarizer.js`** — the plugin's own one-shot LLM summarizer: replays
   the region's messages, appends a compaction directive as the final user
   message, streams through `ctx.llm`, and returns the condensed checkpoint.
-- **`src/compact.js`** — the checkpoint orchestrator: select region → project
+- **`src/engine/checkpoint.js`** — the checkpoint orchestrator: select region → project
   region messages → run the preview + shrink gate → delegate the durable
   mutation to the `compaction` service's **`compactRegion(start, end, agent,
    signal)`**

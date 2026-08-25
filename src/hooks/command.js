@@ -13,9 +13,9 @@
  * @module @falling-ts/dsh-force-compact/command
  */
 
-import { queueForceCompact, dbg } from './request-guard.js'
-import { resolveCompaction } from './service-resolver.js'
-import { readRawSetting } from './settings.js'
+import { queueForceCompact, dbg } from './guard.js'
+import { resolveCompaction } from '../engine/backend.js'
+import { readRawSetting } from '../core/settings.js'
 
 /**
  * Register the global `/force-compact` command. A no-op when the `commands`
@@ -45,7 +45,7 @@ export function registerCommand(ctx) {
       const agent = invocation.agent
       const session = agent.session
       // Locate the compaction backend through `agent.ctx` (presets isolate it)
-      // with a host-global fallback (see `service-resolver.js`). The
+      // with a host-global fallback (see `engine/backend.js`). The
       // `compactionMode` setting is read once here (raw, cheap) and passed so
       // the resolver need not re-read settings.
       const mode = await readRawSetting(ctx, 'compactionMode')

@@ -44,19 +44,19 @@
 
 支撑模块：
 
-- **`src/request-guard.js`** —— 每次请求的门禁：`agent/request` 关闭思考 +
+- **`src/hooks/guard.js`** —— 每次请求的门禁：`agent/request` 关闭思考 +
   `agent/pre-step` 阈值门禁 + 强制压缩 + `/force-compact` 的 process-local 强制标记。
-- **`src/command.js`** —— `/force-compact` 斜杠命令：Agent 空闲时经 `compactNow`
+- **`src/hooks/command.js`** —— `/force-compact` 斜杠命令：Agent 空闲时经 `compactNow`
   压缩；繁忙时插入强制标记，待下一个模型步骤消费。
-- **`src/turn-end.js`** —— 一轮结束强制压缩：`agent/status` 上的 `idle` 监听器，
+- **`src/hooks/idle.js`** —— 一轮结束强制压缩：`agent/status` 上的 `idle` 监听器，
   经 `compactNow`（引擎自身区间选择）压缩。
-- **`src/region.js`** —— 插件自己的 head-anchored 区间选择：`selectRegion`（检查点
+- **`src/engine/region.js`** —— 插件自己的 head-anchored 区间选择：`selectRegion`（检查点
   路径）与 `selectEarliestByTokens`（供 `agent/pre-step` 使用）：前者按 surface
   节点数保留最近尾段，且都把区间末端对齐到 `user/message` 边界（始终是一个平衡
   边界）。`idle` / `/force-compact` 路径改用 `compactNow` 的引擎自身区间选择。
-- **`src/summarizer.js`** —— 插件自己的一次性 LLM 摘要器：回放区间消息，把压缩
+- **`src/engine/summarizer.js`** —— 插件自己的一次性 LLM 摘要器：回放区间消息，把压缩
   指令作为最后一条 user 消息追加，通过 `ctx.llm` 流式生成，返回浓缩后的检查点。
-- **`src/compact.js`** —— 检查点编排器：选区间 → 投影区间消息 → 运行预览 + 收缩
+- **`src/engine/checkpoint.js`** —— 检查点编排器：选区间 → 投影区间消息 → 运行预览 + 收缩
   门禁 → 把持久变更委托给 compaction 服务的 **`compactRegion(start, end,
   agent, signal)`**（经 `ctx.get('compaction')` 实时读取；权威摘要器）。
 

@@ -26,9 +26,9 @@
  * @module @falling-ts/dsh-force-compact/request-guard
  */
 
-import { readSettings, DEFAULTS } from './settings.js'
-import { selectEarliestByTokens } from './region.js'
-import { resolveCompaction } from './service-resolver.js'
+import { readSettings, DEFAULTS } from '../core/settings.js'
+import { selectEarliestByTokens } from '../engine/region.js'
+import { resolveCompaction } from '../engine/backend.js'
 
 /**
  * The plugin's OWN debug logger — the single, consistent observability channel.
@@ -226,7 +226,7 @@ export async function thinkingDisabled(ctx) {
 /**
  * Coarse token estimate for a session's whole surface content, used only when
  * the `tokenMeter` service is not mounted. Mirrors the character-based
- * heuristic of `compact.js`.
+ * heuristic of `engine/checkpoint.js`.
  * @param {import('@deepseek-ai/dsh-session').Session} session
  * @returns {number}
  */

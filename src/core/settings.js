@@ -26,7 +26,7 @@
  *   own range selection (the idle path cannot select a custom token fraction,
  *   so there is no turn-end ratio parameter).
  * - `debug` (boolean, default `true`): the gate for the debug log
- *   (`src/debug-log.js`). **On by default** so the plugin's `[force-compact]`
+ *   (`core/log.js`). **On by default** so the plugin's `[force-compact]`
  *   diagnostics always land in the debug file; set `false` for a production
  *   deployment to suppress the file. There is no environment auto-detection —
  *   the operator declares intent directly via this flag.
@@ -39,7 +39,7 @@
  *   plugin locates the official `compaction` service (realm-scoped per-agent
  *   vs host-global). See `COMPACT_MODE_*` constants below.
  * - `builtinEnabled` (boolean, default `true`): the gate for this plugin's
- *   own self-contained compaction engine (see `src/builtin-engine.js`). When
+ *   own self-contained compaction engine (see `engine/builtin.js`). When
  *   the official `compaction` service is reachable (host-global mount), it is
  *   always preferred; when unreachable (the standard preset realm-isolates it)
  *   the plugin falls back to the builtin engine — which runs the full durable
@@ -286,7 +286,7 @@ export async function buildSchema() {
       // that would escape `buildSchema`'s try/catch and break the WHOLE
       // namespace registration (regressing the settings panel to "loading").
       compactionMode: buildEnumField(z, DEFAULTS.compactionMode),
-      // The builtin engine fallback (see `service-resolver.js`): on by default
+      // The builtin engine fallback (see `engine/backend.js`): on by default
       // so the plugin's own engine takes over whenever the official
       // `compaction` service is unreachable (standard-preset realm isolation).
       // Value is coerced at read-time in `readSettings`, so the schema field is

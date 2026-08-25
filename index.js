@@ -20,26 +20,31 @@
  * delegated to the `compaction` service's `compactRegion`) so useful history
  * is condensed even between model requests.
  *
- * The compaction implementation lives in `src/`:
- * - `config.js`       — tunables.
- * - `region.js`       — the plugin's own head-anchored region selection.
- * - `summarizer.js`   — the plugin's own one-shot LLM summarizer (preview + shrink gate).
- * - `compact.js`      — the checkpoint orchestrator: region → preview → delegate to `compactRegion`.
- * - `settings.js`     — the `falling-ts-force-compact` settings namespace (the two parameters).
- * - `request-guard.js`— the per-request guard: threshold gate + forced compaction + thinking-off.
- * - `command.js`      — the `/force-compact` slash command (idle → compact now; busy → queue a force flag).
+ * Layout:
+ * - `index.js`         — this file; the Cordis plugin entry (listener registrations).
+ * - `core/policy.js`   — fixed compaction-policy knobs (tunables).
+ * - `core/settings.js` — the `falling-ts-force-compact` settings namespace (parameters + schema).
+ * - `core/log.js`      — the debug-log sink (routes `[force-compact]` lines to `logFile`).
+ * - `engine/region.js`     — the plugin's own head-anchored region selection.
+ * - `engine/summarizer.js` — the plugin's own one-shot LLM summarizer (preview + shrink gate).
+ * - `engine/builtin.js`    — the self-contained compaction engine (`fc-compact/*` transactions).
+ * - `engine/checkpoint.js` — the `session/flush` checkpoint orchestrator: region → delegate to a backend.
+ * - `engine/backend.js`    — the unified backend facade (official-service-first, builtin-fallback).
+ * - `hooks/guard.js`       — the per-model-request guard: threshold gate + forced compaction + thinking-off.
+ * - `hooks/command.js`     — the `/force-compact` slash command (idle → compact now; busy → queue a force flag).
+ * - `hooks/idle.js`        — the turn-end (agent `idle`) forced compaction.
+ * - `web/client.js`        — the browser half: the Force-Compact settings.section UI.
  *
  * @module @falling-ts/dsh-force-compact
  */
 
-import { compactSession } from './compact.js'
-import { registerNamespace, readSettings } from './settings.js'
-import { ensureDebugLogger } from './debug-log.js'
-import { forceCompactIfNeeded, thinkingDisabled, dbg } from './request-guard.js'
-import { resolveCompaction } from './service-resolver.js'
-import { readRawSetting } from './settings.js'
-import { registerCommand } from './command.js'
-import { handleAgentStatus } from './turn-end.js'
+import { compactSession } from './src/engine/checkpoint.js'
+import { registerNamespace, readSettings, readRawSetting } from './src/core/settings.js'
+import { ensureDebugLogger } from './src/core/log.js'
+import { forceCompactIfNeeded, thinkingDisabled, dbg } from './src/hooks/guard.js'
+import { resolveCompaction } from './src/engine/backend.js'
+import { registerCommand } from './src/hooks/command.js'
+import { handleAgentStatus } from './src/hooks/idle.js'
 
 /** @type {string} the function plugin's display name. */
 export const name = 'force-compact'
@@ -56,7 +61,7 @@ export const name = 'force-compact'
  * agent's scoped context — resolves the instance. Every compaction path therefore
  * captures the LISTENER context (`ctx.on(event, function (p, n) { … })` binds
  * `this` to the dispatch context) and locates the service through it, with a
- * host-global fallback (see `service-resolver.js`). Missing-service cases are
+ * host-global fallback (see `engine/backend.js`). Missing-service cases are
  * still guarded (`undefined` → skip with a log), so a gap never blocks a
  * listener. The plugin therefore declares no `inject` — profile entries activate
  * at process boot, before the preset plane mounts the service, and a boot-time
@@ -301,7 +306,7 @@ export function apply(ctx) {
     if (agent !== undefined && agent !== null && (signal === undefined || !signal.aborted)) {
       try {
         // The resolver locates the per-realm compaction backend through
-        // `agent.ctx` (see `service-resolver.js`). We pass the PLUGIN-GLOBAL
+        // `agent.ctx` (see `engine/backend.js`). We pass the PLUGIN-GLOBAL
         // `ctx` as the fallback context and read the mode once here (raw, cheap)
         // so the hot path never pays a full-settings-parse cost.
         const mode = await readRawSetting(ctx, 'compactionMode')

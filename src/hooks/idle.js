@@ -19,9 +19,9 @@
  * @module @falling-ts/dsh-force-compact/turn-end
  */
 
-import { readSettings, DEFAULTS } from './settings.js'
-import { dbg } from './request-guard.js'
-import { resolveCompaction } from './service-resolver.js'
+import { readSettings, DEFAULTS } from '../core/settings.js'
+import { dbg } from './guard.js'
+import { resolveCompaction } from '../engine/backend.js'
 
 /**
  * Handle one `agent/status` emission: when the agent transitions to `idle` and
@@ -49,7 +49,7 @@ export async function handleAgentStatus(ctx, payload, mode) {
   const session = agent.session
   // Locate a usable compaction backend: the OFFICIAL `compaction` service
   // (preferred) OR this plugin's OWN builtin engine (fallback when the service
-  // is realm-isolated away — see `service-resolver.js`). At idle the agent is
+  // is realm-isolated away — see `engine/backend.js`). At idle the agent is
   // still live in the registry, so its realm-scoped context still resolves the
   // official instance when one exists; otherwise the builtin engine takes over.
   const backend = await resolveCompaction(ctx, agent, mode)

@@ -28,9 +28,9 @@
  * @module @falling-ts/dsh-force-compact/service-resolver
  */
 
-import { readRawSetting, COMPACT_MODE_GLOBAL } from './settings.js'
+import { readRawSetting, COMPACT_MODE_GLOBAL } from '../core/settings.js'
 
-import { compactNowBuiltin, compactRegionBuiltin } from './builtin-engine.js'
+import { compactNowBuiltin, compactRegionBuiltin } from './builtin.js'
 
 /**
  * Find a usable compaction backend for one agent.

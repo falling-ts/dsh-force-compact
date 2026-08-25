@@ -13,11 +13,11 @@
  * @module @falling-ts/dsh-force-compact/compact
  */
 
-import { resolveConfig } from './config.js'
+import { resolveConfig } from '../core/policy.js'
 import { selectRegion } from './region.js'
-import { readSettings, DEFAULTS } from './settings.js'
-import { dbg } from './request-guard.js'
-import { resolveCompaction } from './service-resolver.js'
+import { readSettings, DEFAULTS } from '../core/settings.js'
+import { dbg } from '../hooks/guard.js'
+import { resolveCompaction } from './backend.js'
 
 /** Characters per token, mirroring the token meter's coarse estimate. */
 const CHARS_PER_TOKEN = 4
