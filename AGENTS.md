@@ -120,7 +120,7 @@ preset 把 `compaction-basic` 挂在了 `- isolate:{compaction:true,…}` 组里
 | `logFile` | string | `~/.dsh/logs/dsh-force-compact.log` | 调试日志目标路径 |
 | `compactionMode` | `'realm'\|'global'` | `'realm'` | 官方服务解析策略（仅影响 priority-1 路径） |
 | `builtinEnabled` | boolean | `true` | **内置引擎闸门**。`false` 时严格只走官方；缺省视为 `true`（兼容旧 yaml） |
-| `maxSummaryTokens` | integer (4096–200000) | `4096` | 摘要 LLM 调用的 `maxTokens` 上限；防超长摘要。**下限 4096**（低于 4096 的值读取时自动抬升至 4096） |
+| `maxSummaryTokens` | integer (1024–200000) | `1024` | 摘要 LLM 调用的 `maxTokens` 上限；防超长摘要。**下限 1024**（低于 1024 的值读取时自动抬升至 1024） |
 
 ### 如何验证内置引擎工作
 

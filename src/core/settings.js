@@ -54,7 +54,7 @@
  *   `user/message` shadowing a head-anchored span, own shrink gate). Setting
  *   this to `false` disables that fallback so ONLY the official backend is
  *   attempted.
- * - `maxSummaryTokens` (positive integer, default `4096`, floor `4096`): the
+ * - `maxSummaryTokens` (positive integer, default `1024`, floor `1024`): the
  *   `maxTokens` bound applied to the plugin's OWN summarization LLM call — a
  *   cap on the summary length. Combined with the shrink gate (the summary must
  *   be strictly smaller than the span it replaces), this prevents runaway
@@ -143,7 +143,7 @@ export const DEFAULT_LOG_FILE = '~/\.dsh/logs/dsh-force-compact.log'.replace('\\
 export const MIN_TOKEN_SCALES = Object.freeze({
   autoThresholdTokens: 32000,
   retainLatestTokens: 8000,
-  maxSummaryTokens: 4096,
+  maxSummaryTokens: 1024,
 })
 
 export const DEFAULTS = Object.freeze({
@@ -172,7 +172,7 @@ export const DEFAULTS = Object.freeze({
   // the plugin's own summarization LLM call). Prevents runaway summaries when
   // the shadowed span is large; the shrink gate independently ensures the
   // committed summary is smaller than the span it replaces.
-  maxSummaryTokens: 4096,
+  maxSummaryTokens: 1024,
    // Ceiling on the NUMBER OF SURFACE NODES one compaction region may span
    // (positional, counted from the head of the ordered surface). When the
    // token-budget-driven cutoff point lands beyond this many nodes —

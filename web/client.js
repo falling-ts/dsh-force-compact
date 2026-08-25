@@ -51,7 +51,7 @@ window.__ModuleLoader__.load({
       builtinEnabled: "内置压缩引擎",
       builtinEnabledHint: "官方 compaction 服务不可达时（例如标准 preset 将其隔离进 isolate 组），启用插件自研的内置压缩引擎作为后备。默认开启。设为 false 严格只走官方。",
       maxSummaryTokens: "最大摘要数（tokens）",
-      maxSummaryTokensHint: "插件自身摘要 LLM 调用的 maxTokens 上限（默认 4096，4096–200000），防止摘要长度失控；收缩门禁另行保证提交的摘要比被遮蔽区间小。最小 4096，若填低于此值会自动重置为 4096。",
+      maxSummaryTokensHint: "插件自身摘要 LLM 调用的 maxTokens 上限（默认 1024，1024–200000），防止摘要长度失控；收缩门禁另行保证提交的摘要比被遮蔽区间小。最小 1024，若填低于此值会自动重置为 1024。",
       unavailable: "设置不可用",
       loading: "加载中…",
       notWritable: "（当前为只读/内存模式，改动仅本进程生效）",
@@ -81,7 +81,7 @@ window.__ModuleLoader__.load({
       builtinEnabled: "Built-in compaction engine",
       builtinEnabledHint: "Fallback to this plugin's own self-contained engine when the official compaction service is unreachable (e.g. standard-preset realm isolation). Defaults on. Set false to strictly use only the official backend.",
       maxSummaryTokens: "Max summary size (tokens)",
-      maxSummaryTokensHint: "maxTokens ceiling on the plugin's own summarization LLM call (default 4096, range 4096–200000). Prevents runaway summaries; the shrink gate separately guarantees the committed summary is smaller than the span it replaces. Minimum 4096 — values below are clamped back to 4096.",
+      maxSummaryTokensHint: "maxTokens ceiling on the plugin's own summarization LLM call (default 1024, range 1024–200000). Prevents runaway summaries; the shrink gate separately guarantees the committed summary is smaller than the span it replaces. Minimum 1024 — values below are clamped back to 1024.",
       unavailable: "Settings unavailable",
       loading: "Loading…",
       notWritable: "(read-only / memory mode; changes are process-local)",
@@ -488,9 +488,9 @@ window.__ModuleLoader__.load({
       // 新增三项的可观察源（同样放在顶部无条件调用，保持 hooks 顺序稳定）。
       const lfOpt = { placeholder: t("logFilePlaceholder") };
       const [lfBuf, lfHandlers] = useDraftText("logFile", valOrUndef("logFile"), update);
-      // maxSummaryTokens: 数字框，4096–200000，默认 4096。
-      const msOpt = { step: 64, min: 4096, max: 200000 };
-      const [msBuf, msHandlers] = useDraftNumberClamped("maxSummaryTokens", valOrUndef("maxSummaryTokens"), msOpt, update, 4096);
+      // maxSummaryTokens: 数字框，1024–200000，默认 1024。
+      const msOpt = { step: 64, min: 1024, max: 200000 };
+      const [msBuf, msHandlers] = useDraftNumberClamped("maxSummaryTokens", valOrUndef("maxSummaryTokens"), msOpt, update, 1024);
       const modeOptions = [
         { id: "realm", label: t("modeRealm") },
         { id: "global", label: t("modeGlobal") },
