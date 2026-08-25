@@ -27,10 +27,9 @@
  *   • COMPRESSING — pinned red `[强制压缩中>>>]`, fired BEFORE the `compactNow` /
  *     `compactRegion` call;
  *   • DONE        — pinned green `[压缩完成!]`, fired right AFTER the call
- *     commits; then after `DONE_FALLBACK_MS` (3 s) the next LLM-call moment
- *     redraws a fresh random working pair (no dedicated timer — the badge
- *     self-corrects at the very next model step, which is the natural visual
- *     rhythm anyway and keeps this module free of timers entirely).
+ *     commits; then after `DONE_FALLBACK_MS` (3 s) a forced
+ *     `isImportant=true` push redraws a fresh random Deep working pair
+ *     (single-purpose timer — the only one in this module).
  *
  * All writers are GUARANTEED never to throw (they wrap the settings-service
  * write in try/catch): a messenger failure must NEVER disrupt the model
@@ -197,15 +196,13 @@ export async function publishUiStatus(ctx, status, isImportant = false) {
 }
 
 /**
- * The single host-side driver for one MODEL REQUEST'S start moment. Call from
- * the `llm/stream` waterfall (once per outgoing call): draw a fresh random
- * working pair and publish it. Because the drawing is random-per-call, the
- * "3 seconds after `压缩完成!!!`, pick a new working pair" requirement falls
- * out naturally — the NEXT model-step's `llm/stream` fires within seconds of
- * compaction finishing and overwrites the green DONE state with a fresh
- * working pair, so no explicit timer is needed and none is kept (keeping this
- * module timer-free also sidesteps the "plugins don't introduce timers"
- * convention for anything that isn't observationally inert).
+ * The host-side driver for one MODEL REQUEST's start moment. Call from the
+ * `llm/stream` waterfall (once per outgoing call): draw a fresh random working
+ * pair and publish it NON-importantly (so a pinned bracket-form text such as
+ * `[压缩完成!]` survives the push until its own fallback timer clears it — see
+ * {@link publishDone}). A fresh pair is also emitted on the 3-second fallback
+ * after DONE ({@link DONE_FALLBACK_MS}), firing with `isImportant=true` so it
+ * overwrites the DONE banner even though a `[`-prefixed text is on screen.
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @returns {Promise<void>}
  */
@@ -226,15 +223,35 @@ export async function publishCompressing(ctx) {
 }
 
 /**
+ * How long after the pinned "[压缩完成!]" DONE banner is published before the
+ * forced fallback kicks in and paints a fresh random Deep working pair back on
+ * the badge (with `isImportant=true`). 3000 ms.
+ *
+ * Note: this is the plugin's SINGLE-USE TIMER — a deliberate, documented
+ * exception to the collection rule "plugins are pure host listeners that do
+ * not introduce timers". See the `dsh-force-compact` AGENTS.md deviation note.
+ */
+const DONE_FALLBACK_MS = 3000
+
+/**
  * Publish the pinned GREEN "[压缩完成!]" status. Call AFTER a `compactNow` /
- * `compactRegion` invocation commits. The following model step's
- * `llm/stream` listener replaces it with a fresh random working pair (~within
- * 3 s in normal cadence — see {@link publishRandomWorking}). Does NOT pass
- * `isImportant=true`: a DONE banner is transient (self-corrects at the next
- * model step) and should not clobber a manually-set custom banner.
+ * `compactRegion` invocation commits. After {@link DONE_FALLBACK_MS} (3 s) a
+ * forced fallback (`isImportant=true`) overwrites the DONE banner with a fresh
+ * random Deep working pair, restoring the usual working appearance regardless
+ * of whether a subsequent `llm/stream` fires in the interim. We paint a
+ * FRESH random working pair (not the literal pre-compression text, which is no
+ * longer recoverable from the settings store — it was already overwritten by
+ * the COMPRESSING/DONE banners): the intent is "back to a normal working
+ * look", which a freshly-drawn working pair satisfies.
+ *
+ * Does NOT pass `isImportant=true` for the initial DONE push: a DONE banner is
+ * transient and should not clobber a manually-set custom banner.
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @returns {Promise<void>}
  */
 export async function publishDone(ctx) {
   await publishUiStatus(ctx, pinnedPayload(PHASE_DONE))
+  setTimeout(() => {
+    void publishUiStatus(ctx, randomWorkingPair(), true)
+  }, DONE_FALLBACK_MS)
 }

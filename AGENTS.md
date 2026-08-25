@@ -2,6 +2,18 @@
 
 本规则适用于 `dsh-force-compact/`，并补充[集合约定](../AGENTS.md)。
 
+## 例外：`publishDone` 的单用途定时器（有意偏离集合约定"不引入 timer"）
+
+集合约定要求插件"纯 Host 监听器：不引入 timer"。本插件在
+`src/core/ui-signal.js` 的 `publishDone` 中存在**一处有意的单用途定时器**
+（`DONE_FALLBACK_MS = 3000` ms）：发布绿色 `[压缩完成!]` DONE 横幅后，3 秒后
+以 `isImportant=true` 强制重绘一对随机 Deep working 文本，把 UI 还原到常规
+工作中外观。该定时器是纯表现层（fire-and-forget `setTimeout`，无内存态、
+无持久化、不影响任何压缩事务或模型请求），为用户明确要求的 UI 行为，
+**不属于**"引入 timer"所指的计时型副作用（如周期调度 / 延时重试），故予以
+豁免。除此一处之外，本插件仍不引入任何 timer；`queueForceCompact` 的
+process-local `Map` 标记也无 timer。
+
 ## 双引擎架构（内置引擎 + 官方服务并列共存）
 
 本插件拥有**两条独立的压缩路径**，通过统一的 `resolveCompaction(ctx, agent, mode)` facade
