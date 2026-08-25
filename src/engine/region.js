@@ -1,14 +1,20 @@
 /**
  * dsh-force-compact's own region selection, modeled on the official
  * `compaction-basic` region selection. A head-anchored span that retains a
- * recent tail verbatim and ends on a `user/message` boundary — always a
- * balanced boundary, so the delegated `compactRegion` never rejects it for
- * unpaired tool calls.
+ * recent tail verbatim and ends on a TOOL-PAIRING BALANCED surface boundary —
+ * verified with the official pairing ledger (`core/pairing.js`), not assumed
+ * from a coarse `user/message` heuristic. Balanced cuts include any surface
+ * position with zero unanswered tool calls, so the delegated `compactRegion`
+ * never rejects the chosen bounds for unpaired tool calls.
  *
  * @module @falling-ts/dsh-force-compact/region
  */
 
 import { guardFn } from '../core/crashnet.js'
+import {
+  toolPairingBalancedAfterSafe,
+  toolPairingBalancedBeforeSafe,
+} from '../core/pairing.js'
 
 /**
  * Select the compactable region for a session.
@@ -29,11 +35,12 @@ function __selectRegionBody(session, config) {
   let keepFromIdx = total - retainCount
   if (keepFromIdx < 1) return null
 
-  // Walk the tail boundary back to the nearest `user/message` node. A user
-  // message never participates in a tool-call/result pair, so the boundary
-  // before it is always tool-pairing balanced and `compactRegion` will accept it.
-  const userMessageSeqs = userMessageEventSeqs(session)
-  while (keepFromIdx > 1 && !userMessageSeqs.has(nodes[keepFromIdx - 1])) {
+  // Walk the tail boundary back to the NEAREST PRECEDING TOOL-PAIRING BALANCED
+  // position — the official criterion (ledger in `core/pairing.js`: cut-before
+  // the node at `keepFromIdx` is balanced iff zero tool calls straddle it).
+  // Any balanced position works, not only `user/message` nodes — such nodes
+  // are merely the historically used sufficient subset.
+  while (keepFromIdx > 1 && !toolPairingBalancedBeforeSafe(session, nodes[keepFromIdx])) {
     keepFromIdx -= 1
   }
   if (keepFromIdx < 2) return null
@@ -52,9 +59,13 @@ function __selectRegionBody(session, config) {
   // guarantees `start <= end`, and the region still denotes the same leading
   // segment of the projection (bounds are inclusive index segments interpreted
   // by the session core, so the seq ORDERING within the segment is irrelevant).
-  // Snap the OUTWARD bounds to `user/message` seqs so the replacement stays
-  // tool-pair-balanced: widen `start` downward / shrink `end` upward to the
-  // nearest surrounding user-message seq within the compactable prefix.
+  // Snap the OUTWARD bounds to TOOL-PAIRING BALANCED positions so the
+  // replacement stays balanced: the LEADING position's cut-before must be
+  // balanced (trivially satisfied at position 0) and the TRAILING position's
+  // cut-after must be balanced (zero tool calls left dangling). Widen `start`
+  // downward / shrink `end` upward within the prefix to the nearest balanced
+  // positions; when neither bound can be made balanced (degenerate prefix),
+  // fall back to the raw value extremes so a valid span is preserved.
   const prefix = nodes.slice(0, keepFromIdx - 1)
   let start = Infinity
   let end = -Infinity
@@ -63,16 +74,23 @@ function __selectRegionBody(session, config) {
     if (seq > end) end = seq
   }
   if (!Number.isFinite(start) || !Number.isFinite(end)) return null
-  // Snap both bounds to `user/message` seqs WITHIN the prefix so the replacement
-  // stays tool-pair-balanced: the LOWEST user-message seq becomes `start` and
-  // the HIGHEST becomes `end`. The session core interprets a replace region as
-  // the inclusive index segment between those two nodes, so the segment still
-  // spans the intended leading history. When the prefix contains no user message
-  // at all (unusual — the head is normally one), fall back to the raw value
-  // extremes so a valid span is preserved.
-  const userSeqsInRange = [...prefix].filter(s => userMessageSeqs.has(s)).sort((a, b) => a - b)
-  const snappedStart = userSeqsInRange.length > 0 ? userSeqsInRange[0] : start
-  const snappedEnd = userSeqsInRange.length > 0 ? userSeqsInRange[userSeqsInRange.length - 1] : end
+  let snappedStart = start
+  let snappedEnd = end
+  // Leading bound: shrink the leading segment until its first node's cut-BEFORE
+  // is balanced (at position 0 this is trivially true).
+  let startIdx = 0
+  while (startIdx < prefix.length && !toolPairingBalancedBeforeSafe(session, prefix[startIdx])) {
+    startIdx += 1
+  }
+  if (startIdx < prefix.length) snappedStart = prefix[startIdx]
+  // Trailing bound: pull the tail inward until the last node's cut-AFTER is
+  // balanced (any `user/message` position qualifies; so do tool-boundary-closed
+  // positions such as a finished step's last node).
+  let endIdx = prefix.length - 1
+  while (endIdx > startIdx && !toolPairingBalancedAfterSafe(session, prefix[endIdx])) {
+    endIdx -= 1
+  }
+  snappedEnd = prefix[endIdx]
   if (snappedStart > snappedEnd) return null
   return { start: snappedStart, end: snappedEnd }
 }
@@ -80,21 +98,78 @@ function __selectRegionBody(session, config) {
 /** Public entry — wrapped by the universal crash net. */
 export const selectRegion = guardFn('region.selectRegion', __selectRegionBody)
 
+
+
 /**
- * The set of seqs that are `user/message` surface events, so the region
- * boundary can be snapped to one without re-deriving the projection.
+ * Validate one requested surface-position span — ported from the official
+ * `compaction-basic` `validateSurfaceRegion`. Rejects (throws) when either
+ * bound is not a CURRENT SURFACE NODE, the ordering is inverted by INDEX, or
+ * either bound's tool-pairing balance check fails (the official fail-loud
+ * behaviour: a candidate that would split a step's tool-call/result pair is
+ * refused BEFORE any expensive summarization begins).
+ *
+ * Plugin adaptation: our builtin transaction validates bounds through
+ * {@link validateReplacementBounds} (non-throwing, `null` on invalid) right
+ * before the replace append — that path also cross-checks that the bounds land
+ * on current surface nodes. This exported validator adds the PAIRING checks on
+ * top, mirroring the official double-gate.
  * @param {import('@deepseek-ai/dsh-session').Session} session
- * @returns {Set<number>}
+ * @param {number} start the first surface-node seq (inclusive).
+ * @param {number} end the last surface-node seq (inclusive).
+ * @returns {{start: number, end: number, startIdx: number, endIdx: number, shadowedSeqs: number[]}}
+ * @throws {Error} when the span is malformed or unbalanced (official semantics).
  */
-function userMessageEventSeqs(session) {
-  const seqs = new Set()
-  const events = (session && Array.isArray(session.events)) ? session.events : []
-  for (const event of events) {
-    if (event === null || typeof event !== 'object') continue
-    if (event.type === 'user/message' && typeof event.seq === 'number') seqs.add(event.seq)
+// Internal body of `validateSurfaceRegion` — routed through the crash-net wrapper.
+function __validateSurfaceRegionBody(session, start, end) {
+  const surfaceNodes = (session && session.surface && Array.isArray(session.surface.nodes)) ? session.surface.nodes : []
+  const startIdx = surfaceNodes.indexOf(start)
+  const endIdx = surfaceNodes.lastIndexOf(end)
+  if (startIdx === -1) throw new Error(`compactRegion: start seq ${start} not found in surface`)
+  if (endIdx === -1) throw new Error(`compactRegion: end seq ${end} not found in surface`)
+  if (startIdx > endIdx) {
+    throw new Error(`compactRegion: start seq ${start} (position ${startIdx}) is after end seq ${end} (position ${endIdx}) on the surface`)
   }
-  return seqs
+  // Official double gate: BOTH bounds must sit on tool-pairing balanced cuts,
+  // verified with the precise per-event ledger (not the coarse user-message
+  // assumption). The SAFE variants determine a corrupt-surface ledger failure
+  // as "balanced", so a damaged log degrades to the session core's own replace
+  // validation (its final line of defense) instead of wedging selection forever.
+  if (!toolPairingBalancedBeforeSafe(session, surfaceNodes[startIdx])) {
+    throw new Error(`compactRegion: start seq ${start} is not a balanced boundary (would split a step's tool-call/result pair)`)
+  }
+  if (!toolPairingBalancedAfterSafe(session, surfaceNodes[endIdx])) {
+    throw new Error(`compactRegion: end seq ${end} is not a balanced boundary (would split a step, or the step is still open)`)
+  }
+  return {
+    start,
+    end,
+    startIdx,
+    endIdx,
+    shadowedSeqs: surfaceNodes.slice(startIdx, endIdx + 1),
+  }
 }
+
+/**
+ * Safe variant of {@link __validateSurfaceRegionBody} for hot paths: identical
+ * math, but ANY throw (unknown bound, inverted span, unbalanced cut, corrupt
+ * surface) resolves to `null` instead of propagating — callers skip the
+ * doomed compaction instead of crashing the trigger path. Mirrors the way the
+ * official code routes `validateSurfaceRegion` rejections into a clean
+ * `SurfaceChangedError`.
+ * @param {import('@deepseek-ai/dsh-session').Session} session
+ * @param {number} start
+ * @param {number} end
+ * @returns {{start: number, end: number, startIdx: number, endIdx: number, shadowedSeqs: number[]} | null}
+ */
+// Public entries — wrapped by the universal crash net.
+export const validateSurfaceRegion = guardFn('region.validateSurfaceRegion', __validateSurfaceRegionBody)
+export const validateSurfaceRegionSafe = ((session, start, end) => {
+  try {
+    return validateSurfaceRegion(session, start, end)
+  } catch {
+    return null
+  }
+})
 
 /**
  * Select the **earliest** `ratio` fraction of a **token meter measurement** as
@@ -118,8 +193,11 @@ function userMessageEventSeqs(session) {
  * seq than some surviving early nodes, so nodes are NOT guaranteed ascending by
  * seq. Positional order IS the meaningful "earliest-first" order. Once the
  * running total meets the `totalTokens * ratio` budget, the span's **end** is
- * snapped FORWARD to the next `user/message` node (balanced, tool-call-safe
- * boundary). Returns `null` when there is not enough surface to compact.
+ * walked BACKWARD to the NEAREST PRECEDING TOOL-PAIRING BALANCED position
+ * (verified with the official pairing ledger — a superset of `user/message`
+ * positions; the historical heuristic snapped to `user/message` only because
+ * such positions were believed sufficient, never necessary). Returns `null`
+ * when there is not enough surface to compact.
  *
  * @param {import('@deepseek-ai/dsh-session').Session} session
  * @param {number} ratio a fraction in (0, 1].
@@ -133,7 +211,9 @@ function userMessageEventSeqs(session) {
  *   token-derived 0.ratio crossing point lands beyond this many nodes — typical
  *   for a large `ratio` like 0.7 on a long, tool-heavy conversation — the
  *   region is CLAMPED DOWN to the largest head-aligned prefix that fits under
- *   the cap AND ends on a `user/message` boundary. Rationale: the builtin
+ *   the cap AND ends on a TOOL-PAIRING BALANCED boundary (official pairing
+   ledger — any cut-after-balanced node, not only `user/message`).
+   Rationale: the builtin
  *   summarization engine refuses regions whose projected message count exceeds
  *   its replay cap; clamping here (rather than refusing there) GUARANTEES a
  *   committable region on every threshold trip so the auto-gate never livelocks
@@ -160,13 +240,12 @@ function __selectEarliestByMeasurementsBody(session, ratio, measurement, maxRegi
     : nodeSum
   const budget = Math.max(1, Math.round(totalTokens * clampedRatio))
 
-  const userMessageSeqs = userMessageEventSeqs(session)
-
   // Upper positional bound on the region span: the smallest of (a) the last
   // node, (b) the token-crossing point, (c) the optional node-count cap. All
   // expressed as an INDEX into `nodes`. We then snap THAT index backward to the
-  // nearest `user/message` boundary BELOW it (a balanced, tool-call-safe END),
-  // which may bring the span further inward.
+  // nearest PRECEDING TOOL-PAIRING BALANCED position BELOW it (ledger-verified
+  // END — any cut-after-balanced node, not only `user/message`), which may
+  // bring the span further inward.
   const capBound = (Number.isFinite(maxRegionNodes) && maxRegionNodes > 0)
     ? Math.min(total, Math.ceil(maxRegionNodes)) - 1
     : total - 1
@@ -183,14 +262,15 @@ function __selectEarliestByMeasurementsBody(session, ratio, measurement, maxRegi
     }
   }
 
-  // Snap the span's end BACKWARD to the nearest `user/message` boundary at or
-  // before the crossing point so the compacted span ends balanced. Walking
-  // backward (instead of forward) keeps the span WITHIN the cap — the previous
-  // forward snap could overshoot past the cap. If the prefix has no
-  // `user/message` at all, fall back to the raw crossing point so a valid
-  // region is preserved.
+  // Snap the span's end BACKWARD to the nearest PRECEDING TOOL-PAIRING
+  // BALANCED position at or before the crossing point so the compacted span
+  // ends balanced (official criterion — a strict superset of the old
+  // `user/message` heuristic: any node whose cut-after carries zero
+  // unanswered tool calls). Walking backward keeps the span WITHIN the cap.
+  // If no preceding balanced position exists, fall back to the raw crossing
+  // point so a valid region is preserved.
   let settled = endIdx
-  while (settled > 0 && !userMessageSeqs.has(nodes[settled].seq)) {
+  while (settled > 0 && !toolPairingBalancedAfterSafe(session, nodes[settled].seq)) {
     settled -= 1
   }
   const endNode = nodes[settled]
@@ -219,10 +299,11 @@ function __selectEarliestByMeasurementsBody(session, ratio, measurement, maxRegi
  * POINT splits the window: nodes BEFORE the first fully-retained node form
  * the head-anchored SPAN TO COMPACT (sent to the summarizer as one batch;
  * the original span entries become shadowed / skipped in derived history).
- * The cutoff is then SNAPPED BACKWARD to the nearest preceding `user/message`
- * boundary (positionally before the retained tail's start) so the compacted
- * span ends at a balanced, tool-call-safe point — the same invariant the
- * other selectors maintain.
+ * The cutoff is then SNAPPED BACKWARD to the nearest PRECEDING TOOL-PAIRING
+ * BALANCED position (cut-after-node semantics, verified with the official
+ * pairing ledger rather than assumed from a `user/message` heuristic) so the
+ * compacted span ends at a balanced, tool-call-safe point — the same
+ * invariant the other selectors maintain.
  *
  * Why this supersedes ratio-of-total: budgeting the RETAINED side against a
  * FIXED absolute token amount (not `totalTokens × ratio`) decouples the cut
@@ -262,14 +343,13 @@ function __selectRetainingLatestTokensBody(session, retainLatestTokens, measurem
     ? Math.max(1, Math.floor(retainLatestTokens))
     : 1
 
-  const userMessageSeqs = userMessageEventSeqs(session)
-
   // Walk FROM THE TAIL toward the head, accumulating node tokens. Stop as soon
   // as the accumulated sum reaches OR EXCEEDS `budget` (the `>=` stop rule).
   // The first node included in the accumulated tail is the cutoff point:
   // everything STRICTLY BEFORE it (positionally) is compacted. Because a node
   // cannot be split, the retained tail may overshoot `budget` by UP TO ONE
   // node's weight — that is the closest achievable "exactly N" boundary.
+  const events = (session && Array.isArray(session.events)) ? session.events : []
   let acc = 0
   let tailStartIdx = total // exclusive: index just AFTER the last retained node
   let crossingAccBefore = -1 // accumulator value JUST BEFORE the crossing node was added (-1 when the walk consumed the whole window)
@@ -291,18 +371,13 @@ function __selectRetainingLatestTokensBody(session, retainLatestTokens, measurem
   // prefix occupies [0 .. tailStartIdx-1]. Need at least one node to compact.
   if (tailStartIdx <= 0) return null
 
-  // Snap the compacted span's END BACKWARD to the nearest `user/message`
-  // boundary strictly BEFORE the retained tail starts, so the span ends on a
-  // balanced, tool-call-safe node. Nodes BETWEEN the snapped boundary and the
-  // raw crossing point stay ON THE RETAINED SIDE: they are never dropped from
-  // the head nor lost from the tail — the retained tail can only GROW past the
-  // literal budget by the width of those boundary-alignment nodes. This makes
-  // the retention guarantee monotone: the verbatim tail is ALWAYS at least as
-  // large as `budget` in the common case and larger near boundaries. If no
-  // `user/message` exists anywhere in the prefix, fall back to the raw
-  // crossing index so a valid region is preserved.
+  // Snap to the nearest PRECEDING TOOL-PAIRING BALANCED position (official
+  // criterion via the `core/pairing.js` ledger — a strict superset of the
+  // old `user/message` heuristic: any node whose cut-after carries zero
+  // unanswered tool calls). No balanced position in the prefix → keep the raw
+  // crossing index so a valid region survives.
   let endIdx = tailStartIdx - 1
-  while (endIdx > 0 && !userMessageSeqs.has(nodes[endIdx].seq)) {
+  while (endIdx > 0 && !toolPairingBalancedAfterSafe(session, nodes[endIdx].seq)) {
     endIdx -= 1
   }
   const endNode = nodes[endIdx]
@@ -333,6 +408,23 @@ function __selectRetainingLatestTokensBody(session, retainLatestTokens, measurem
   //                       (= crossingAccBefore + crossingNodeSize)
   // All three are -1 when the walk consumed the whole window without ever
   // reaching the budget (the degenerate tiny-session case).
+  // boundaryKind classifies WHAT KIND of position the span finally settled on
+  // after the backward balance snap (feeds the REGION-PICK diagnostic line):
+  //   'pairing'           — a ledger-verified balanced position that is NOT a
+  //                         `user/message` (the tighter cut the ledger
+  //                         enables)
+  //   'user-message'      — a human-message position (always balanced too)
+  //   'crossing-fallback' — no balanced position ahead of the raw crossing;
+  //                         the raw crossing itself was kept
+  let boundaryKind
+  if (endIdx < total - 1) {
+    boundaryKind = 'crossing-fallback'
+  } else {
+    const endEvent = events[endIdx]
+    boundaryKind = (endEvent !== null && typeof endEvent === 'object' && endEvent.type === 'user/message')
+      ? 'user-message'
+      : 'pairing'
+  }
   return {
     start: Math.min(start, end),
     end: Math.max(start, end),
@@ -340,6 +432,7 @@ function __selectRetainingLatestTokensBody(session, retainLatestTokens, measurem
     crossingAccBefore,
     crossingNodeSize,
     crossingAccAfter,
+    boundaryKind,
   }
 }
 
@@ -358,9 +451,11 @@ function __selectRetainingLatestTokensBody(session, retainLatestTokens, measurem
  * `totalTokens*R` as the absolute token budget to compact from the head —
  * for callers who lack a real `measure()` snapshot. The span covers every
  * surface node from the first through the node that crosses the token budget,
- * then snaps the span's **end** forward to the next `user/message` boundary
- * (so the compacted span ends at a balanced, tool-call-safe point). Returns
- * `null` when there is not enough surface history to compact.
+ * then walks the span's **end** FORWARD to the next TOOL-PAIRING BALANCED
+ * position (official pairing ledger — any cut-after-balanced node, a strict
+ * superset of the historical `user/message` heuristic) so the compacted span
+ * ends at a balanced, tool-call-safe point. Returns `null` when there is not
+ * enough surface history to compact.
  *
  * @param {import('@deepseek-ai/dsh-session').Session} session
  * @param {number} totalTokens the ABSOLUTE token budget to compact from the
@@ -381,7 +476,6 @@ function __selectEarliestByTokensBody(session, totalTokens, maxRegionNodes) {
   const nodes = (session && session.surface && Array.isArray(session.surface.nodes)) ? session.surface.nodes : []
   const total = nodes.length
   if (total < 2) return null
-  const userMessageSeqs = userMessageEventSeqs(session)
   const budget = (typeof totalTokens === 'number' && Number.isFinite(totalTokens) && totalTokens > 0)
     ? Math.round(totalTokens)
     : estimateSurfaceTokens(session)
@@ -403,12 +497,13 @@ function __selectEarliestByTokensBody(session, totalTokens, maxRegionNodes) {
     if (accumulated >= budget) break
   }
 
-  // Snap the span's end forward to the next `user/message` boundary so the
-  // compacted span ends balanced.
-  while (endIdx + 1 < total && !userMessageSeqs.has(nodes[endIdx])) {
+  // Walk the span's end FORWARD to the next TOOL-PAIRING BALANCED position
+  // (official ledger criterion — any cut-after-balanced node, not only
+  // `user/message`) so the compacted span ends balanced.
+  while (endIdx + 1 < total && !toolPairingBalancedAfterSafe(session, nodes[endIdx])) {
     endIdx += 1
   }
-  if (!userMessageSeqs.has(nodes[endIdx])) return null
+  if (!toolPairingBalancedAfterSafe(session, nodes[endIdx])) return null
   if (endIdx < 1) return null
 
   return { start: nodes[0], end: nodes[endIdx] }

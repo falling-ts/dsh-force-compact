@@ -51,9 +51,10 @@ function emitLoadMarker() {
   if (loadMarkerEmitted) return
   loadMarkerEmitted = true
   try {
-    console.log(`[force-compact] BUILTIN ENGINE LOADED — marker v2026-08-25-crash-harness `
-      + `(diagnostics: MIN_USEFUL_SPAN floor active, tools-prefix OMITTED bisect-toggle still on, `
-      + `CRASH-HARNESS arm on kind==='error' terminal finishes)`)
+    console.log(`[force-compact] BUILTIN ENGINE LOADED — marker v2026-08-25-official-parity `
+      + `(official port active: tool-pairing-ledger boundary selection, validateSurfaceRegion double gate, `
+      + `surface-consistency cross-check, official busy-lock semantics, tools prefix RESTORED, `
+      + `instruction aligned to official COMPACTION_INSTRUCTION)`)
   } catch {
     /* a load marker must never throw out of a compaction path */
   }
@@ -306,6 +307,19 @@ async function runTransaction(ctx, agent, session, region, signal, settings) {
     warn(ctx, `${session.id}: builtin compaction unavailable — no LLM service`)
     return null
   }
+
+  // ---- Busy-lock REFUSAL (ported from the official `assertNoActiveCompaction`)
+  // An UNMATCHED `compaction/start` with no later `session/end-seed` proves a
+  // transaction is in flight (typically a crashed predecessor that opened its
+  // bracket but died before closing). Refuse THIS entry rather than nest a
+  // second bracket on top (nested brackets violate the invariant listener's
+  // single-inflight-trace contract). Inherited orphans (preceded by a later
+  // end-seed) are IGNORED per official semantics — see the helper's doc.
+  const busyNote = assertNoActiveCompaction(session, 'builtin.runTransaction')
+  if (busyNote !== null) {
+    info(ctx, `${session.id}: builtin compaction SKIPPED (${busyNote})`)
+    return null
+  }
   const meter = ctx.get('tokenMeter')
 
   // ---- Failure cooldown ---------------------------------------------------
@@ -414,9 +428,16 @@ async function runTransaction(ctx, agent, session, region, signal, settings) {
     const input = {
       messages,
       ...(prefix.system !== undefined ? { system: prefix.system } : {}),
-      // DIAGNOSTIC TOGGLE: temporarily omit the `tools` prefix to bisect the
-      // provider `reading 'kind'` crash (suspect: the harness-internal tool
-      // schema objects fed to options.tools). Revert to `...(prefix.tools !== undefined ? { tools: prefix.tools } : {})` once root-caused.
+      // FULL OFFICIAL PREFIX-CACHE ALIGNMENT: feed the session's latest
+      // request-header SYSTEM PROMPT AND TOOL SCHEMAS verbatim into the
+      // auxiliary call (mirrors `summarizeWithLlm`'s `input.tools` pass-through
+      // — the auxiliary call becomes a genuine prefix of the last routed
+      // request and the provider's warm KV cache is reused instead of
+      // invalidated). The earlier temporary omission was a bisection probe
+      // against the vendor-side replay `reading 'kind'` crash, which has since
+      // been proven unrelated to the `tools` option (replays of ROUTED requests
+      // crash identically with or without this field) — so restore full parity.
+      ...(prefix.tools !== undefined ? { tools: prefix.tools } : {}),
     }
     // `summarize` NEVER throws and resolves to a discriminated `{ status, ... }`
     // object (plus `reason` on non-ok outcomes). Branch defensively:
@@ -755,21 +776,98 @@ function validateReplacementBounds(session, region) {
   return { start: region.start, end: region.end }
 }
 
-/** Whether an open compaction transaction is present (durant lock check). */
-function hasOpenFctLock(session) {
-  // Conservative under a malformed shape: a missing/non-array `events` cannot
-  // prove a lock is open, so treat it as NOT locked (return false) and let
-  // downstream guards decide. Non-object event rows are tolerated (skipped) so
-  // a `.type` read never throws on a primitive row.
-  const events = (session && Array.isArray(session.events)) ? session.events : []
-  for (let i = events.length - 1; i >= 0; i--) {
-    const e = events[i]
-    if (e === null || typeof e !== 'object') continue
-    const t = e.type
-    if (t === 'compaction/start') return true
-    if (t === 'compaction/end') return false
+/**
+ * Inspect open-turn, unmatched-compaction, and latest seed-boundary state
+ * independently — ported from the official `inspectCompactionEntryState`.
+ * Scans the durable log BACKWARD once, collecting:
+ *   • `openTurn`              — the turn number of the currently-open turn, or
+ *                               `null` when no turn is open (or the state is
+ *                               simply absent);
+ *   • `unmatchedCompactionStart` — the LATEST `compaction/start` without a
+ *                                  following `compaction/end` (the in-flight
+ *                                  transaction lock), `undefined` when none;
+ *   • `latestEndSeedSeq`        — the newest `session/end-seed` marker,
+ *                                 `undefined` when absent.
+ * A backward scan means each field is found in O(1)-amortised passes: we stop
+ * as soon as ALL THREE are known.
+ * @param {readonly object[]} events the durable session log.
+ * @returns {{openTurn: number|null, unmatchedCompactionStart: object|undefined, latestEndSeedSeq: number|undefined}}
+ */
+function inspectCompactionEntryState(events) {
+  const rows = (Array.isArray(events)) ? events : []
+  let openTurn = null
+  let openTurnStateKnown = false
+  let unmatchedCompactionStart
+  let compactionEntryStateKnown = false
+  let latestEndSeedSeq
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const event = rows[index]
+    if (event === null || typeof event !== 'object') continue
+    const type = event.type
+    if (latestEndSeedSeq === undefined && type === 'session/end-seed' && typeof event.seq === 'number') {
+      latestEndSeedSeq = event.seq
+    }
+    if (!compactionEntryStateKnown) {
+      if (type === 'compaction/start') {
+        unmatchedCompactionStart = event
+        compactionEntryStateKnown = true
+      } else if (type === 'compaction/end') {
+        compactionEntryStateKnown = true
+      }
+    }
+    if (!openTurnStateKnown) {
+      if (type === 'turn/start') {
+        const data = (event.data && typeof event.data === 'object') ? event.data : undefined
+        openTurn = (data && data.turn !== undefined) ? data.turn : null
+        openTurnStateKnown = true
+      } else if (type === 'turn/end') {
+        openTurnStateKnown = true
+      }
+    }
+    if (openTurnStateKnown && compactionEntryStateKnown && latestEndSeedSeq !== undefined) break
   }
-  return false
+  return { openTurn, unmatchedCompactionStart, latestEndSeedSeq }
+}
+
+/**
+ * Refuse to enter a compaction while one is already active — ported from the
+ * official `assertCompactionInactive` + `assertNoActiveCompaction`.
+ *
+ * SEMANTICS (official):
+ *   • An UNMATCHED `compaction/start` with NO later `session/end-seed` proves
+ *     a transaction is genuinely in flight → throw `ManualCompactionError`-style
+ *     rejection (here: return a descriptive string the caller logs and skips on).
+ *   • An unmatched `compaction/start` PRECEDED by a LATER `session/end-seed` is
+ *     a CONSTRUCTOR-INHERITED ORPHAN (persisted across a session resume whose
+ *     reload reseeded the surface from a checkpoint). The official code IGNORES
+ *     such a stale marker — it belongs to an earlier session lifecycle and must
+ *     NOT wedge subsequent compactions.
+ *   • `null` → no refusal (proceed).
+ *
+ * Our builtin transaction closes its bracket SYNCHRONOUSLY (four appends in a
+ * row, no yielding), so a LIVE process can never observe its own in-flight
+ * marker from another entry — the refusal only matters for the rare
+ * corrupted-orphan case and for defensive double-entry suppression.
+ * @param {import('@deepseek-ai/dsh-session').Session} session
+ * @param {string} stage operation label for the diagnostic (e.g. `'runTransaction'`).
+ * @returns {string|null} a human-readable BUSY NOTE when refused, `null` to proceed.
+ */
+function assertNoActiveCompaction(session, stage) {
+  const state = inspectCompactionEntryState((session && Array.isArray(session.events)) ? session.events : [])
+  const { unmatchedCompactionStart, latestEndSeedSeq } = state
+  if (unmatchedCompactionStart === undefined) return null
+  if (latestEndSeedSeq !== undefined && latestEndSeedSeq > (unmatchedCompactionStart.seq ?? -1)) {
+    // Inherited orphan cleared by a later end-seed boundary (constructor
+    // reseed) — the official semantics explicitly ignore it.
+    return null
+  }
+  return `${stage}: compaction already in progress; the session compaction lock is already active`
+}
+
+/** Whether an open compaction transaction is present (busy-lock check — kept for
+ *  compatibility; now backed by the official entry-state inspection). */
+function hasOpenFctLock(session) {
+  return assertNoActiveCompaction(session, 'lockCheck') !== null
 }
 
 /** The turn number of the currently-open turn, or `null` (standalone/idle). */

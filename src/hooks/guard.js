@@ -32,6 +32,7 @@ import {
   selectEarliestByTokens,
   selectEarliestByMeasurements,
   selectRetainingLatestTokens,
+  validateSurfaceRegionSafe,
 } from '../engine/region.js'
 import { resolveCompaction } from '../engine/backend.js'
 import { publishCompressing, publishDone } from '../core/ui-signal.js'
@@ -157,9 +158,18 @@ function estimateRegionTokens(meter, session, region, measurement) {
  * is available): starting FROM THE LATEST surface node, ACCUMULATE node tokens
  * BACKWARD until the sum REACHES OR EXCEEDS `retainLatestTokens`; the cutoff
  * splits the surface into the head SPAN TO COMPACT and the RETAINED TAIL
- * (verbatim). Everything before the cut (plus the snap-to-user-boundary
- * adjustment) is sent to the summarizer AS ONE BATCH — the original span's
- * entries become shadowed/skipped in derived history.
+ * (verbatim). Everything before the cut (plus the snap-to-nearest-preceding-
+ * tool-pairing-balanced-boundary adjustment — the official pairing ledger,
+ * a strict superset of `user/message` boundaries) is sent to the summarizer
+ * AS ONE BATCH — the original span's entries become shadowed/skipped in
+ * derived history. Before spending the summarization round-trip, the selected
+ * span passes TWO official safety gates (both ported from `compaction-basic`):
+ * a SURFACE-CONSISTENCY cross-check (the meter's priced snapshot must align
+ * node-for-node with the CURRENT `session.surface.nodes`; a concurrent
+ * modification between measure and selection aborts this attempt) and the
+ * `validateSurfaceRegion` DOUBLE-BALANCE gate (both bounds must sit on
+ * tool-pairing balanced cuts — a candidate that would split a step's
+ * tool-call/result pair is refused here, logged, and skipped).
  *
  * Legacy `selectEarliestByTokens` is used only when no measurement snapshot is
  * available (tokenMeter absent): it estimates total tokens from char-count and
@@ -281,6 +291,44 @@ async function __compactRetainingLatestBody(ctx, agent, signal, mode) {
     return false
   }
 
+  // ---- Surface-consistency CROSS-CHECK (ported from the official
+  //  `compaction-basic` `prepareCompaction`) -------------------------------
+  // The meter's priced snapshot MUST align position-for-position with the
+  // session's current surface nodes. When a concurrent modification landed a
+  // node between the `measure()` above and selection completion, the two
+  // disagree; proceeding would price a STALE span. Refuse the compaction
+  // attempt entirely (next step retries on a fresh snapshot) rather than pay
+  // for a summarization of the wrong bytes.
+  const surfaceNodes = (session.surface && Array.isArray(session.surface.nodes)) ? session.surface.nodes : []
+  const pricedNodes = (measurement !== undefined && Array.isArray(measurement.nodes)) ? measurement.nodes : null
+  if (pricedNodes !== null && (pricedNodes.length !== surfaceNodes.length
+    || pricedNodes.some((seq, index) => seq !== surfaceNodes[index]?.seq))) {
+    ctx.logger.debug(
+      `[force-compact] ${session.id}: token-meter surface does not match the current session surface ` +
+      `(priced=${pricedNodes.length} vs current=${surfaceNodes.length} nodes) — REFUSING this compaction ` +
+      `attempt rather than summarize a stale span; retrying on the next step.`
+    )
+    return false
+  }
+
+  // ---- Official PAIRING BOUNDARY GATE (ported from the official
+  //  `validateSurfaceRegion`) ----------------------------------------------
+  // Before spending a summarization round-trip, verify BOTH bounds are
+  // tool-pairing balanced on the CURRENT surface (the precise per-event
+  // ledger, not an assumption about the selection having done its job). A
+  // candidate that would split a step's tool-call/result pair is refused
+  // HERE (fail-loud, logged) — the session core's own replace validation
+  // remains the last line of defense behind this gate.
+  const validated = validateSurfaceRegionSafe(session, region.start, region.end)
+  if (validated === null) {
+    ctx.logger.debug(
+      `[force-compact] ${session.id}: selected span seq ${region.start}..${region.end} FAILED the official ` +
+      `surface/balance validation (unknown bound, inverted index, or an unbalanced tool-pairing cut) — ` +
+      `REFUSING this compaction attempt; the session core's own replace validation remains the safety net.`
+    )
+    return false
+  }
+
   // THRESHOLD-AWARE SHRINK GATE (root fix for the low-threshold dead loop).
   // Predict whether compacting this region can ACTUALLY pull the session below
   // `autoThresholdTokens` before paying for a summarization LLM call. When the
@@ -330,6 +378,7 @@ async function __compactRetainingLatestBody(ctx, agent, signal, mode) {
     + `crossingAccBefore=${region.crossingAccBefore} `
     + `crossingNodeSize=${region.crossingNodeSize} `
     + `crossingAccAfter=${region.crossingAccAfter} `
+    + `boundaryKind=${region.boundaryKind ?? 'unknown'} `
     + `retainedTokens(after-boundary-snap)=${region.retainedTokens}`
   )
   try {

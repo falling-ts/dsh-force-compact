@@ -25,6 +25,34 @@ resolveCompaction
 
 官方服务可达 → 使用官方；不可达 → 自动落到内置引擎。**用户无需手动切换**。
 
+## 官方行为全量移植（2026-08 升级：内置引擎与官方 `compaction-basic` 逐项对齐）
+
+内置引擎现已移植官方实现的**全部核心环节**（逐一对照
+`deepseek-harness/packages/compaction/{compaction,compaction-basic}/src`），不再是
+"结构模仿"而是同数学定义、同 fail-loud 语义：
+
+| 官方来源 | 移植到 | 说明 |
+|----------|--------|------|
+| `compaction/src/tool-pairing.ts`（增量配对账本：`assistant/message` +tool-call 块数、`tool/result` −1、其余 0；切点平衡 ⇔ 运行计数为 0；`WeakMap` 按 session 缓存、按 `replaceGeneration` 换代重折；损坏面 loud-fail） | `src/core/pairing.js`（逐字 JS 移植 + 插件侧 SAFE 变体） | **精确工具配对账本**取代旧的"最近 `user/message`"启发式——任意配对闭合处都可下刀（step 末节点、收尾 tool result 之后……），保留端 overshoot 比"必须退到下一条人类消息"小得多 |
+| 官方选区第二阶段的向头部吸附判据 | `region.js` 四个选择器 | 吸附循环改查账本（`toolPairingBalancedBefore/AfterSafe`）而非 `user/message` 集合；`selectRetainingLatestTokens` 额外产出 `boundaryKind`（`pairing` / `user-message` / `crossing-fallback`）供 REGION-PICK 诊断行观察吸附落在哪种切点 |
+| `compaction-basic/src/region.ts` `validateSurfaceRegion`（界外拒绝 + 索引倒置拒绝 + **双侧平衡校验**） | `region.js` 导出 `validateSurfaceRegion`（throwing，官方语义）+ `validateSurfaceRegionSafe`（hot-path 安全壳，异常归一化为 `null`） | 提交前双重把关：不平衡候选在此被拒绝并记日志（fail-loud），不再带着可能劈裂 tool 对的边界往下走；会话核自身的 replace 校验仍是最后一道网 |
+| `compaction-basic/src/region.ts` `prepareCompaction` 的 surface 一致性交叉校验（meter 快照必须与 `session.surface.nodes` 逐位相等） | `hooks/guard.js` 选区之后、花钱之前 | 并发修改导致快照过期时整体拒绝本次尝试（下一步新鲜快照重试），绝不摘要错误的字节 |
+| `compaction-basic/src/region.ts` `inspectCompactionEntryState` + `assertCompactionInactive`（反向一次扫描同时收集 openTurn / 未配对 `compaction/start` / 最新 `session/end-seed`；**晚于孤儿 start 的 end-seed ⇒ 视为 constructor 继承残留，忽略**） | `builtin.js` `inspectCompactionEntryState` / `assertNoActiveCompaction`（原 `hasOpenFctLock` 由此重构而来） | busy 锁定语义与官方完全一致：真·在途事务拒入；跨生命周期继承的孤儿标记不再永久楔死后续压缩 |
+| `compaction-basic/src/summarizer.ts` `COMPACTION_INSTRUCTION` + `CHECKPOINT_PREAMBLE` + `<compacted-summary>` framing | `src/engine/summarizer.js`（逐字对齐，含七节结构与 Rules 段） | 指令文案与官方单源实现逐字一致——摘要输出结构、"(none)" 占位规则、prior-checkpoint 合并规则、"不得提及本次压缩"禁令全部相同 |
+| `compaction-basic` 摘要调用的 `system` + `tools` 前缀缓存对齐 | `builtin.js` 摘要输入（**已恢复 `tools` 传入**，撤销此前的二分法临时关闭） | 辅助调用成为上次路由请求的真前缀，复用热 KV 缓存；此前怀疑 `tools` 引发 provider `reading 'kind'` 崩溃，后经活体验证证实该崩溃源于 vendor 侧重放路径（与 `options.tools` 无关），故恢复全量对齐 |
+
+**未移植项及原因**（有意识的差异，非遗漏）：
+- 官方 `whole-surface` / `span-stable` **异步摘要期稳定性复检**（`assertWholeSurfaceUnchanged` /
+  `assertSelectedSpanStable`，应对摘要进行中新事件插入）——我们内置事务的摘要调用虽仍经
+  `await ctx.llm.stream` 让出微任务，但提交前的 `validateReplacementBounds` 已按"当前
+  surface 节点是否仍命中同一界点"复检；若未来引入真·多 yield 长摘要（如分段摘要），应补
+  装官方的两种 stability 检查。
+- `compaction-tool-result-pruner`（独立的 tool result 修剪通路）——与本插件职责正交
+  （它是"原地剪枝超限 tool result"，不是"区域替换"），不移植。
+
+REGION-PICK 诊断行新增 `boundaryKind=` 字段；加载标记升级为
+`v2026-08-25-official-parity`（dev-server stdout 可见）。
+
 ### 内置引擎（src/engine/builtin.js）
 
 自包含、不依赖官方 `compaction` 服务的完整持久事务：
