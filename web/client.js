@@ -716,7 +716,7 @@ window.__ModuleLoader__.load({
       const t = ctx.locale.bind(NS);
       const scope = ctx.settingsScope.bind({ namespace: NS_SETTINGS });
       // 挂载 swish 调色板样式表（首次 apply 时执行一次；effect 登记便于 fiber 卸载时清理）。
-      ctx.effect(() => ensureSwishCssLoaded(), "force-compact: swish stylesheets");
+      ctx.effect(() => ensureSwishStylesheetInlined(), "force-compact: swish stylesheets");
       // 把 settingsScope 镜像成 uSES 安全的 SnapshotStore（hooks 分区的可观察源）。
       const store = createSnapshotStore({ status: "loading", value: undefined, writable: false });
       const derive = () => {
