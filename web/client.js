@@ -8,7 +8,7 @@
  * dsh.client 声明被 client module 系统自动组成并服务（/plugins/<id>/client.js）。
  *
  * 该分区通过 settingsScope 读写宿主侧 falling-ts-force-compact 设置命名空间
- * （disableThinking / autoThresholdTokens / autoEarliestRatio / forceEarliestRatio /
+ * （disableThinking / autoThresholdTokens / retainLatestTokens /
  * turnEndForceCompactionEnabled），并在设置页左侧菜单注册 "强制压缩" 分区。
  * 纯展示 + 写回，不引入 timer、内存态存储或额外订阅。
  */
@@ -33,12 +33,10 @@ window.__ModuleLoader__.load({
       intro: "控制 force-compact 插件的压缩行为（强制压缩配置）。改动在 $DSH_HOME/settings.yaml 的 falling-ts-force-compact 段生效。",
       disableThinking: "压缩时关闭思考",
       disableThinkingHint: "为 true 时每次模型请求携带 reasoningEffort: off，关闭思考以节省 token。",
-      autoThresholdTokens: "自动压缩阈值（token）",
-      autoThresholdTokensHint: "会话总上下文 tokens ≥ 该值时，agent/pre-step 阈值门禁触发强制压缩。",
-      autoEarliestRatio: "自动压缩最早比例",
-      autoEarliestRatioHint: "自动压缩时按会话总 tokens 的该比例从头截断（0.01–1，默认 0.3）。",
-      forceEarliestRatio: "强制压缩最早比例",
-      forceEarliestRatioHint: "/force-compact 忙碌排队后按总 tokens 的该比例从头截断（0.01–1，默认 0.5）。",
+      autoThresholdTokens: "自动压缩阈值（tokens）",
+      autoThresholdTokensHint: "会话总上下文 tokens ≥ 该值时，agent/pre-step 阈值门禁触发强制压缩。最小 32000；若填低于此值会自动重置为 32000。",
+      retainLatestTokens: "保留最新上下文（tokens）",
+      retainLatestTokensHint: "自动/强制压缩时，从会话最新条目往前累加 token（按官方 tokenMeter 逐节点计数），直到 ≥ 该值停止；该截点之前的所有条目一次性发往大模型做摘要（原条目被遮蔽/跳过），保留的尾部逐字保留。默认 8000；最小 8000，若填低于此值会自动重置为 8000。",
       turnEndForceCompaction: "回合结束强制压缩",
       turnEndForceCompactionHint: "为 true 时，agent 转入 idle（一轮结束）时执行一轮结束压缩。",
       debug: "详细日志（debug）",
@@ -52,8 +50,8 @@ window.__ModuleLoader__.load({
       modeGlobal: "global（全局）",
       builtinEnabled: "内置压缩引擎",
       builtinEnabledHint: "官方 compaction 服务不可达时（例如标准 preset 将其隔离进 isolate 组），启用插件自研的内置压缩引擎作为后备。默认开启。设为 false 严格只走官方。",
-      maxSummaryTokens: "摘要最大 tokens",
-      maxSummaryTokensHint: "插件自身摘要 LLM 调用的 maxTokens 上限（默认 2400，256–200000），防止摘要长度失控；收缩门禁另行保证提交的摘要比被遮蔽区间小。",
+      maxSummaryTokens: "最大摘要数（tokens）",
+      maxSummaryTokensHint: "插件自身摘要 LLM 调用的 maxTokens 上限（默认 4096，4096–200000），防止摘要长度失控；收缩门禁另行保证提交的摘要比被遮蔽区间小。最小 4096，若填低于此值会自动重置为 4096。",
       unavailable: "设置不可用",
       loading: "加载中…",
       notWritable: "（当前为只读/内存模式，改动仅本进程生效）",
@@ -66,11 +64,9 @@ window.__ModuleLoader__.load({
       disableThinking: "Disable thinking during compaction",
       disableThinkingHint: "When true, every model request carries reasoningEffort: off to save tokens.",
       autoThresholdTokens: "Auto-compaction threshold (tokens)",
-      autoThresholdTokensHint: "When the session's total context tokens ≥ this value, the agent/pre-step threshold gate force-compacts.",
-      autoEarliestRatio: "Auto-compaction earliest ratio",
-      autoEarliestRatioHint: "For auto-compaction, truncate from the head to this ratio of total tokens (0.01–1, default 0.3).",
-      forceEarliestRatio: "Force-compaction earliest ratio",
-      forceEarliestRatioHint: "After a busy /force-compact queues, truncate from the head to this ratio of total tokens (0.01–1, default 0.5).",
+      autoThresholdTokensHint: "When the session's total context tokens ≥ this value, the agent/pre-step threshold gate force-compacts. Minimum 32000; values below are clamped back to 32000.",
+      retainLatestTokens: "Retain latest context (tokens)",
+      retainLatestTokensHint: "When auto/forced compaction fires, walk backward from the LATEST surface entry accumulating per-node tokens (the official tokenMeter's prices) until the running sum REACHES OR EXCEEDS this budget; everything before that cutoff is sent to the summarizer in ONE batch (its entries become shadowed/skipped in derived history), and the retained tail stays VERBATIM. Default 8000; minimum 8000 — values below are clamped back to 8000.",
       turnEndForceCompaction: "Force-compaction at turn end",
       turnEndForceCompactionHint: "When true, run a turn-end compaction when the agent becomes idle.",
       debug: "Verbose logging (debug)",
@@ -84,8 +80,8 @@ window.__ModuleLoader__.load({
       modeGlobal: "global (global)",
       builtinEnabled: "Built-in compaction engine",
       builtinEnabledHint: "Fallback to this plugin's own self-contained engine when the official compaction service is unreachable (e.g. standard-preset realm isolation). Defaults on. Set false to strictly use only the official backend.",
-      maxSummaryTokens: "Max summary tokens",
-      maxSummaryTokensHint: "maxTokens ceiling on the plugin's own summarization LLM call (default 2400, range 256–200000). Prevents runaway summaries; the shrink gate separately guarantees the committed summary is smaller than the span it replaces.",
+      maxSummaryTokens: "Max summary size (tokens)",
+      maxSummaryTokensHint: "maxTokens ceiling on the plugin's own summarization LLM call (default 4096, range 4096–200000). Prevents runaway summaries; the shrink gate separately guarantees the committed summary is smaller than the span it replaces. Minimum 4096 — values below are clamped back to 4096.",
       unavailable: "Settings unavailable",
       loading: "Loading…",
       notWritable: "(read-only / memory mode; changes are process-local)",
@@ -298,6 +294,54 @@ window.__ModuleLoader__.load({
       return [buf, handlers];
     }
 
+    /**
+     * 在 `useDraftNumber` 之上再套一层「硬性 floor」：commit 时把数值先 clamp
+     * 到 [hardFloor, opts.max]（忽略 opts.min，改用传入的硬下界），并把钳位后的
+     * 值同时写回 store——即使另一入口绕过表单写入 sub-floor 值，下一次 blur
+     * 也会把它拉回 floor。用于带最小值的 token 尺度参数。
+     * @param {string} key
+     * @param {*} currentValue 当前 store 中的值。
+     * @param {{ step?: number, min?: number, max?: number }} opts 步进与上下界提示。
+     * @param {(k:string,v:any)=>void} update 底层写回函数。
+     * @param {number} hardFloor 不可逾越的下限（提交时向上 clamp）。
+     * @returns [draftValue, handlers]
+     */
+    function useDraftNumberClamped(key, currentValue, opts, update, hardFloor) {
+      const [buf, setBuf] = React.useState(currentValue === undefined ? "" : String(currentValue));
+      const focusedRef = React.useRef(false);
+      React.useEffect(() => {
+        // External drift (another tab / programmatic write) re-syncs the buffer
+        // ONLY when we are not mid-edit, mirroring the unclamped twin.
+        if (!focusedRef.current) {
+          setBuf(currentValue === undefined ? "" : String(currentValue));
+        }
+      }, [currentValue, hardFloor]);
+      const clampToFloor = (n) => {
+        let x = n;
+        if (x < hardFloor) x = hardFloor;
+        if (opts.max !== undefined && x > opts.max) x = opts.max;
+        return x;
+      };
+      const commit = () => {
+        focusedRef.current = false;
+        const trimmed = buf.trim();
+        if (trimmed === "") { update(key, undefined); setBuf(""); return; }
+        const n = Number(trimmed);
+        if (Number.isNaN(n)) { setBuf(currentValue === undefined ? "" : String(currentValue)); return; }
+        const c = clampToFloor(n);
+        update(key, c);
+        setBuf(String(c));
+      };
+      const handlers = {
+        onFocus: () => { focusedRef.current = true; },
+        onChange: (e) => setBuf(e.target.value),
+        onBlur: commit,
+        onKeyDown: (e) => { if (e.key === "Enter") { e.currentTarget.blur(); } },
+        inputMode: "decimal",
+      };
+      return [buf, handlers];
+    }
+
     /** 比例滑块的几何与外观常量。 */
     const SLIDER_W = 200;      // 轨道宽度（px）
     const SLIDER_H = 4;        // 轨道条高度
@@ -431,18 +475,22 @@ window.__ModuleLoader__.load({
       const snap = useForceCompact((s) => s);
       const value = snap.value;
       const valOrUndef = (k) => (value && k in value ? value[k] : undefined);
-      // 阈值用草稿数字框；两个比例用拖动滑块。三者都在组件顶部、任何条件返回之
-      // 前无条件调用对应 hook，保证 React hooks 顺序恒定（状态切换不改变 hook 数）。
-      const thOpt = { step: 1000, min: 0, max: 1000000 };
-      const [thBuf, thHandlers] = useDraftNumber("autoThresholdTokens", valOrUndef("autoThresholdTokens"), thOpt, update);
-      const arSlider = useDragRatio("autoEarliestRatio", valOrUndef("autoEarliestRatio"), update);
-      const frSlider = useDragRatio("forceEarliestRatio", valOrUndef("forceEarliestRatio"), update);
+      // 阈值用草稿数字框；「保留最新 tokens」也用草稿数字框（绝对 token 值，非
+      // 比例）。所有 hook 都在组件顶部、任何条件返回之前无条件调用，保证 React
+      // hooks 顺序恒定（状态切换不改变 hook 数）。
+      // 三个 token 尺度参数均带硬性下界：schema 与表单两侧同设同一 floor，
+      // 表单提交时再做一次运行时 clamp（防键盘直接键入 sub-floor 值）。
+      const thOpt = { step: 1000, min: 32000, max: 1000000 };
+      const [thBuf, thHandlers] = useDraftNumberClamped("autoThresholdTokens", valOrUndef("autoThresholdTokens"), thOpt, update, 32000);
+      // retainLatestTokens：整 token 值（step 512），范围 8000–1_000_000。
+      const rtOpt = { step: 512, min: 8000, max: 1000000 };
+      const [rtBuf, rtHandlers] = useDraftNumberClamped("retainLatestTokens", valOrUndef("retainLatestTokens"), rtOpt, update, 8000);
       // 新增三项的可观察源（同样放在顶部无条件调用，保持 hooks 顺序稳定）。
       const lfOpt = { placeholder: t("logFilePlaceholder") };
       const [lfBuf, lfHandlers] = useDraftText("logFile", valOrUndef("logFile"), update);
-      // maxSummaryTokens: 数字框，256–200000，默认 2400。
-      const msOpt = { step: 16, min: 256, max: 200000 };
-      const [msBuf, msHandlers] = useDraftNumber("maxSummaryTokens", valOrUndef("maxSummaryTokens"), msOpt, update);
+      // maxSummaryTokens: 数字框，4096–200000，默认 4096。
+      const msOpt = { step: 64, min: 4096, max: 200000 };
+      const [msBuf, msHandlers] = useDraftNumberClamped("maxSummaryTokens", valOrUndef("maxSummaryTokens"), msOpt, update, 4096);
       const modeOptions = [
         { id: "realm", label: t("modeRealm") },
         { id: "global", label: t("modeGlobal") },
@@ -542,8 +590,7 @@ window.__ModuleLoader__.load({
           h("div", null,
             booleanRow("disableThinking", "disableThinking", "disableThinkingHint", false),
             numberRow("autoThresholdTokens", "autoThresholdTokens", "autoThresholdTokensHint", thBuf, thHandlers, thOpt, false),
-            ratioRow("autoEarliestRatio", "autoEarliestRatioHint", arSlider, false),
-            ratioRow("forceEarliestRatio", "forceEarliestRatioHint", frSlider, false),
+            numberRow("retainLatestTokens", "retainLatestTokens", "retainLatestTokensHint", rtBuf, rtHandlers, rtOpt, false),
             booleanRow("turnEndForceCompactionEnabled", "turnEndForceCompaction", "turnEndForceCompactionHint", false),
             booleanRow("debug", "debug", "debugHint", false),
             textRow("logFile", "logFileHint", lfBuf, lfHandlers, lfOpt, false),

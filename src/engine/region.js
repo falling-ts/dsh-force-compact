@@ -91,46 +91,263 @@ function userMessageEventSeqs(session) {
 }
 
 /**
- * Select the **earliest** `ratio` fraction of the session's **tokens** as a
- * head-anchored region to compact — the "earliest conversation token ratio" knob.
+ * Select the **earliest** `ratio` fraction of a **token meter measurement** as
+ * a head-anchored region to compact — the preferred, same-caliber variant of
+ * {@link selectEarliestByTokens}.
  *
- * Unlike a node-count-based selector, this measures the actual token content:
- * it walks surface events from the head, accumulating per-event token estimates
- * (4 chars/token heuristic), until the accumulated tokens reach
- * `totalTokens * ratio`. The span covers every surface node from the first
- * through the node that crosses the token budget, then snaps the span's **end**
- * forward to the next `user/message` boundary (so the compacted span ends at a
- * balanced, tool-call-safe point). Returns `null` when there is not enough
- * surface history to compact.
+ * Why this exists: the naive {@link selectEarliestByTokens} prices each node
+ * with its own char/4 heuristic on FLAT surface text only, which systematically
+ * UNDERCOUNTS relative to the gate's `totalTokens` (that figure includes the
+ * system-prompt + tools schema header, nested tool blocks, and JSON framing).
+ * Budgeting against the large `totalTokens` but accumulating a much smaller
+ * flat-text total means the budget is never met and the final boundary snap
+ * fails — so the selector returns `null` ("no earliest region") and the
+ * compaction silently gives up. Feeding it the meter's OWN per-node prices
+ * (each node's `tokens` comes from the same `estimateMessage` that feeds
+ * `totalTokens`) makes the accumulation reachable and the boundary well-defined.
+ *
+ * The walk is POSITIONAL over the ordered `measurement.nodes` (model-visible
+ * head-to-tail order, as maintained by the meter's surface fold) rather than by
+ * `seq` value: after a committed compaction the checkpoint node sits at a higher
+ * seq than some surviving early nodes, so nodes are NOT guaranteed ascending by
+ * seq. Positional order IS the meaningful "earliest-first" order. Once the
+ * running total meets the `totalTokens * ratio` budget, the span's **end** is
+ * snapped FORWARD to the next `user/message` node (balanced, tool-call-safe
+ * boundary). Returns `null` when there is not enough surface to compact.
  *
  * @param {import('@deepseek-ai/dsh-session').Session} session
  * @param {number} ratio a fraction in (0, 1].
- * @param {number} [totalTokens] the session's total context tokens (from
- *   `tokenMeter.measure` or a character-based fallback); when omitted, the
- *   function estimates the total itself.
+ * @param {Readonly<{
+ *   totalTokens: number,
+ *   nodes: ReadonlyArray<{ seq: number, tokens: number }>,
+ * }>} measurement a `tokenMeter.measure(session)` snapshot; `nodes` is the
+ *   ordered per-node pricing and `totalTokens` is the figure to budget against.
+ * @param {number} [maxRegionNodes] a hard ceiling on the NUMBER OF SURFACE NODES
+ *   the returned region may span (positional, from the head). When the
+ *   token-derived 0.ratio crossing point lands beyond this many nodes — typical
+ *   for a large `ratio` like 0.7 on a long, tool-heavy conversation — the
+ *   region is CLAMPED DOWN to the largest head-aligned prefix that fits under
+ *   the cap AND ends on a `user/message` boundary. Rationale: the builtin
+ *   summarization engine refuses regions whose projected message count exceeds
+ *   its replay cap; clamping here (rather than refusing there) GUARANTEES a
+ *   committable region on every threshold trip so the auto-gate never livelocks
+ *   and the context can actually be pulled back down. Multiple successive gates
+ *   chip away the head until the session settles below the threshold.
  * @returns {{start: number, end: number} | null} the head-anchored span to compact, or `null`.
  */
-export function selectEarliestByTokens(session, ratio, totalTokens) {
-  // A malformed surface / bad ratio yields nothing to compact — return null
-  // rather than throwing on a missing `session.surface.nodes` or an NaN budget.
-  const nodes = (session && session.surface && Array.isArray(session.surface.nodes)) ? session.surface.nodes : []
+export function selectEarliestByMeasurements(session, ratio, measurement, maxRegionNodes) {
+  const nodes = (measurement && Array.isArray(measurement.nodes) && measurement.nodes.length > 0)
+    ? measurement.nodes
+    : []
   const total = nodes.length
   if (total < 2) return null
-  const clampedRatio = Number.isFinite(ratio) ? Math.min(Math.max(ratio, 0), 1) : 0.5
+  const clampedRatio = Number.isFinite(ratio) ? Math.min(Math.max(ratio, 0.01), 1) : 0.5
 
-  // Estimate the session's total tokens (surface content only).
-  const rawTotal = (typeof totalTokens === 'number' && Number.isFinite(totalTokens) && totalTokens > 0) ? totalTokens : estimateSurfaceTokens(session)
-  const surfaceTokens = rawTotal
-  const budget = Math.max(1, Math.round(surfaceTokens * clampedRatio))
+  // Same caliber as the accumulation: budget from the SAME measurement whose
+  // nodes we accumulate. Fall back to the sum of the nodes' own prices when
+  // `totalTokens` is absent/malformed so the budget always stays reachable.
+  const nodeSum = nodes.reduce((acc, n) => acc + (Number(n.tokens) > 0 ? Number(n.tokens) : 0), 0)
+  const totalTokens = (typeof measurement.totalTokens === 'number' && Number.isFinite(measurement.totalTokens) && measurement.totalTokens > 0)
+    ? measurement.totalTokens
+    : nodeSum
+  const budget = Math.max(1, Math.round(totalTokens * clampedRatio))
 
   const userMessageSeqs = userMessageEventSeqs(session)
 
+  // Upper positional bound on the region span: the smallest of (a) the last
+  // node, (b) the token-crossing point, (c) the optional node-count cap. All
+  // expressed as an INDEX into `nodes`. We then snap THAT index backward to the
+  // nearest `user/message` boundary BELOW it (a balanced, tool-call-safe END),
+  // which may bring the span further inward.
+  const capBound = (Number.isFinite(maxRegionNodes) && maxRegionNodes > 0)
+    ? Math.min(total, Math.ceil(maxRegionNodes)) - 1
+    : total - 1
+
+  // Accumulate node-by-node (positional) until the budget is met OR the capped
+  // bound is reached, whichever comes FIRST.
+  let accumulated = 0
+  let endIdx = Math.min(capBound, total - 1)
+  for (let i = 0; i <= endIdx; i += 1) {
+    accumulated += Number(nodes[i].tokens) > 0 ? Number(nodes[i].tokens) : 0
+    if (i <= capBound && accumulated >= budget) {
+      endIdx = i
+      break
+    }
+  }
+
+  // Snap the span's end BACKWARD to the nearest `user/message` boundary at or
+  // before the crossing point so the compacted span ends balanced. Walking
+  // backward (instead of forward) keeps the span WITHIN the cap — the previous
+  // forward snap could overshoot past the cap. If the prefix has no
+  // `user/message` at all, fall back to the raw crossing point so a valid
+  // region is preserved.
+  let settled = endIdx
+  while (settled > 0 && !userMessageSeqs.has(nodes[settled].seq)) {
+    settled -= 1
+  }
+  const endNode = nodes[settled]
+  const startNode = nodes[0]
+  if (startNode === undefined || endNode === undefined) return null
+  const start = startNode.seq
+  const end = endNode.seq
+  if (!Number.isInteger(start) || !Number.isInteger(end)) return null
+  if (start === end) return null
+  return { start: Math.min(start, end), end: Math.max(start, end) }
+}
+
+/**
+ * Select a **tail-retained** region to compact using the TOKEN METER'S OWN
+ * per-node prices — the successor to {@link selectEarliestByMeasurements}'s
+ * ratio-of-total budgeting.
+ *
+ * Semantics (per the user-facing policy knob `retainLatestTokens`): starting
+ * FROM THE LATEST ENTRY of the measurement's `nodes` (the ordered
+ * model-visible head-to-tail surface, exactly the caliber that feeds
+ * `totalTokens`), ACCUMULATE node tokens BACKWARD (newest → oldest) until the
+ * accumulated sum REACHES OR EXCEEDS `retainLatestTokens` (stop condition:
+ * `>=`, so the retained tail truly covers the configured budget). The cutoff
+ * CUT POINT splits the window: nodes BEFORE the first fully-retained node form
+ * the head-anchored SPAN TO COMPACT (sent to the summarizer as one batch,
+ * recorded as a single summary node; the original span entries become shadowed
+ * / skipped in derived history). The cutoff is then SNAPPED BACKWARD to the
+ * nearest preceding `user/message` boundary (positionally before the retained
+ * tail's start) so the compacted span ends at a balanced, tool-call-safe
+ * point — the same invariant the other selectors maintain.
+ *
+ * Why this supersedes ratio-of-total: budgeting the RETAINED side against a
+ * FIXED absolute token amount (not `totalTokens × ratio`) decouples the cut
+ * from provider-usage inflation baked into `totalTokens` — the exact
+ * divergence that made `autoEarliestRatio` regions undersized against an
+ * inflated denominator (observed live: total=71270 dominated by a usage
+ * baseline of 61818 left the head region unable to ever reach below threshold
+ * no matter how well it summarized).
+ *
+ * Boundary cases:
+ * - `retainLatestTokens <= 0` → clamp to 1 node minimum retained (never
+ *   compact the whole surface in one pass).
+ * - The retained tail ALREADY reaches the budget at the VERY LAST node
+ *   (single huge trailing node ≥ budget) → nothing left to compact: `null`.
+ * - Fewer than 2 nodes total → `null`.
+ *
+ * @param {import('@deepseek-ai/dsh-session').Session} session
+ * @param {number} retainLatestTokens the absolute TOKEN COUNT to RETAIN at the
+ *   latest end of the surface. Positive integer.
+ * @param {Readonly<{
+ *   nodes: ReadonlyArray<{ seq: number, tokens: number }>,
+ * }>} measurement a `tokenMeter.measure(session)` snapshot whose `nodes` are
+ *   the ordered per-node prices.
+ * @returns {{start: number, end: number, retainedTokens: number} | null} the
+ *   head-anchored span to compact plus the actual retained tail's token sum,
+ *   or `null` when there is not enough surface to compact.
+ */
+export function selectRetainingLatestTokens(session, retainLatestTokens, measurement) {
+  const nodes = (measurement && Array.isArray(measurement.nodes) && measurement.nodes.length > 0)
+    ? measurement.nodes
+    : []
+  const total = nodes.length
+  if (total < 2) return null
+  const budget = (Number.isFinite(retainLatestTokens) && retainLatestTokens > 0)
+    ? Math.max(1, Math.floor(retainLatestTokens))
+    : 1
+
+  const userMessageSeqs = userMessageEventSeqs(session)
+
+  // Walk FROM THE TAIL toward the head, accumulating node tokens. Stop as soon
+  // as the accumulated sum reaches OR EXCEEDS `budget` (the `>=` stop rule).
+  // The first node included in the accumulated tail is the cutoff point:
+  // everything STRICTLY BEFORE it (positionally) is compacted.
+  let acc = 0
+  let tailStartIdx = total // exclusive: index just AFTER the last retained node
+  for (let i = total - 1; i >= 0; i -= 1) {
+    tailStartIdx = i
+    const t = Number(nodes[i].tokens) > 0 ? Number(nodes[i].tokens) : 0
+    acc += t
+    if (acc >= budget) break
+  }
+  // The tail occupied indices [tailStartIdx .. total-1]; the compactable
+  // prefix occupies [0 .. tailStartIdx-1]. Need at least one node to compact.
+  if (tailStartIdx <= 0) return null
+
+  // Snap the compacted span's END BACKWARD to the nearest `user/message`
+  // boundary at or before index `tailStartIdx - 1`, so the span ends balanced.
+  // If no `user/message` exists anywhere in the prefix, fall back to the raw
+  // crossing index so a valid region is preserved.
+  let endIdx = tailStartIdx - 1
+  while (endIdx > 0 && !userMessageSeqs.has(nodes[endIdx].seq)) {
+    endIdx -= 1
+  }
+  const endNode = nodes[endIdx]
+  const startNode = nodes[0]
+  if (startNode === undefined || endNode === undefined) return null
+  const start = startNode.seq
+  const end = endNode.seq
+  if (!Number.isInteger(start) || !Number.isInteger(end)) return null
+  if (start === end) return null
+
+  // Report the ACTUAL retained tail's token sum (indices [endIdx+1 .. total-1]
+  // after the boundary snap — the snap may have pulled the end slightly
+  // earlier, enlarging the retained tail's true content).
+  let retainedTokens = 0
+  for (let i = endIdx + 1; i < total; i += 1) {
+    const t = Number(nodes[i].tokens) > 0 ? Number(nodes[i].tokens) : 0
+    retainedTokens += t
+  }
+  return { start: Math.min(start, end), end: Math.max(start, end), retainedTokens }
+}
+
+/**
+ * Select the **earliest** `ratio` fraction of the session's **tokens** as a
+ * head-anchored region to compact — the "earliest conversation token ratio"
+ * knob. **Legacy fallback**: used only when no `tokenMeter.measure` snapshot is
+ * available. Prefer {@link selectEarliestByMeasurements}, which prices from the
+ * same caliber as the gate's `totalTokens` and avoids the undercount/blank
+ * failure this char-heuristic variant exhibits on tool-heavy conversations.
+ *
+ * It walks surface events from the head, accumulating per-event token estimates
+ * (4 chars/token heuristic on flat surface text), until the accumulated tokens
+ * reach `budget = min(totalTokens, surfaceTokens)`. This mirrors the legacy
+ * ratio-of-total behavior where passing a ratio R is equivalent to passing
+ * `totalTokens*R` as the absolute token budget to compact from the head —
+ * for callers who lack a real `measure()` snapshot. The span covers every
+ * surface node from the first through the node that crosses the token budget,
+ * then snaps the span's **end** forward to the next `user/message` boundary
+ * (so the compacted span ends at a balanced, tool-call-safe point). Returns
+ * `null` when there is not enough surface history to compact.
+ *
+ * @param {import('@deepseek-ai/dsh-session').Session} session
+ * @param {number} totalTokens the ABSOLUTE token budget to compact from the
+ *   head. Typically the session's estimated total context tokens (char-based
+ *   fallback) — walking forward until accumulated per-event tokens reach this
+ *   many compacts up to the point where the budget is consumed, leaving the
+ *   remaining tail intact. When `totalTokens` exceeds the actual surface
+ *   token sum, the entire surface is eligible (equivalent to a ratio of 1.0).
+ * @param {number|undefined} [maxRegionNodes] optional positional ceiling on
+ *   the region's node count — same contract as
+ *   {@link selectEarliestByMeasurements}.
+ * @returns {{start: number, end: number} | null} the head-anchored span to compact, or `null`.
+ */
+export function selectEarliestByTokens(session, totalTokens, maxRegionNodes) {
+  // A malformed surface yields nothing to compact — return null rather than
+  // throwing on a missing `session.surface.nodes`.
+  const nodes = (session && session.surface && Array.isArray(session.surface.nodes)) ? session.surface.nodes : []
+  const total = nodes.length
+  if (total < 2) return null
+  const userMessageSeqs = userMessageEventSeqs(session)
+  const budget = (typeof totalTokens === 'number' && Number.isFinite(totalTokens) && totalTokens > 0)
+    ? Math.round(totalTokens)
+    : estimateSurfaceTokens(session)
+
   // Walk surface events from the head, accumulating tokens until the budget
   // is reached. The span end is the last node whose cumulative tokens first
-  // meet or exceed the budget.
+  // meet or exceed the budget. Honor the optional `maxRegionNodes` positional
+  // ceiling (same contract as {@link selectEarliestByMeasurements}): the span
+  // can NEVER extend past the capped window.
+  const capBound = (Number.isFinite(maxRegionNodes) && maxRegionNodes > 0)
+    ? Math.min(total, Math.ceil(maxRegionNodes)) - 1
+    : total - 1
   let accumulated = 0
   let endIdx = 0
-  for (let i = 0; i < total; i++) {
+  for (let i = 0; i <= capBound; i++) {
     const seq = nodes[i]
     accumulated += estimateEventTokens(session, seq)
     endIdx = i

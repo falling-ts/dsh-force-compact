@@ -14,8 +14,9 @@
  * - **`agent/pre-step`** (a Waterfall before each model step) — reads the
  *   session's **total context tokens** through the `tokenMeter` service. When
  *   the total is **>= `autoThresholdTokens`**, the guard rejects the proposed
- *   step (so the model request is NOT made) and instead compacts the **earliest
- *   `autoEarliestRatio`** of the conversation's tokens via the `compaction`
+ *   step (so the model request is NOT made) and instead retains the **latest
+ *   `retainLatestTokens` of the conversation's tokens verbatim** while sending
+ *   everything before that cutoff to the `compaction`
  *   service's `compactRegion` (read live via `ctx.get('compaction')`), which
  *   condenses the head history and lets the loop retry with a smaller context.
  *
@@ -27,7 +28,11 @@
  */
 
 import { readSettings, DEFAULTS } from '../core/settings.js'
-import { selectEarliestByTokens } from '../engine/region.js'
+import {
+  selectEarliestByTokens,
+  selectEarliestByMeasurements,
+  selectRetainingLatestTokens,
+} from '../engine/region.js'
 import { resolveCompaction } from '../engine/backend.js'
 import { publishCompressing, publishDone } from '../core/ui-signal.js'
 
@@ -157,11 +162,33 @@ function clearCompactCooldown(sessionId) {
  * @param {{start: number, end: number}} region the head-anchored span (inclusive seqs).
  * @returns {number} the summed token estimate (0 when nothing measurable).
  */
-function estimateRegionTokens(meter, session, region) {
-  // Malformed shape (missing `session.surface` / non-array `nodes`, missing
-  // `events`, non-object rows, missing `data`/`message`) degrades to whatever
-  // IS measurable (often 0) rather than throwing — feeds a shrink gate, never a
-  // correctness path.
+/**
+ * Sum the meter's per-node prices for the surface nodes whose seq falls within
+ * the selected region's [start..end] seq window. Reusing the measurement's own
+ * node prices keeps the shrink gate's region figure on the SAME caliber as both
+ * the region selector and the gate's `totalTokens` (all fed by the one
+ * `measure()` snapshot). Falls back to re-pricing flat surface content via
+ * `meter.estimateMessage` / char-heuristic when no measurement is supplied.
+ */
+function estimateRegionTokens(meter, session, region, measurement) {
+  // PREFERRED: when a `measure()` snapshot is available, sum the node prices for
+  // the seq window directly — same pricer, same total caliber as the selector.
+  if (measurement !== undefined && Array.isArray(measurement.nodes)) {
+    const lo = Math.min(region.start, region.end)
+    const hi = Math.max(region.start, region.end)
+    let tokens = 0
+    for (const node of measurement.nodes) {
+      const n = Number(node.seq)
+      if (Number.isFinite(n) && n >= lo && n <= hi) {
+        const t = Number(node.tokens)
+        if (Number.isFinite(t) && t > 0) tokens += t
+      }
+    }
+    return tokens
+  }
+  // LEGACY: no measurement — price the region's surface seqs manually. Malformed
+  // shapes degrade to whatever IS measurable (often 0) rather than throwing —
+  // feeds a shrink gate, never a correctness path.
   const surfaceNodes = (session && session.surface && Array.isArray(session.surface.nodes)) ? session.surface.nodes : []
   const nodes = [...surfaceNodes]
   const firstIdx = nodes.indexOf(region.start)
@@ -198,24 +225,34 @@ function estimateRegionTokens(meter, session, region) {
 }
 
 /**
- * Compact the **earliest** `ratio` fraction of a session's **tokens** via
- * `compactRegion` (the "earliest conversation token ratio" knob). Measures the
- * session's total context tokens (via `tokenMeter` or a character-based
- * fallback), computes the token budget (`totalTokens * ratio`), selects the
- * head-anchored span with `selectEarliestByTokens`, and delegates the durable
- * mutation to the `compaction` service's `compactRegion(start, end, agent,
- * signal)` (read live via `ctx.get('compaction')`), forwarding the caller's
- * `AbortSignal` for cancellation. Resolves `true` when a
- * compaction was committed, `false` otherwise (missing service, no compactable
- * span, or a thrown error) — it never throws.
+ * Compact a session's head so that the latest `retainLatestTokens` of the
+ * surface remains verbatim, sending the remainder to a single summarizer call
+ * via the `compaction` service's `compactRegion(start, end, agent, signal)`.
+ * Measures the session's total context tokens (via `tokenMeter` or a
+ * character-based fallback), then delegates the durable mutation.
+ *
+ * Selection prefers the meter's own per-node prices (when a `measure()` snapshot
+ * is available): starting FROM THE LATEST surface node, ACCUMULATE node tokens
+ * BACKWARD until the sum REACHES OR EXCEEDS `retainLatestTokens`; the cutoff
+ * splits the surface into the head SPAN TO COMPACT and the RETAINED TAIL
+ * (verbatim). Everything before the cut (plus the snap-to-user-boundary
+ * adjustment) is sent to the summarizer AS ONE BATCH — the original span's
+ * entries become shadowed/skipped in derived history.
+ *
+ * Legacy `selectEarliestByTokens` is used only when no measurement snapshot is
+ * available (tokenMeter absent): it estimates total tokens from char-count and
+ * picks a head-aligned prefix under the same `retainLatestTokens` budget (with
+ * an implicit total assumption that fits the legacy behavior).
+ *
+ * Never throws: all failures resolve `false` so the caller's model request
+ * proceeds unimpeded.
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @param {import('@deepseek-ai/dsh-agent').Agent} agent
  * @param {AbortSignal|undefined} signal the current turn's signal (forwarded to compaction).
- * @param {number} ratio a fraction in (0, 1] of the session's tokens to compact from the head.
  * @param {string|undefined} mode the `compactionMode` setting (passed by the caller); undefined re-reads live.
  * @returns {Promise<boolean>} whether a compaction was committed.
  */
-async function compactEarliestRatio(ctx, agent, signal, ratio, mode) {
+async function compactRetainingLatest(ctx, agent, signal, mode) {
   // SAFETY ENVELOPE: this function's CONTRACT is to resolve `false` (let the
   // request proceed) on ANY failure — a missing service, a missing span, a
   // throwing `tokenMeter.measure`, a rejecting backend call, or even a
@@ -224,17 +261,17 @@ async function compactEarliestRatio(ctx, agent, signal, ratio, mode) {
   // (the "every request pauses" symptom). The actual logic lives in the inner
   // closure; any exception anywhere inside resolves `false`.
   try {
-    return await __compactEarliestRatioBody(ctx, agent, signal, ratio, mode)
+    return await __compactRetainingLatestBody(ctx, agent, signal, mode)
   } catch (error) {
     const message = error instanceof Error ? (error.stack || error.message) : String(error)
     const sid = (agent && agent.session && agent.session.id) ? agent.session.id : '?'
-    ctx.logger.warn(`[force-compact] ${sid}: compactEarliestRatio degraded to false (letting the request proceed) — ${message}`)
+    ctx.logger.warn(`[force-compact] ${sid}: compactRetainingLatest degraded to false (letting the request proceed) — ${message}`)
     return false
   }
 }
 
-/** Body of {@link compactEarliestRatio}; wrapped by its safe envelope. */
-async function __compactEarliestRatioBody(ctx, agent, signal, ratio, mode) {
+/** Body of {@link compactRetainingLatest}; wrapped by its safe envelope. */
+async function __compactRetainingLatestBody(ctx, agent, signal, mode) {
   const settings = (await readSettings(ctx)) ?? DEFAULTS
   const session = agent.session
   if (session === undefined || session === null) return false
@@ -261,17 +298,57 @@ async function __compactEarliestRatioBody(ctx, agent, signal, ratio, mode) {
   // (fallback estimation) rather than propagate.
   const meter = ctx.get('tokenMeter')
   let totalTokens
+  let measurement
   if (meter !== undefined && typeof meter.measure === 'function') {
     try {
       const measured = meter.measure(session)
-      totalTokens = (measured !== undefined && measured !== null) ? measured.totalTokens : undefined
+      if (measured !== undefined && measured !== null) {
+        totalTokens = measured.totalTokens
+        measurement = measured
+      }
     } catch {
       totalTokens = undefined
     }
   }
-  const region = selectEarliestByTokens(session, ratio, totalTokens)
+  // Region selection: PREFER the same-caliber meter-node selector (prices each
+  // candidate from the very `measure()` snapshot that produced `totalTokens`,
+  // so the budget is always reachable and the boundary well-defined). The
+  // `maxRegionNodes` cap CLAMPS an oversized 0.ratio head-span down to the
+  // largest serviceable head-aligned prefix so the builtin engine's replay cap
+  // is never tripped and a region is ALWAYS committable on a threshold trip.
+  // Fall back to the legacy char-heuristic variant only when no measurement
+  // snapshot is available (tokenMeter absent). See the selectors' docs.
+  const maxRegionNodes = (settings.maxRegionNodes !== undefined && Number.isFinite(Number(settings.maxRegionNodes)))
+    ? Number(settings.maxRegionNodes)
+    : undefined
+  // Prefer the tail-retaining selector when a measurement snapshot exists: it
+  // walks the node prices backward from the newest entry accumulating tokens
+  // until `>= retainLatestTokens`, snapping the cutoff to a preceding
+  // `user/message` boundary. This is exactly the "keep latest N tokens
+  // verbatim, send everything older in one batch to the LLM" semantic the
+  // user-facing `retainLatestTokens` knob promises.
+  //
+  // FALLBACK (legacy `selectEarliestByTokens`): when no measurement snapshot
+  // is available (tokenMeter absent), use the char-heuristic variant — it
+  // prices from `estimateSessionTokens` and applies the same `maxRegionNodes`
+  // clamp for the same bounded-region guarantee.
+  const region = (measurement !== undefined)
+    ? selectRetainingLatestTokens(session, settings.retainLatestTokens, measurement)
+    : (() => {
+        // DEGENERATE FALLBACK (tokenMeter absent): express the retention
+        // semantic via the char-estimated total. The head to compact is at
+        // most (totalEstimated − retainLatestTokens); pass THAT absolute
+        // head-budget to the legacy selector, which walks from the head
+        // accumulating until the budget is consumed. When the retention
+        // budget exceeds the estimated total (tiny session), the head budget
+        // clamps to 0 and the selector trivially returns null — no compaction.
+        if (typeof totalTokens !== 'number' || !Number.isFinite(totalTokens) || totalTokens <= 0) return null
+        const headBudget = Math.max(0, Math.round(totalTokens - settings.retainLatestTokens))
+        if (headBudget <= 0) return null
+        return selectEarliestByTokens(session, headBudget, maxRegionNodes)
+      })()
   if (region === null) {
-    ctx.logger.debug(`[force-compact] ${session.id}: no earliest ${ratio} token region to compact (totalTokens=${totalTokens == null ? 'unknown(fallback est)' : totalTokens})`)
+    ctx.logger.debug(`[force-compact] ${session.id}: no region to compact retaining ~${settings.retainLatestTokens} latest tokens (totalTokens=${totalTokens == null ? 'unknown(fallback est)' : totalTokens}${measurement !== undefined ? `, surface nodes=${measurement.nodes.length}, surfaceTokens=${measurement.surfaceTokens}` : ''})`)
     return false
   }
 
@@ -292,13 +369,24 @@ async function __compactEarliestRatioBody(ctx, agent, signal, ratio, mode) {
   if (totalTokens !== undefined && totalTokens >= settings.autoThresholdTokens) {
     let regionTokens
     try {
-      regionTokens = estimateRegionTokens(meter, session, region)
+      regionTokens = estimateRegionTokens(meter, session, region, measurement)
     } catch {
       regionTokens = 0 // a measurement failure means "skip the shrink gate"; the inner try/catch handles the eventual compaction.
     }
+    // NOTE ON CAP-CLAMPING WITH TAIL RETENTION: unlike the legacy
+    // ratio-of-total selector (where a capped head-span had to be deliberately
+    // bypassed because committing it was the ONLY way to make headway), the
+    // new tail-retention semantic ALREADY bounds the retained side. When a
+    // measurement snapshot is present, `selectRetainingLatestTokens` returns a
+    // region whose head-span is AT MOST (windowSum − retainLatestTokens)
+    // tokens wide — inherently a bounded head. If THAT bound is still too big
+    // to cross the threshold, skipping is CORRECT here: retrying the SAME
+    // region next step changes nothing (nothing shrunk), so deferring avoids
+    // burning repeated summarization calls. We therefore DO NOT special-case
+    // a "capped head-span" branch — the math is simpler and correct.
     if (typeof regionTokens === 'number' && regionTokens > 0 && totalTokens - regionTokens >= settings.autoThresholdTokens) {
       ctx.logger.debug(
-        `[force-compact] ${session.id}: threshold-aware gate — earliest ${ratio} region (~${regionTokens} tokens) `
+        `[force-compact] ${session.id}: threshold-aware gate — retained-tail region (~${regionTokens} tokens; retains ~${settings.retainLatestTokens} latest tokens) `
         + `cannot pull total ~${totalTokens} below threshold ${settings.autoThresholdTokens} `
         + `(would still be ~${totalTokens - regionTokens}); SKIPPING compaction, letting the request proceed`
       )
@@ -306,18 +394,21 @@ async function __compactEarliestRatioBody(ctx, agent, signal, ratio, mode) {
     }
   }
 
-  ctx.logger.debug(`[force-compact] ${session.id}: compacting earliest ${ratio} via ${backend.kind} backend -> span seqs ${region.start}..${region.end} (totalTokens=${totalTokens})`)
+  ctx.logger.debug(
+    `[force-compact] ${session.id}: compacting head spanning seqs ${region.start}..${region.end} `
+    + `while retaining the latest ~${settings.retainLatestTokens} tokens, via ${backend.kind} backend (totalTokens=${totalTokens})`
+  )
   try {
     // LIVE UI SIGNAL — PIN RED "compressing" BEFORE the region compaction
     // commits. This single site covers BOTH pre-step trigger paths (queued
     // `/force-compact` flag and the auto token-threshold gate), since both
-    // funnel through `compactEarliestRatio`. Publishers swallow their own
+    // funnel through `compactRetainingLatest`. Publishers swallow their own
     // failures — the messenger can never affect whether the compaction itself
     // commits.
     await publishCompressing(ctx)
     const result = await backend.compactRegion(region.start, region.end, agent, signal)
     if (result === undefined || result === null) {
-      ctx.logger.debug(`[force-compact] ${session.id}: earliest ${ratio} compaction committed nothing via ${backend.kind}`)
+      ctx.logger.debug(`[force-compact] ${session.id}: retained-tail compaction committed nothing via ${backend.kind}`)
       return false
     }
     // COMMITTED — range shadowed + summary added. Clear any outstanding
@@ -328,13 +419,14 @@ async function __compactEarliestRatioBody(ctx, agent, signal, ratio, mode) {
     // it with a fresh random working pair shortly after (cadence < 3 s, no timer).
     await publishDone(ctx)
     ctx.logger.info(
-      `[force-compact] ${session.id}: earliest ${ratio} compaction (${backend.kind}) shadowed ${result.shadowedSeqs?.length ?? '?'} nodes `
-      + `(~${result.shadowedTokenCount ?? '?'} tokens)`,
+      `[force-compact] ${session.id}: retained-latest-${settings.retainLatestTokens}-tokens compaction (${backend.kind}) `
+      + `shadowed ${result.shadowedSeqs?.length ?? '?'} nodes (~${result.shadowedTokenCount ?? '?'} tokens) `
+      + `spanning seqs ${region.start}..${region.end}`,
     )
     return true
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
-    ctx.logger.warn(`[force-compact] ${session.id}: earliest ${ratio} compaction via ${backend.kind} FAILED — ${message}`)
+    ctx.logger.warn(`[force-compact] ${session.id}: retained-tail compaction via ${backend.kind} FAILED — ${message}`)
     return false
   }
 }
@@ -379,11 +471,11 @@ async function __forceCompactIfNeededBody(ctx, agent, signal, mode) {
   }
 
   // A `/force-compact` command was issued for this agent while it was busy:
-  // compact now, regardless of the token threshold — the earliest
-  // `forceEarliestRatio` of the conversation.
+  // compact now, regardless of the token threshold — retain the latest
+  // `retainLatestTokens` of the surface, compress the head in one batch.
   if (takeForceCompact(session.id)) {
-    ctx.logger.info(`[force-compact] ${session.id}: /force-compact queued; force-compacting the earliest ${settings.forceEarliestRatio} immediately`)
-    const committed = await compactEarliestRatio(ctx, agent, signal, settings.forceEarliestRatio, mode)
+    ctx.logger.info(`[force-compact] ${session.id}: /force-compact queued; force-compacting the head (keeping the latest ~${settings.retainLatestTokens} tokens) immediately`)
+    const committed = await compactRetainingLatest(ctx, agent, signal, mode)
     ctx.logger.debug(`[force-compact] ${session.id}: /force-compact forced compaction ${committed ? 'COMMITTED' : 'did not commit'} — letting the request proceed`)
     return committed
   }
@@ -399,9 +491,62 @@ async function __forceCompactIfNeededBody(ctx, agent, signal, mode) {
   const total = measurement && typeof measurement.totalTokens === 'number'
     ? measurement.totalTokens
     : estimateSessionTokens(session)
+  // DIAGNOSTIC: log every measurement facet on the threshold branch so a
+  // divergent total can be attributed (baseline kind/tokens vs surface sum vs
+  // nodes-window sum). Threshold hits are rare events, so unconditional INFO
+  // here is cheap.
+  const diagNodes = Array.isArray(measurement && measurement.nodes) ? measurement.nodes : []
+  const diagWindowSum = diagNodes.reduce((acc, n) => acc + (Number(n.tokens) > 0 ? Number(n.tokens) : 0), 0)
+  if (total >= settings.autoThresholdTokens) {
+    const baseline = measurement && measurement.baseline
+    const estFallback = estimateSessionTokens(session)
+    ctx.logger.debug(
+      `[force-compact] ${session.id}: MEASURE-DIAG total=${total} `
+      + `baseline=${baseline ? `${baseline.kind}:${baseline.tokens}` : 'none'} `
+      + `delta=${measurement && typeof measurement.surfaceDeltaTokens === 'number' ? measurement.surfaceDeltaTokens : '?'} `
+      + `surfaceTokens=${measurement && typeof measurement.surfaceTokens === 'number' ? measurement.surfaceTokens : '?'} `
+      + `nodes=${diagNodes.length} windowSum=${diagWindowSum} charEst4=${estFallback}`
+    )
+  }
   if (total < settings.autoThresholdTokens) {
     ctx.logger.debug(`[force-compact] ${session.id}: total ~${total} tokens < threshold ${settings.autoThresholdTokens} — below gate, letting the request proceed`)
     return false
+  }
+
+  // PRE-FLIGHT DIAGNOSTIC — SURFACE-BASED FLOOR OBSERVATION (informational
+  // only; NEVER aborts the compaction). Rationale for dropping the early-return
+  // this block USED TO perform: `totalTokens` mixes a provider-reported USAGE
+  // baseline (which inflates on sessions that have already consumed context)
+  // with the live SURFACE DELTA. Shaving the whole surface window lowers the
+  // NEXT request's usage baseline dramatically (the provider re-baselines on
+  // the compacted surface), so projecting `total − maxRemovableHead` onto the
+  // CURRENT measurement is UNSOUND whenever the baseline is usage-flavored:
+  // it predicts "cannot cross" precisely in the regime where compaction helps
+  // most. Instead we LOG the floor arithmetic (useful attribution data — how
+  // much of `total` is baseline vs window vs delta) and ALWAYS fall through to
+  // the attempted compaction. The threshold-aware SHRINK GATE further downstream
+  // still applies to the CHOSEN region, and the blank-result COOLDOWN below
+  // still breaks any residual livelock — together they preserve the invariant
+  // "never spam identical useless compactions" without the earlier regression
+  // of permanently arming-cooldown-free skips when the floor prediction
+  // misfires on an inflated baseline.
+  const floorWindow = (measurement && Array.isArray(measurement.nodes) ? measurement.nodes : [])
+    .filter(n => n !== null && typeof n === 'object' && Number.isFinite(Number(n.tokens)))
+  const windowSumObserved = floorWindow.reduce((acc, n) => acc + Number(n.tokens), 0)
+  const maxRemovableObserved = Math.max(0, windowSumObserved - settings.retainLatestTokens)
+  const projectedAfterObserved = total - maxRemovableObserved
+  if (floorWindow.length > 0 && projectedAfterObserved >= settings.autoThresholdTokens) {
+    ctx.logger.debug(
+      `[force-compact] ${session.id}: PRE-FLIGHT OBSERVATION — total ${total} `
+      + `(usage-baseline ${measurement.baseline ? `${measurement.baseline.kind}:${measurement.baseline.tokens}` : 'n/a'} `
+      + `+ surfaceDelta ${measurement.surfaceDeltaTokens != null ? measurement.surfaceDeltaTokens : '?'}); `
+      + `surfaces window = ${windowSumObserved} tokens across ${floorWindow.length} nodes, `
+      + `retains ~${settings.retainLatestTokens} → max removable head = ${maxRemovableObserved} tokens; `
+      + `naive projected-after ${projectedAfterObserved} is >= threshold ${settings.autoThresholdTokens} `
+      + `BUT the baseline is provider-reported usage (resets post-compaction), `
+      + `so we PROCEED with the compaction attempt regardless. The downstream `
+      + `shrink-gate + blank-cooldown still protect against repeat no-ops.`
+    )
   }
 
   // DEAD-LOOP GUARD — BLANK-RESULT SHORT-CIRCUIT. If a PRIOR threshold-gated
@@ -418,20 +563,21 @@ async function __forceCompactIfNeededBody(ctx, agent, signal, mode) {
     return false
   }
 
-  // At or above the threshold: do NOT request the model. Compact the earliest
-  // `autoEarliestRatio` of the conversation instead; the loop retries the step
-  // against the shrunken context.
+  // At or above the threshold: do NOT request the model. Retain the latest
+  // `retainLatestTokens` of the surface VERBATIM, and send everything before
+  // that cutoff (the head) as ONE BATCH to the LLM summarizer. The loop retries
+  // the step against the shrunken context (retained tail unchanged).
   ctx.logger.info(
     `[force-compact] ${session.id}: context ~${total} tokens >= threshold ${settings.autoThresholdTokens}; `
-    + `rejecting the model request and compacting the earliest ${settings.autoEarliestRatio}`,
+    + `rejecting the model request and compacting the head while retaining the latest ~${settings.retainLatestTokens} tokens`,
   )
-  const committed = await compactEarliestRatio(ctx, agent, signal, settings.autoEarliestRatio, mode)
+  const committed = await compactRetainingLatest(ctx, agent, signal, mode)
   if (!committed) {
     // BLANK OUTCOME — record a cooldown HIGH-WATER MARK at this token count so
     // subsequent steps at (roughly) the same total stop hammering. CLEARED
     // automatically once the session genuinely grows (see
     // consultCompactCooldown) or a compaction finally commits (see
-    // compactEarliestRatio).
+    // compactRetainingLatest).
     markCompactCooldown(session.id, total, 'blank/unchanged summary at threshold')
     ctx.logger.debug(`[force-compact] ${session.id}: threshold-gate compaction came back BLANK — recorded a compaction cooldown at ~${total} tokens (auto-gate will pause here until context grows). Letting the request proceed.`)
   } else {

@@ -24,9 +24,9 @@
 - **`agent/pre-step`** —— 每个模型步骤之前的 Waterfall。通过 `tokenMeter` 服务
   读取会话**上下文总 tokens 数**；当其**达到或超过** `autoThresholdTokens` 时，
   返回 `{ kind: 'reject' }` **不发起模型请求**，并通过 compaction 服务的
-  `compactRegion`（经 `ctx.get('compaction')` 实时读取）从头压缩最早
-  `autoEarliestRatio` 的对话（将该区间浓缩为一个摘要节点，让循环以更小的
-  上下文重试）。
+  `compactRegion`（经 `ctx.get('compaction')` 实时读取）**保留最新的
+  `retainLatestTokens` 个 token 逐字不变**，并将其余**头段**一次性浓缩为一个摘要节点，
+  让循环以更小的上下文重试。
 - **`session/flush`** —— 一个被等待（awaited）的 `parallel` 持久化检查点。检查点
   会等待所有监听器完成，因此压缩在调用方继续之前就已结束，摘要保证落盘。
 - **`/force-compact`** —— 通过 `/` 选择执行的斜杠命令，强制压缩该 Agent 的会话
@@ -34,9 +34,9 @@
   （owner `null`，空闲手动入口，引擎自身区间选择）立即压缩；**繁忙**时
   `compactNow` 被拒绝，handler **插入一个 process-local 强制标记**（JS 内存记录，
   无持久态、无 timer），由 `agent/pre-step` 钩子在下一个模型步骤读取。
-  读到强制标记时，该步骤**跳过 token 阈值门禁**、从头压缩最早
-  `forceEarliestRatio`（`compactRegion`，current-turn owner，可在 mid-turn 执行），
-  并返回 `{ kind: 'reject' }` **不再请求模型**。
+  读到强制标记时，该步骤**跳过 token 阈值门禁**，按 `retainLatestTokens`
+  语义选区（保留最新 N 个 token、头段一次性压缩）并经 `compactRegion`（current-turn owner，可在 mid-turn 执行）执行，并返回 `{ kind: 'reject' }`
+
 - **`agent/status`** —— agent 生命周期迁移监听器。当 agent 转入 `idle`
   （所有轮次结束，含子代理，下一次人为对话之前）且 `turnEndForceCompactionEnabled`
   为 `true` 时，经 `compactNow`（owner `null`，空闲手动入口）压缩会话——使用
@@ -68,7 +68,7 @@ agent/request(payload, next)              # 每次模型请求
 agent/pre-step(payload, next)             # 每个模型步骤之前
     tokenMeter.measure(session).totalTokens >= autoThresholdTokens?
         否  -> next()                      # 让模型请求继续
-        是  -> compactRegion(earliest autoEarliestRatio, signal)   # 强制压缩
+        是  -> compactRegion(head-before-retainLatestTokens, signal)   # 强制压缩
               return { kind: "reject" }    # 本次步骤不请求模型
 
 agent/status({ agent, status })           # agent 生命周期迁移
@@ -115,9 +115,9 @@ dsh web --patch dsh-force-compact/cordis.patch.yml
 | 键 | 类型 | 默认值 | 作用 |
 | --- | --- | --- | --- |
 | `disableThinking` | `boolean` | `true` | 为 `true` 时，**每次模型请求**都携带 `reasoningEffort: 'off'`，LLM 适配器将其映射为 `thinking: { type: 'disabled' }`——即请求时关闭提供方的思考/推理。同样作用于插件自己的摘要调用。 |
-| `autoThresholdTokens` | `number` | `80000` | 强制压缩触发阈值（单位 tokens）。**在请求模型前**，通过 `tokenMeter` 测量会话上下文总 tokens 数；当其**达到或超过**该值时，**不请求模型**，而是强制执行一次强制压缩。`session/flush` 检查点路径也把它作为触发门禁。 |
-| `autoEarliestRatio` | `number` | `0.3` | **自动压缩最早对话比例**——`agent/pre-step` 阈值门禁触发时，按 `tokenMeter` 测量的会话总 tokens 的该比例，从头累计 tokens 至预算（`totalTokens * ratio`）后截断（末端对齐 `user/message` 边界），压缩该区间。 |
-| `forceEarliestRatio` | `number` | `0.5` | **强制压缩最早对话比例**——`/force-compact` 命令在 Agent **繁忙**时排队强制标记，由 `agent/pre-step` 钩子（`compactRegion`）在下一个模型步骤按会话总 tokens 的该比例从头截断压缩（命令本身在空闲时经 `compactNow` 用引擎自身区间选择压缩，不使用该比例）。 |
+| `autoThresholdTokens` | `number`（≥ 32000） | `32000` | 自动压缩触发阈值（单位 tokens）。**在请求模型前**，通过 `tokenMeter` 测量会话上下文总 tokens 数；当其**达到或超过**该值时，**不请求模型**，而是强制执行一次压缩。`session/flush` 检查点路径也把它作为触发门禁。**下限 32000**：低于 32000 的值读取时自动抬升至 32000。 |
+| `retainLatestTokens` | positive int（≥ 8000） | `8000` | **保留最新上下文的绝对 token 数**——`agent/pre-step` 阈值门禁或 `/force-compact` 强制标记触发时，从会话**最新条目**起，按官方 `tokenMeter` 的逐节点计数**反向**累加 token，直到 ≥ 该值**停止**；该截点之前的**所有条目一次性**发往大模型做摘要（原条目被遮蔽/跳过），保留段逐字不变。**下限 8000**：低于 8000 的值读取时自动抬升至 8000。
+| ~~`forceEarliestRatio`~~ | — | — | *已移除。* 强制标记路径现同样使用上方 `retainLatestTokens`（见上行），不再单独保留一个比例参数。 |
 | `turnEndForceCompactionEnabled` | `boolean` | `true` | **是否开启一轮结束强制压缩**——为 `true` 时，agent 转入 `idle`（所有轮次结束，含子代理，下一次人为对话之前）时经 `compactNow`（引擎自身区间选择）强制执行一轮结束压缩。 |
 
 `$DSH_HOME/settings.yaml` 示例：
@@ -125,9 +125,8 @@ dsh web --patch dsh-force-compact/cordis.patch.yml
 ```yaml
 falling-ts-force-compact:
   disableThinking: true
-  autoThresholdTokens: 80000
-  autoEarliestRatio: 0.3
-  forceEarliestRatio: 0.5
+  autoThresholdTokens: 32000
+  retainLatestTokens: 8000
   turnEndForceCompactionEnabled: true
 ```
 
@@ -141,8 +140,8 @@ falling-ts-force-compact:
   flush 触发时 `Agent` 已被注销，插件打印 `no live agent … — skipping` 并跳过
   该检查点。`agent/*` Waterfall 的 payload 直接携带 `Agent`，无需 `agents` 查找。
 - **可选依赖：** `settings` 服务。不存在时，参数回退到默认值（`disableThinking:
-  true`、`autoThresholdTokens: 80000`、`autoEarliestRatio: 0.3`、
-  `forceEarliestRatio: 0.5`、`turnEndForceCompactionEnabled: true`）。
+  true`、`autoThresholdTokens: 32000`、`retainLatestTokens: 8000`、
+  `turnEndForceCompactionEnabled: true`）。
 - **可选依赖：** `tokenMeter` 服务。供 `agent/pre-step` 阈值门禁使用；不存在时，
   门禁回退到对会话 surface 内容的粗略字符估算。
 - **每次请求读取设置：** 两个参数都**每次模型请求**读取
@@ -164,7 +163,7 @@ falling-ts-force-compact:
   则让请求按原样继续，而非循环。
 - `idle` 与 `/force-compact` 路径使用 `compactNow`（引擎的空闲手动入口），其
   区间选择是引擎自身的（基于 `retainTokens`），而非插件可调比例。插件可调比例
-  （`autoEarliestRatio`、`forceEarliestRatio`）由 `agent/pre-step` 钩子
+  （`retainLatestTokens` 驱动 `agent/pre-step` 钩子
   （current-turn owner `compactRegion`）遵守。
 - 不注册任何 client/browser UI；插件是纯 Host 插件。参数可通过
   `falling-ts-force-compact` 设置命名空间调参（未来某个动态 client 插件可读取它

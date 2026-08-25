@@ -2,7 +2,7 @@
  * dsh-force-compact settings — the "强制压缩配置" (Force-Compact Configuration)
  * surface.
  *
- * Nine user-tunable parameters are registered under the `falling-ts-force-compact`
+ * User-tunable parameters are registered under the `falling-ts-force-compact`
  * settings namespace so the harness settings panel can expose and persist them
  * (the `falling-ts-` prefix prevents collisions with other plugins' keys):
  *
@@ -10,16 +10,23 @@
  *   compaction summarization request carries `reasoningEffort: 'off'`, which
  *   the LLM adapter maps to `thinking: { type: 'disabled' }` — i.e. the
  *   provider's thinking/reasoning is switched off for the summarization call.
- * - `autoThresholdTokens` (number, default `131000`): the automatic
- *   compaction trigger threshold in tokens. Compaction runs only when the
- *   session's estimated total context is at least this many tokens; below it,
- *   the checkpoint is skipped.
- * - `autoEarliestRatio` (number 0.01..1, default `0.3`): the fraction of the
- *   session's surface history the automatic path compacts from the **head**
- *   (the oldest `autoEarliestRatio` of the conversation).
- * - `forceEarliestRatio` (number 0.01..1, default `0.5`): the fraction of the
- *   session's surface history the `/force-compact` command compacts from the
- *   **head**.
+ * - `autoThresholdTokens` (positive integer, default `32000`, floor `32000`):
+ *   the automatic compaction trigger threshold in tokens. Compaction runs only
+ *   when the session's estimated total context is at least this many tokens;
+ *   below it, the checkpoint is skipped. Stored values BELOW the floor are
+ *   coerced UP to it at read time (and the schema rejects sub-floor drafts).
+ * - `retainLatestTokens` (positive integer, default `8000`, floor `8000`): the
+ *   ABSOLUTE TOKEN COUNT retained at the LATEST end of the session's surface
+ *   when an auto or forced compaction fires. Starting from the newest surface
+ *   node and walking BACKWARD (latest → oldest) using the official
+ *   `tokenMeter`'s per-node token prices, node tokens accumulate until the
+ *   running sum
+ *   REACHES OR EXCEEDS this budget; everything before that cutoff forms the
+ *   head-anchored region compacted into a single summary node in one LLM call
+ *   (the original entries of the compacted span become shadowed / skipped in
+ *   derived history). Replaces the former `autoEarliestRatio` /
+ *   `forceEarliestRatio` percentage knobs with a fixed retention target
+ *   independent of the (possibly usage-inflated) `totalTokens` denominator.
  * - `turnEndForceCompactionEnabled` (boolean, default `true`): whether a turn-end
  *   forced compaction runs when the agent transitions to `idle` — compaction
  *   goes through the engine's idle manual entry (`compactNow`), which uses its
@@ -47,11 +54,12 @@
  *   `user/message` shadowing a head-anchored span, own shrink gate). Setting
  *   this to `false` disables that fallback so ONLY the official backend is
  *   attempted.
- * - `maxSummaryTokens` (positive integer, default `2400`): the `maxTokens`
- *   bound applied to the plugin's OWN summarization LLM call — a cap on the
- *   summary length. Combined with the shrink gate (the summary must be
- *   strictly smaller than the span it replaces), this prevents runaway
+ * - `maxSummaryTokens` (positive integer, default `4096`, floor `4096`): the
+ *   `maxTokens` bound applied to the plugin's OWN summarization LLM call — a
+ *   cap on the summary length. Combined with the shrink gate (the summary must
+ *   be strictly smaller than the span it replaces), this prevents runaway
  *   summarizer outputs from ballooning past the region being condensed.
+ *   Stored values below the floor are coerced up to it at read time.
  *
  * The namespace is registered against the `settings` service when one is
  * mounted. The schema is BUILT BEST-EFFORT through `@deepseek-ai/schemastery`:
@@ -101,14 +109,13 @@ export const COMPACT_MODE_GLOBAL = 'global'
 export const COMPACT_MODES = [COMPACT_MODE_REALM, COMPACT_MODE_GLOBAL]
 
 /**
- * Composition defaults for the nine parameters. These are the `base` layer the
+ * Composition defaults for the parameters. These are the `base` layer the
  * settings namespace resolves over, so a field the user has not overridden
  * resolves to these values.
  * @type {Readonly<{
  *   disableThinking: boolean,
  *   autoThresholdTokens: number,
- *   autoEarliestRatio: number,
- *   forceEarliestRatio: number,
+ *   retainLatestTokens: number,
  *   turnEndForceCompactionEnabled: boolean,
  *   debug: boolean,
  *   logFile: string,
@@ -120,11 +127,38 @@ export const COMPACT_MODES = [COMPACT_MODE_REALM, COMPACT_MODE_GLOBAL]
 /** Default debug-log destination: the shared user `$DSH_HOME/logs/` dir. */
 export const DEFAULT_LOG_FILE = '~/\.dsh/logs/dsh-force-compact.log'.replace('\\', '/')
 
+/**
+ * Floor applied to the three token-scale parameters on EVERY read. Stored values
+ * BELOW the floor are coerced UP to it (rather than rejected), so a hand-edited
+ * settings.yaml with an out-of-band value still yields a legal runtime setting.
+ * The web form mirrors these floors as input constraints; the server-side clamp
+ * is authoritative in any race (e.g. a stale draft written by a different client
+ * while the form was open).
+ * @type {Readonly<{
+ *   autoThresholdTokens: number,
+ *   retainLatestTokens: number,
+ *   maxSummaryTokens: number,
+ * }>}
+ */
+export const MIN_TOKEN_SCALES = Object.freeze({
+  autoThresholdTokens: 32000,
+  retainLatestTokens: 8000,
+  maxSummaryTokens: 4096,
+})
+
 export const DEFAULTS = Object.freeze({
   disableThinking: true,
-  autoThresholdTokens: 131000,
-  autoEarliestRatio: 0.3,
-  forceEarliestRatio: 0.5,
+  autoThresholdTokens: 32000,
+  // Absolute TOKEN COUNT retained at the LATEST end of the surface when an
+  // auto / forced compaction fires. Starting from the newest surface node and
+  // walking backward, node tokens (from the official `tokenMeter` per-node
+  // prices) accumulate until the running sum REACHES OR EXCEEDS this budget;
+  // everything BEFORE that cutoff forms the head-anchored region compacted
+  // into a single summary node in one summarizer call. Replaces the former
+  // `autoEarliestRatio` / `forceEarliestRatio` percentage knobs with a fixed,
+  // predictable retention target independent of the (potentially
+  // usage-inflated) `totalTokens` denominator.
+  retainLatestTokens: 8000,
   turnEndForceCompactionEnabled: true,
   debug: true,
   logFile: DEFAULT_LOG_FILE,
@@ -138,7 +172,19 @@ export const DEFAULTS = Object.freeze({
   // the plugin's own summarization LLM call). Prevents runaway summaries when
   // the shadowed span is large; the shrink gate independently ensures the
   // committed summary is smaller than the span it replaces.
-  maxSummaryTokens: 2400,
+  maxSummaryTokens: 4096,
+   // Ceiling on the NUMBER OF SURFACE NODES one compaction region may span
+   // (positional, counted from the head of the ordered surface). When the
+   // token-budget-driven cutoff point lands beyond this many nodes —
+   // normal for a large `autoEarliestRatio` such as 0.7 on a long tool-heavy
+   // conversation — the region is CLAMPED DOWN to the largest head-aligned
+   // prefix under this cap that ends on a `user/message` boundary. Sized
+   // safely under the builtin engine's 128-message replay cap (a region of N
+   // surface nodes projects at most N messages, so N < 128 keeps the projected
+   // message count within the cap), guaranteeing a COMMISIBLE region on every
+   // threshold trip so the auto-gate never livelocks. Successive gates chip the
+   // head away until the session settles below the threshold.
+   maxRegionNodes: 96,
 })
 
 /**
@@ -149,8 +195,7 @@ export const DEFAULTS = Object.freeze({
  * @returns {Promise<{
  *   disableThinking: boolean,
  *   autoThresholdTokens: number,
- *   autoEarliestRatio: number,
- *   forceEarliestRatio: number,
+ *   retainLatestTokens: number,
  *   turnEndForceCompactionEnabled: boolean,
  *   debug: boolean,
  *   logFile: string,
@@ -187,17 +232,19 @@ async function __readSettingsBody(ctx) {
     (typeof section[field] === 'boolean' ? section[field] : fallback)
   const asPositiveInt = (field, fallback) =>
     (Number.isFinite(section[field]) && section[field] > 0 ? section[field] : fallback)
-  const asRatio = (field, fallback) =>
-    (Number.isFinite(section[field]) && section[field] > 0 && section[field] <= 1 ? section[field] : fallback)
+  // Token-scale parameter: parse + clamp up to the published floor (below-floor
+  // values RESOLVE to the floor rather than being rejected).
+  const asScaled = (field, floor) => {
+    const v = asPositiveInt(field, DEFAULTS[field])
+    return Number.isFinite(v) && v < floor ? floor : v
+  }
   const disableThinking = asBool('disableThinking', DEFAULTS.disableThinking)
-  const autoThresholdTokens = asPositiveInt('autoThresholdTokens', DEFAULTS.autoThresholdTokens)
-  const autoEarliestRatio = asRatio('autoEarliestRatio', DEFAULTS.autoEarliestRatio)
-  const forceEarliestRatio = asRatio('forceEarliestRatio', DEFAULTS.forceEarliestRatio)
+  const autoThresholdTokens = asScaled('autoThresholdTokens', MIN_TOKEN_SCALES.autoThresholdTokens)
+  const retainLatestTokens = asScaled('retainLatestTokens', MIN_TOKEN_SCALES.retainLatestTokens)
   const turnEndForceCompactionEnabled = asBool('turnEndForceCompactionEnabled', DEFAULTS.turnEndForceCompactionEnabled)
   const debug = asBool('debug', DEFAULTS.debug)
   const logFile = (typeof section.logFile === 'string' ? section.logFile : DEFAULTS.logFile)
-  const rawMode = (typeof section.compactionMode === 'string' && section.compactionMode.length > 0
-    ? section.compactionMode.toLowerCase()
+  const rawMode = (typeof section.compactionMode === 'string' ? section.compactionMode.toLowerCase()
     : DEFAULTS.compactionMode)
   const compactionMode = COMPACT_MODES.includes(rawMode) ? rawMode : DEFAULTS.compactionMode
   // Builtin-engine gate: absent / non-boolean stored values treat the field as
@@ -206,12 +253,11 @@ async function __readSettingsBody(ctx) {
   const builtinEnabled = (typeof section.builtinEnabled === 'boolean'
     ? section.builtinEnabled
     : DEFAULTS.builtinEnabled)
-  const maxSummaryTokens = asPositiveInt('maxSummaryTokens', DEFAULTS.maxSummaryTokens)
+  const maxSummaryTokens = asScaled('maxSummaryTokens', MIN_TOKEN_SCALES.maxSummaryTokens)
   return {
     disableThinking,
     autoThresholdTokens,
-    autoEarliestRatio,
-    forceEarliestRatio,
+    retainLatestTokens,
     turnEndForceCompactionEnabled,
     debug,
     logFile,
@@ -338,12 +384,25 @@ export async function buildSchema() {
     if (z === undefined) return null
     const schema = z.object({
       disableThinking: z.boolean().default(DEFAULTS.disableThinking),
-      // `step(1)` constrains to whole numbers (schemastery has no `.int()`).
-      autoThresholdTokens: z.number().step(1).min(1).default(DEFAULTS.autoThresholdTokens),
-      // A "ratio" is a fraction of the session's surface history, in (0, 1].
-      // `step(0.01)` keeps values to two decimals (schemastery has no `.int()`).
-      autoEarliestRatio: z.number().step(0.01).min(0.01).max(1).default(DEFAULTS.autoEarliestRatio),
-      forceEarliestRatio: z.number().step(0.01).min(0.01).max(1).default(DEFAULTS.forceEarliestRatio),
+      // Minimal chain: `.step()` and `.min()` were ADDED this pass and are
+      // exactly what broke the host's vendored schemastery surface (the
+      // standalone-node build resolves these fine but the host's z doesn't
+      // expose them as chainable). Fall back to a bare `z.number().default(…)`
+      // — the FLOOR IS STILL ENFORCED IN `readSettings` (asScaled clamps
+      // stored values BELOW the floor UP TO the floor before they're surfaced),
+      // and the web FORM enforces its own minimum at the input level
+      // (`useDraftNumberClamped`). So even though the schema carries no
+      // machine-checked lower bound, a hand-edited settings.yaml holding a
+      // sub-floor value still RESOLVES to the legal floor at read time, and
+      // the form refuses to persist a sub-floor draft. Documented trade-off:
+      // the schema is descriptive here; the floor is behavioral.
+      autoThresholdTokens: z.number().default(DEFAULTS.autoThresholdTokens),
+      // ABSOLUTE TOKEN COUNT retained at the latest end of the surface when an
+      // auto / forced compaction fires (see the `DEFAULTS` comment for the full
+      // semantics). `step(1)` constrains to whole tokens (schemastery has no
+      // `.int()`); `min(1)` guards the degenerate 0 case (which clamps to 1
+      // node minimum retained anyway).
+      retainLatestTokens: z.number().default(DEFAULTS.retainLatestTokens),
       turnEndForceCompactionEnabled: z.boolean().default(DEFAULTS.turnEndForceCompactionEnabled),
       // Debug-log gate, on by default; set false for production deployments.
       debug: z.boolean().default(DEFAULTS.debug),
@@ -369,7 +428,7 @@ export async function buildSchema() {
       // runaway summaries; combined with the shrink gate (the summary must be
       // strictly smaller than the span it replaces) this keeps transactions
       // bounded while ensuring compression is always net-negative.
-      maxSummaryTokens: z.number().step(1).min(256).max(200000).default(DEFAULTS.maxSummaryTokens),
+      maxSummaryTokens: z.number().default(DEFAULTS.maxSummaryTokens),
         liveUi: z.any(), // TRANSIENT UI MESSENGER (core/ui-signal.js): host-written { phase,text,color }. z.any() used because the vendored schemastery exposes object/any/string/number/boolean/array only (no record/unknown/chained .optional()); z.record(z.unknown()).optional() throws there and aborts the whole z.object(...), stranding the settings panel on "loading". Absence-by-default is inherent (no .default). readSettings ignores it — not a user preference.
     })
     return schema

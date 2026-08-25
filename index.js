@@ -12,7 +12,9 @@
  * - **`agent/pre-step`** (a Waterfall before each model step) — reads the
  *   session's total context tokens; when they reach the `autoThresholdTokens`
  *   threshold the proposed step is rejected (the model request is NOT made)
- *   and the **earliest `autoEarliestRatio`** of the conversation's tokens is
+ *   and the **latest `retainLatestTokens` of the conversation's tokens** is
+ *   RETAINED VERBATIM (everything before that cutoff is compacted in one
+ *   batch into a single summary node)
  *   compacted via the `compaction` service's `compactRegion` instead.
  *
  * The plugin also keeps the `session/flush` durability checkpoint: a

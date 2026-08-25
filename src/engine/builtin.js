@@ -291,7 +291,8 @@ async function runTransaction(ctx, agent, session, region, signal, settings) {
       `${session.id}: builtin compaction REFUSED — region projects ${messages.length} messages `
       + `(span seq ${region.start}..${region.end}), exceeding the ${MAX_REPLAY_MESSAGES}-message replay cap; `
       + `a summarization of that size is unserviceable on a local model endpoint. Skipping (no lock opened, `
-      + `no LLM call made). Lower the auto-region extent (autoEarliestRatio) to compact smaller windows.`,
+      + `no LLM call made). Raise \`retainLatestTokens\` so less of the head is compacted, `
+      + `or increase \`maxRegionNodes\` / the built-in engine's replay cap.`,
     )
     return null
   }
@@ -332,7 +333,9 @@ async function runTransaction(ctx, agent, session, region, signal, settings) {
     const input = {
       messages,
       ...(prefix.system !== undefined ? { system: prefix.system } : {}),
-      ...(prefix.tools !== undefined ? { tools: prefix.tools } : {}),
+      // DIAGNOSTIC TOGGLE: temporarily omit the `tools` prefix to bisect the
+      // provider `reading 'kind'` crash (suspect: the harness-internal tool
+      // schema objects fed to options.tools). Revert to `...(prefix.tools !== undefined ? { tools: prefix.tools } : {})` once root-caused.
     }
     // `summarize` NEVER throws and resolves to a discriminated `{ status, ... }`
     // object (plus `reason` on non-ok outcomes). Branch defensively:
@@ -537,14 +540,49 @@ function estimateSurfaceTokens(session) {
 }
 
 /**
- * Select the plugin's head-anchored compactable region using the configured
- * `autoEarliestRatio` (default 0.5) against the session's estimated surface
- * tokens, snapping the end to a `user/message` boundary so the replacement is
- * tool-pairing safe. Reuses the module's own selector.
+ * Select the plugin's head-anchored compactable region given a session.
+ *
+ * Semantics (new `retainLatestTokens` world): keep the latest
+ * `settings.retainLatestTokens` tokens of the surface VERBATIM; everything
+ * before that cutoff forms the head-anchored region compacted into a single
+ * summary node. The head-side token budget is (surfaceSum − retain), so we
+ * estimate the surface token sum with the char heuristic and subtract the
+ * retention budget — passing the resulting absolute head budget to the
+ * legacy selector (which walks from the head accumulating until it reaches
+ * the budget). Snaps the end to a `user/message` boundary for
+ * tool-pairing safety.
+ *
+ * Edge cases: if the estimated surface sum is smaller than the retention
+ * budget (very short sessions), the head budget goes negative — we clamp to
+ * zero and the selector trivially produces no region (returns null).
  */
 function selectHeadAnchoredRegion(settings, session) {
-  const ratio = clamp01(settings.autoEarliestRatio, 0.5)
-  return selectEarliestByTokens(session, ratio, undefined)
+  const surfaceSum = estimateSurfaceTokensLocal(session)
+  const retainBudget = Number.isFinite(settings.retainLatestTokens)
+    ? Math.max(0, Math.round(settings.retainLatestTokens))
+    : 0
+  const headBudget = Math.max(0, surfaceSum - retainBudget)
+  if (headBudget <= 0) return null
+  return selectEarliestByTokens(session, headBudget, undefined)
+}
+
+/** Local surface-sum estimator (module-private copy of the char heuristic). */
+function estimateSurfaceTokensLocal(session) {
+  const events = (session && Array.isArray(session.events)) ? session.events : []
+  let chars = 0
+  for (const event of events) {
+    if (event === null || typeof event !== 'object') continue
+    const data = (event.data && typeof event.data === 'object') ? event.data : {}
+    let content
+    if (event.type === 'user/message') content = data.content
+    else if (event.type === 'assistant/message') content = (data.message && data.message.content !== undefined) ? data.message.content : undefined
+    else if (event.type === 'tool/result') content = (data.message && data.message.content !== undefined) ? data.message.content : undefined
+    if (content === undefined) continue
+    for (const block of Array.isArray(content) ? content : []) {
+      if (block && typeof block === 'object' && typeof block.text === 'string') chars += block.text.length
+    }
+  }
+  return Math.ceil(chars / 4)
 }
 
 /**

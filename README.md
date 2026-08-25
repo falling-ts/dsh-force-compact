@@ -30,8 +30,9 @@ requirement), plus the durability checkpoint:
 - **`agent/pre-step`** — a Waterfall before each model step. It reads the
   session's **total context tokens** through the `tokenMeter` service. When the
   total is **>= `autoThresholdTokens`**, it returns `{ kind: 'reject' }` so the
-  model request is **not** made, and compacts the **earliest `autoEarliestRatio`**
-  of the conversation's tokens via the `compaction` service's `compactRegion`
+  model request is **not** made, and retains the **latest `retainLatestTokens`**
+  of the conversation's tokens verbatim while sending everything before that
+  cutoff to the `compaction` service's `compactRegion`
   (read live via `ctx.get('compaction')`, which condenses that span into one
    summary node and lets the loop retry with a smaller context).
 - **`session/flush`** — an awaited `parallel` durability checkpoint. Because
@@ -45,7 +46,7 @@ requirement), plus the durability checkpoint:
   inserts a **process-local force flag** (a JS memory record — no durable state,
   no timer) that the `agent/pre-step` hook reads at the next model step. When
   the flag is present, that step **skips the token threshold**, force-compacts
-  the earliest `forceEarliestRatio` (via `compactRegion`, the current-turn owner
+  a `retainLatestTokens` window (via `compactRegion`, the current-turn owner
   that works mid-turn), and returns `{ kind: 'reject' }` so the model request
   is **not** made.
 
@@ -83,7 +84,7 @@ agent/request(payload, next)              # every model request
 agent/pre-step(payload, next)             # before each model step
     tokenMeter.measure(session).totalTokens >= autoThresholdTokens?
         no  -> next()                      # let the model request proceed
-        yes -> compactRegion(earliest autoEarliestRatio, signal)  # force compact
+        yes -> compactRegion(head-before-retainLatestTokens, signal)  # force compact
               return { kind: "reject" }    # NO model request this step
 
 agent/status({ agent, status })           # agent lifecycle transition
@@ -132,9 +133,9 @@ with other plugins' keys):
 | key | type | default | effect |
 | --- | --- | --- | --- |
 | `disableThinking` | `boolean` | `true` | when `true`, **every model request** carries `reasoningEffort: 'off'`, which the LLM adapter maps to `thinking: { type: 'disabled' }` — the provider's thinking/reasoning is switched off for the request. Also applies to the plugin's own summarization calls. |
-| `autoThresholdTokens` | `number` | `80000` | the forced-compaction trigger threshold in tokens. **Before a model request**, the session's total context tokens (via `tokenMeter`) are measured; when they are **>= this value**, the request is rejected and a forced compaction runs instead. The `session/flush` checkpoint path also uses this threshold as its trigger gate. |
-| `autoEarliestRatio` | `number` | `0.3` | **auto compact-earliest-conversation ratio** — the fraction of the session's **total tokens** (via `tokenMeter`) the `agent/pre-step` threshold gate compacts from the **head**. Walks surface events from the head, accumulating per-event token estimates until the budget (`totalTokens * ratio`) is met, then snaps the span end to the next `user/message` boundary. |
-| `forceEarliestRatio` | `number` | `0.5` | **force compact-earliest-conversation ratio** — the fraction of the session's **total tokens** the `agent/pre-step` hook compacts from the **head** when a `/force-compact` force flag is present (the command itself compacts through `compactNow`'s engine range selection when idle, and queues the force flag when busy). |
+| `autoThresholdTokens` | `number` (≥ 32000) | `32000` | the auto-compaction trigger threshold in tokens. **Before a model request**, the session's total context tokens (via `tokenMeter`) are measured; when they are **>= this value**, the request is rejected and a forced compaction runs instead. The `session/flush` checkpoint path also uses this threshold as its trigger gate. **Floor 32000**: stored values below 32000 are clamped back up at read time. |
+| `retainLatestTokens` | positive int (≥ 8000) | `8000` | **latest context retained, in absolute tokens** — starting from the LATEST surface node, per-node tokens (via the official `tokenMeter` prices) accumulate BACKWARD until the running sum reaches OR exceeds this budget; everything before that cutoff is sent to the summarizer as one batch (its entries become shadowed/skipped in derived history), and the retained tail stays verbatim. Used by both the auto-threshold gate and the `/force-compact` forced-flag path. **Floor 8000**: stored values below 8000 are clamped back up at read time. |
+| ~~`forceEarliestRatio`~~ | — | — | *Removed.* The forced-flag path now uses `retainLatestTokens` like the auto path (see above). |
 | `turnEndForceCompactionEnabled` | `boolean` | `true` | **enable turn-end force compaction** — when `true`, a forced compaction runs when the agent transitions to `idle` (all turns done, including sub-agents, before the next human turn) through `compactNow` (the engine's idle manual entry, whose range selection is the engine's own — there is no turn-end ratio parameter). |
 
 Example `$DSH_HOME/settings.yaml`:
@@ -142,9 +143,8 @@ Example `$DSH_HOME/settings.yaml`:
 ```yaml
 falling-ts-force-compact:
   disableThinking: true
-  autoThresholdTokens: 80000
-  autoEarliestRatio: 0.3
-  forceEarliestRatio: 0.5
+  autoThresholdTokens: 32000
+  retainLatestTokens: 8000
   turnEndForceCompactionEnabled: true
 ```
 
@@ -165,7 +165,7 @@ a hard dependency.
   Waterfalls receive the `Agent` in their payload and need no `agents` lookup.
 - **Optional dependency:** the `settings` service. When absent, the parameters
   resolve to their defaults (`disableThinking: true`, `autoThresholdTokens:
-  80000`, `autoEarliestRatio: 0.3`, `forceEarliestRatio: 0.5`,
+  32000`, `retainLatestTokens: 8000`,
   `turnEndForceCompactionEnabled: true`).
 - **Optional dependency:** the `tokenMeter` service. Used by the `agent/pre-step`
   threshold gate; when absent, the gate falls back to a coarse character-based
@@ -193,7 +193,7 @@ a hard dependency.
 - The `idle` and `/force-compact` paths use `compactNow` (the engine's idle
   manual entry), whose range selection is the engine's own (`retainTokens`-based)
   rather than a plugin-tunable ratio. The plugin-tunable ratios
-  (`autoEarliestRatio`, `forceEarliestRatio`) are honored by the `agent/pre-step`
+  `retainLatestTokens` drives the region chosen by the `agent/pre-step`
   hook (the current-turn owner `compactRegion`).
 - No client/browser UI is registered; the plugin is Host-only. The parameters
   are tunable through the `falling-ts-force-compact` settings namespace (a
