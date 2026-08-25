@@ -618,17 +618,58 @@ window.__ModuleLoader__.load({
      * 定位策略：全页面可能存在多个 role=status 节点（多标签/多会话并存时,每个
      * 打开的 running 会话各有一个 TurnStatus）。我们取**全部**命中的节点逐一贴
      * 上——装饰性的、幂等的、零侵入（不改 className/结构,只动第一个文本子节点
-     * 的 nodeValue + 父节点的 inline color）。找不到节点则静默 no-op（当前没有
+     * 的 nodeValue + 父节点的相位标记属性）。找不到节点则静默 no-op（当前没有
      * running 会话 → 没有指示器 → 无可贴目标,这是预期行为而非错误）。
+     *
+     * 着色原理：官方 `TurnStatus` 的可见颜色来自 shimmer——
+     * `background: linear-gradient` + `background-clip:text` +
+     * `color/-webkit-text-fill-color: transparent`（ChatView.module.css
+     * .turnStatus）。因此 **inline `style.color` 对它无效**（填充恒为透明,
+     * 看到的是背景渐变,不是 color）。唯一可行的覆盖方式是一条高于普通类规则
+     * 的选择器（`[role="status"][data-fc-phase]` + `!important`）同时中和四个
+     * 属性：`background:none`（撤掉渐变本体）+ `animation:none`（停掉扫光,
+     * prefers-reduced-motion 分支下两者皆静态,一并覆盖）+ `color` /
+     * `-webkit-text-fill-color` 设为相位色。样式表经 ensurePhaseStyleSheet
+     * 按需注入**一次**（head 下首个 <style>,key 前缀 `dsh-fc-` 保证重复插入
+     * 时浏览器按内容复用而不产生重复规则）。选择器以 `data-fc-phase="<phase>"`
+     * 精确匹配相位值（非存在性通配）,使不同相位的多个 status 节点各自命中各自
+     * 的规则、互不干扰；phase 消失（React 重建节点、新 TurnStatus 挂载）后
+     * 属性不复存在 → 规则不再命中 → 官方 shimmer 自然恢复。
      *
      * @param liveUi - 宿主写入的 { phase, text, color }；缺省/null 时 no-op。
      */
+    // 当前注入规则所针对的相位与颜色（闭包内单例，随每次 paintTurnStatus 更新）。
+    let activePhase = "";
+    let activeColor = "";
+    function ensurePhaseStyleSheet(phase, color) {
+      const head = document.head;
+      let styleEl = head.querySelector("style[data-dsh-fc-ui]");
+      if (!styleEl) {
+        styleEl = document.createElement("style");
+        styleEl.setAttribute("data-dsh-fc-ui", "");
+        head.appendChild(styleEl);
+      }
+      // 仅当相位或颜色真正变化时重写规则文本（单次 30µs 级字符串赋值，幂等去抖）。
+      if (phase === activePhase && color === activeColor) return;
+      activePhase = phase;
+      activeColor = color;
+      // 单条规则整体重写：sheet 永远至多一条 fc 规则，文本通道对 CSSOM 最稳健
+      // （不依赖 cssRules 遍历/deleteRule 索引语义），开销可忽略。
+      styleEl.textContent = '[role="status"][data-fc-phase="' + phase + '"{'
+        + "background:none!important;"
+        + "-webkit-background-clip:border!important;background-clip:border!important;"
+        + "-webkit-text-fill-color:" + color + "!important;"
+        + "color:" + color + "!important;"
+        + "animation:none!important}";
+    }
     function paintTurnStatus(liveUi) {
       if (typeof document === "undefined") return;
       if (!liveUi || typeof liveUi.text !== "string" || liveUi.text.length === 0) return;
-      const statusNodes = document.querySelectorAll('[role="status"][aria-live="polite"]');
-      if (statusNodes.length === 0) return; // 没有 running 会话 → 没有 TurnStatus
-      for (const node of statusNodes) {
+      const color = typeof liveUi.color === "string" && liveUi.color !== "" ? liveUi.color : null;
+      const phase = typeof liveUi.phase === "string" && liveUi.phase !== "" ? liveUi.phase : "fc";
+      const nodes = document.querySelectorAll('[role="status"][aria-live="polite"]');
+      if (nodes.length === 0) return; // 没有 running 会话 → 没有 TurnStatus
+      for (const node of nodes) {
         // 第一个文本型子节点（"Deep diving..." 本体；时钟 span 是其后兄弟,不受影响）。
         let textChild = null;
         for (const child of node.childNodes) {
@@ -636,11 +677,8 @@ window.__ModuleLoader__.load({
         }
         if (textChild === null) continue; // 结构不符预期 → 跳过,绝不破坏官方布局
         textChild.nodeValue = liveUi.text;
-        // phase→颜色已在宿主侧算好（working 随机色 / compressing 红 / done 绿）。
-        // 直接设 inline color 即可让 CSS 模块类的 shimmer 动画仍作用于文本填充
-        // （shimmer 用的是 gradient + background-clip:text 的透明填充,与 color 无关;
-        // 但我们仍显式设一次,以防未来 shimmer 样式调整导致底色缺失时仍可辨识相位）。
-        node.style.color = typeof liveUi.color === "string" ? liveUi.color : "";
+        node.setAttribute("data-fc-phase", phase);
+        if (color !== null) ensurePhaseStyleSheet(phase, color);
       }
     }
 
