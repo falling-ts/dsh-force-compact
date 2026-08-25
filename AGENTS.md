@@ -90,6 +90,60 @@ preset 把 `compaction-basic` 挂在了 `- isolate:{compaction:true,…}` 组里
 或服务被显式挂到 host plane），则 `ctx.get('compaction')` 可命中，priority-1 路径
 直接胜出，内置引擎自然不参与——无需改动任何配置。
 
+### Wire 层补丁：面向 llama.cpp 的 `reasoning_effort:"none"`（2026-08 添加）
+
+**背景**：`disableThinking` 在 harness 层表达为 `reasoningEffort:'off'`，经
+DeepSeek 适配器翻译为 wire 字段 `thinking:{type:'disabled'}`。对真·DeepSeek
+API 这是正确的语义，但对 **llama.cpp OpenAI 兼容端点**（本机 :8080 驱动的
+`Qwen3.8-27B-NVFP4-MTP-LOW.gguf` 等本地 GGUF 部署）该字段**不被识别**：
+llama.cpp 的 OAI schema（`server-schema.cpp`）里没有 `thinking` 这个键，OAI
+解析路径也不读取顶层裸 `thinking`（实测于本机 `D:\AI\llama.cpp`），它会被
+原样塞进 `llama_params` 然后被**无声忽略**——结果是 `disableThinking:true`
+在 llama.cpp 上**静默失效**（模型继续思考，没有任何错误暴露）。
+
+llama.cpp 原生支持关闭推理的两种 wire 形态（`server-common.cpp`）：
+- **顶层 `reasoning_effort: "none"`**（1295-1304 行）——最稳，无论模板能力如何
+  都会被解析成 `inputs.enable_thinking = false`；
+- `chat_template_kwargs: { enable_thinking: false }`（1286-1291 行）——依赖
+  模板本身支持 `enable_thinking` 占位符，不如前者鲁棒。
+
+**实现**：`src/hooks/wire-rewrite.js` 提供一个 `llm/stream` Waterfall 监听器
+（挂在 `ctx.llm.stream` 前的单一 LLM 出口缝，参见
+`deepseek-harness/packages/llm/llm/src/index.ts` 的 `llm/stream` 事件）。
+每次出 LLM 调用前，钩子按以下规则做**条件追加**：
+
+| 条件 | 行为 |
+|------|------|
+| `disableThinking` 设置为 `true` **且** `isOpenAiCompatibleTarget(provider, model)` 命中 | 在 `next()` 返回的 options 上做**浅拷贝**，追加 `reasoning_effort: 'none'` 后返回，其余字段保持不动（包括原有的 `thinking` 字段——llama.cpp 容忍未知键，真 DeepSeek API 也会因 `thinking` 已存在而忽略此新增字段）。 |
+| `disableThinking` 缺失 / 为 `false` | `return await next()` 原样转发，零开销短路。 |
+| 目标非 OpenAI 兼容（即真 DeepSeek 部署，`provider` 含 `deepseek` 且 `model` 不以 `.gguf` 结尾） | `return await next()` 原样转发，保留 `thinking:{type:'disabled'}` 的正确语义。 |
+
+**目标识别启发式**（保守，宁可漏判不可误伤）：`isOpenAiCompatibleTarget(provider, model)`
+仅当满足任一条件才返回真：
+- `provider` 字符串（小写化后）**包含** `llama` 子串；
+- `model` 字符串（小写化后）**以** `.gguf` 结尾。
+
+这两条覆盖了本机 :8080 部署（`/v1/models` 实测返回的 `model` 值为
+GGUF 绝对路径，符合第二条）。对未来新变型可在此函数内扩展；漏判的最坏后果
+仅是回到静默失效（而非崩溃），误判（真 DeepSeek 被打上 `reasoning_effort`
+键）因 OpenAI 兼容层对未知顶层字段的容错特性也不会导致请求失败。
+
+**惰性幂等安装**：与 `maybeRegisterCommand` 同套路——`maybeInstallWireRewrite`
+在每个受守卫的监听器（`agent/request` / `agent/pre-step` / `agent/status`
+idle 过渡）首次进入时被调用，内部 `registered` 闩锁保证同一生命周期内至多
+装一次。`apply` 启动期不调用（预设平面晚挂载，启动期强装会与后续 adapter
+注册竞态）。
+
+**为何不用独立 `registerAdapter`**：harness 已把 llama.cpp 流量路由经由
+DeepSeek 适配器（无独立的 llama.cpp 适配器包），再起一份 adapter 会与既有
+注册冲突或被组合顺序掩盖。`llm/stream` 是官方认可的"调整下一次调用序列化
+方式"的拦截缝，不破坏单一 LLM 出口不变量。详见
+`docs/llm-stream-llamacpp-adaptation.md` §7（A/B/C 三方案，此处采用 A）。
+
+**观测**：钩子仅在真正改写时输出一条
+`ctx.logger.debug('[force-compact] llm/stream: appended reasoning_effort="none" for OpenAI-compatible target <provider>/<model>')`，
+供事后核查；不改写路径零日志。
+
 ### 摘要器：深度对齐官方 `compaction-basic`（2026-08 升级）
 
 内置引擎的 `ctx.llm` 摘要调用现已全面对齐官方 `compaction-basic` 的单源实现

@@ -45,6 +45,7 @@ import { forceCompactIfNeeded, thinkingDisabled, dbg } from './src/hooks/guard.j
 import { resolveCompaction } from './src/engine/backend.js'
 import { registerCommand } from './src/hooks/command.js'
 import { handleAgentStatus } from './src/hooks/idle.js'
+import { registerLlmStreamHook } from './src/hooks/wire-rewrite.js'
 
 /** @type {string} the function plugin's display name. */
 export const name = 'force-compact'
@@ -292,6 +293,15 @@ export function apply(ctx) {
   // EVERY guarded listener invokes `maybeRegisterCommand()` as its first
   // action; the first successful attempt settles the latch permanently.
 
+  // The llm/stream wire-rewrite hook (appends `reasoning_effort:"none"` for
+  // OpenAI-compatible targets like :8080 llama.cpp when `disableThinking` is
+  // on). Registered lazily via `maybeInstallWireRewrite` from each guarded
+  // listener below — same defer pattern as the command registration. The
+  // hook lives at `src/hooks/wire-rewrite.js`.
+  const maybeInstallWireRewrite = () => {
+    registerLlmStreamHook(ctx)
+  }
+
   // Hook the core model request: when "disable thinking" is on, every model
   // request carries reasoningEffort: 'off'. Reading the settings here (per
   // request) means a settings.yaml edit is picked up on the next request.
@@ -301,6 +311,7 @@ export function apply(ctx) {
     maybeInstallDebugSink()
     maybeRegisterSettingsNamespace()
     maybeRegisterCommand()
+    maybeInstallWireRewrite()
     const config = await next()
     if (!payload || config === undefined) return config
     if (!(await thinkingDisabled(ctx))) {
@@ -328,6 +339,7 @@ export function apply(ctx) {
     maybeInstallDebugSink()
     maybeRegisterSettingsNamespace()
     maybeRegisterCommand()
+    maybeInstallWireRewrite()
     const agent = payload && payload.agent
     const signal = payload && payload.signal
     if (agent !== undefined && agent !== null && (signal === undefined || !signal.aborted)) {
@@ -358,6 +370,7 @@ export function apply(ctx) {
     // (as the other guarded listeners do) so the first idle transition is what
     // typically settles the `/force-compact` command registration.
     maybeRegisterCommand()
+    maybeInstallWireRewrite()
     // Fire-and-forget: trace listener liveness on the idle transition, read the
     // compactionMode raw (cheap), then hand off to the turn-end handler which
     // locates the per-realm compaction backend via `agent.ctx`.
