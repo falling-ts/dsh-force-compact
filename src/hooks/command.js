@@ -109,7 +109,11 @@ async function __forceCompactCommandBody(ctx, invocation) {
         // messenger can never disturb the actual compaction outcome returned
         // below.
         await publishCompressing(ctx)
-        const result = await backend.compactNow(agent, invocation.signal)
+        // P1 — thread `invocation.commandId` as the 3rd positional arg: the
+        // official `compactNow(agent, signal, commandId)` accepts it directly;
+        // the builtin `compactNow(agent, signal, sourceCommandId, opts)`
+        // absorbs it as `sourceCommandId` (positional widening verified).
+        const result = await backend.compactNow(agent, invocation.signal, invocation.commandId)
         if (result === undefined || result === null) {
           // Persist this diagnosis (WARN level so it survives the default INFO
           // floor AND the `[force-compact]` marker routes it into the plugin's
@@ -147,7 +151,9 @@ async function __forceCompactCommandBody(ctx, invocation) {
         return { kind: 'success', text: `compacted ~${result.shadowedTokenCount ?? '?'} tokens via ${backend?.kind}` }
       } catch (error) {
         // Busy (or otherwise unable) — queue the force flag for the next step.
-        queueForceCompact(session.id)
+        // P1 — carry `invocation.commandId` so the pre-step consumer can echo
+        // it back into the `compaction/*` bracket's `sourceCommandId` field.
+        queueForceCompact(session.id, invocation.commandId)
         const message = error instanceof Error ? error.message : String(error)
         ctx.logger.info(`[force-compact] ${session.id}: ${backend?.kind} said ${message}; queued for the next model step`)
         return {

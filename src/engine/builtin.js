@@ -33,7 +33,7 @@
  * @module @falling-ts/dsh-force-compact/builtin-engine
  */
 
-import { summarize, CHECKPOINT_PREAMBLE, headerPrefix } from './summarizer.js'
+import { summarize, headerPrefix, frameSummary } from './summarizer.js'
 import { selectEarliestByTokens, selectRetainingLatestTokens } from './region.js'
 import { readSettings, DEFAULTS } from '../core/settings.js'
 import { guardFn } from '../core/crashnet.js'
@@ -51,7 +51,7 @@ function emitLoadMarker() {
   if (loadMarkerEmitted) return
   loadMarkerEmitted = true
   try {
-    console.log(`[force-compact] BUILTIN ENGINE LOADED — marker v2026-08-25-official-parity `
+    console.log(`[force-compact] BUILTIN ENGINE LOADED — marker v2026-08-25-p0-p1-port `
       + `(official port active: tool-pairing-ledger boundary selection, validateSurfaceRegion double gate, `
       + `surface-consistency cross-check, official busy-lock semantics, tools prefix RESTORED, `
       + `instruction aligned to official COMPACTION_INSTRUCTION)`)
@@ -115,11 +115,170 @@ const CHARS_PER_TOKEN = 4
  * a FAILED, never-committing compaction every idle tick (the "stuck, stutters
  * every ~5s" symptom). Refusing such a replay outright (return `null`, skip) is
  * strictly better than paying a doomed round-trip repeatedly: it stops the
- * livelock at its source. The cap is generous (128 messages ≈ a substantial but
+ * livelock at its source. The cap is generous (1024 messages ≈ a substantial but
  * bounded window) so legitimate mid-size compactions still proceed; only
  * pathological whole-history replays are refused.
  */
-const MAX_REPLAY_MESSAGES = 128
+const MAX_REPLAY_MESSAGES = 1024
+
+// ---------------------------------------------------------------------------
+// Official-estimator parity helpers (byte-mirrors of
+// `deepseek-harness/packages/llm/token-meter/src/estimate.ts`).
+//
+// WHY THESE EXIST — the shadow-price protocol:
+// `compaction/summary` records `shadowedTokenCount` as the HEURISTIC PRICE OF
+// THE EXACT SURFACE RANGE IT SHADOWS. That figure rides the token-meter
+// surface fold's "shadow-price claim" mechanism: the fold arms a pending claim
+// from the summary event and settles it against the IMMEDIATELY FOLLOWING
+// surface `replace` (delta = checkpoint estimate − claim tokens). Producers
+// are required to price the claimed range under the SAME fixed estimator the
+// fold prices appends with ("The counts are exact by construction"), so a
+// claim priced under a divergent heuristic makes the fold OVER-subtract
+// (undercount) or UNDER-subtract (overcount) the settled total. This port
+// exists precisely so the shadow bill we write equals what the fold expects.
+//
+// Each helper below mirrors the official source line-for-line in plain JS:
+//   • CHAR/BLOCK/ROLE overhead constants and `estimateContent` recursion
+//     (text/reasoning ceil(len/4)+BLOCK; tool-call name+args+BLOCK;
+//     tool-result recurse+BLOCK; unknown block JSON-stringified);
+//   • `estimateHeaderParts` ≙ official `estimateHeader` (system ceil(len/4)+ROLE
+//     when present; tools ceil(JSON len/4)+BLOCK when non-empty);
+//   • `priceSurfaceNode` ≙ official `foldSurface` pricing
+//     (user/user-message → message content; assistant/message → its content;
+//     tool/result → content + ROLE overhead when content present; otherwise 0);
+//   • `priceRegionFromMeasurement` ≙ official `prepareCompaction`'s
+//     `selectedNodes.reduce((total, node) => total + node.tokens, 0)`.
+// ---------------------------------------------------------------------------
+
+const ESTIMATE_BLOCK_OVERHEAD = 4
+const ESTIMATE_ROLE_OVERHEAD = 4
+
+/** Port of official `estimateContent`: recursive block pricing under the fixed density heuristic. */
+function estimateContentBlocks(blocks) {
+  let tokens = 0
+  if (!Array.isArray(blocks)) return tokens
+  for (const block of blocks) {
+    if (block === null || typeof block !== 'object') continue
+    switch (block.type) {
+      case 'text':
+      case 'reasoning':
+        tokens += Math.ceil(String(block.text === undefined || block.text === null ? '' : block.text).length / CHARS_PER_TOKEN) + ESTIMATE_BLOCK_OVERHEAD
+        break
+      case 'tool-call':
+        tokens += Math.ceil(String(block.name === undefined || block.name === null ? '' : block.name).length / CHARS_PER_TOKEN)
+          + Math.ceil(String(block.arguments === undefined || block.arguments === null ? '' : block.arguments).length / CHARS_PER_TOKEN)
+          + ESTIMATE_BLOCK_OVERHEAD
+        break
+      case 'tool-result':
+        tokens += estimateContentBlocks(Array.isArray(block.content) ? block.content : []) + ESTIMATE_BLOCK_OVERHEAD
+        break
+      default: {
+        // Merge-extensible union: unknown block types retain a conservative
+        // structural JSON price (official `default` arm).
+        let json
+        try {
+          json = JSON.stringify(block)
+        } catch {
+          json = ''
+        }
+        tokens += ESTIMATE_BLOCK_OVERHEAD + Math.ceil(json.length / CHARS_PER_TOKEN)
+        break
+      }
+    }
+  }
+  return tokens
+}
+
+/** Port of official `estimateHeader` (system + tools parts), plain-JS tolerant. */
+function estimateHeaderTokens(header) {
+  let total = 0
+  if (header === null || typeof header !== 'object') return total
+  const system = header.system
+  if (typeof system === 'string' && system.length > 0) {
+    total += Math.ceil(system.length / CHARS_PER_TOKEN) + ESTIMATE_ROLE_OVERHEAD
+  }
+  const tools = header.tools
+  if (Array.isArray(tools) && tools.length > 0) {
+    let json
+    try {
+      json = JSON.stringify(tools)
+    } catch {
+      json = ''
+    }
+    total += Math.ceil(json.length / CHARS_PER_TOKEN) + ESTIMATE_BLOCK_OVERHEAD
+  }
+  return total
+}
+
+/**
+ * Port of the official surface-fold per-node pricing (`foldSurface`):
+ *   • `user/message` / `user` → content blocks, NO role framing;
+ *   • `assistant/message` → `data.message.content`, NO role framing;
+ *   • `tool/result` → `data.message.content` + ROLE OVERHEAD when content present;
+ *   • anything else → 0 (and it is not a priced surface node anyway).
+ * All dereferences guarded so a malformed node degrades to 0 rather than throw.
+ */
+function priceSurfaceNode(event) {
+  if (event === null || typeof event !== 'object') return 0
+  const data = (event.data && typeof event.data === 'object') ? event.data : {}
+  const type = event.type
+  if (type === 'user/message' || type === 'user') return estimateContentBlocks(data.content)
+  if (type === 'assistant/message') {
+    const message = (data.message && typeof data.message === 'object') ? data.message : {}
+    return estimateContentBlocks(message.content)
+  }
+  if (type === 'tool/result') {
+    const message = (data.message && typeof data.message === 'object') ? data.message : {}
+    if (message.content === undefined || message.content === null) return 0
+    return estimateContentBlocks(message.content) + ESTIMATE_ROLE_OVERHEAD
+  }
+  return 0
+}
+
+/**
+ * Port of official `prepareCompaction`'s shadow bill — sum the METER-PRICED
+ * nodes covering exactly the requested seq range. Prefer the live meter
+ * snapshot's per-node prices (`measurement.nodes`, each `{seq, tokens}`,
+ * priced by the SAME estimator family the fold uses); fall back to pricing
+ * the session log directly when the snapshot is unusable or does not cover
+ * the range. Returns `null` when neither source can price the range, so the
+ * CALLER decides whether to degrade (pre-check only) or fail-loud
+ * (transaction commit — a summary with no priced claim poisons the fold).
+ *
+ * @param {object} session the durable session (for the direct-log fallback).
+ * @param {object} region `{start, end}` inclusive SURFACE-NODE seq bounds.
+ * @param {object|undefined} measurement the `tokenMeter.measure` snapshot.
+ * @returns {number|null}
+ */
+function priceRegionFromMeasurement(session, region, measurement) {
+  const events = (session && Array.isArray(session.events)) ? session.events : []
+  const surfaceNodes = (session && session.surface && Array.isArray(session.surface.nodes)) ? session.surface.nodes : []
+  const firstIdx = surfaceNodes.indexOf(region.start)
+  const lastIdx = surfaceNodes.lastIndexOf(region.end)
+  if (firstIdx < 0 || lastIdx < firstIdx) return null
+  const covered = surfaceNodes.slice(firstIdx, lastIdx + 1)
+  const meterNodes = (measurement && Array.isArray(measurement.nodes)) ? measurement.nodes : null
+  if (meterNodes !== null) {
+    let total = 0
+    let complete = true
+    for (const seq of covered) {
+      const node = meterNodes.find(n => n && typeof n === 'object' && n.seq === seq)
+      if (node === undefined || node === null || typeof node.tokens !== 'number' || !Number.isFinite(node.tokens)) {
+        complete = false
+        break
+      }
+      total += node.tokens
+    }
+    if (complete) return total
+  }
+  let total = 0
+  for (const seq of covered) {
+    const event = events[seq]
+    if (event === undefined || event === null || typeof event !== 'object') return null
+    total += priceSurfaceNode(event)
+  }
+  return total
+}
 
 /**
  * Minimum shadowed-span size (in estimated tokens) below which a summarization
@@ -221,15 +380,31 @@ function mintCompactionId() {
  * the full transaction. Safe to call only when the agent is idle; a busy agent
  * or an already-active transaction is detected and returns `null`.
  *
+ * MANUAL SELECTION SEMANTICS (OFFICIAL PARITY, P1): like the official
+ * `selectCompactableRange(session, measure, 0)`, a command-driven manual entry
+ * selects with `retainTokens=0` — a FULL-SURFACE head-anchored region — rather
+ * than retaining the latest `settings.retainLatestTokens` tail. Only callers
+ * that pass an explicit `opts` (or use the region-carrying `compactRegion`
+ * path) keep the `retainLatestTokens` behavior; the default `compactNow`
+ * without opts is treated as a manual command-driven entry.
+ *
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @param {import('@deepseek-ai/dsh-agent').Agent} agent
  * @param {AbortSignal} [signal]
+ * @param {string} [sourceCommandId] the originating `/compact`/`/force-compact`
+ *                                    command id, threaded into the lifecycle
+ *                                    events and the checkpoint source (P1).
+ * @param {object} [opts] optional overrides:
+ *   - `retainTokens?: number` — explicit retention budget (default: 0 =
+ *     full-surface manual selection). Pass `settings.retainLatestTokens` from
+ *     the auto/pre-step paths to preserve the legacy "retain the latest N
+ *     tokens" behavior.
  * @returns {Promise<object|null>} the compaction result, or `null` when skipped.
  */
 // Internal body of `compactNowBuiltin` — routed through the crash-net wrapper
 // so an unexpected throw escaping the internal guards becomes a durable,
 // parseable diagnostic rather than a silent propagation up the call stack.
-async function __compactNowBuiltinBody(ctx, agent, signal) {
+async function __compactNowBuiltinBody(ctx, agent, signal, sourceCommandId, opts) {
   const session = agent.session
   if (session === undefined || typeof session.append !== 'function') return null
   const settings = (await readSettings(ctx)) ?? DEFAULTS
@@ -263,7 +438,16 @@ async function __compactNowBuiltinBody(ctx, agent, signal) {
     }
   }
 
-  const region = selectHeadAnchoredRegion(settings, session, measurement)
+  // MANUAL SELECTION (official `selectCompactableRange(…, 0)` parity): when no
+  // explicit `opts.retainTokens` is supplied, treat this as a command-driven
+  // manual entry and select the FULL surface (retain 0). Auto/pre-step/idle
+  // callers MUST pass `opts: { retainTokens: settings.retainLatestTokens }`
+  // (see hooks/guard.js + hooks/idle.js) to preserve the legacy "retain the
+  // latest N tokens" behavior they historically relied on.
+  const retainTokens = (opts !== undefined && typeof opts === 'object' && Number.isFinite(opts.retainTokens))
+    ? Math.max(0, Math.round(opts.retainTokens))
+    : 0
+  const region = selectHeadAnchoredRegion(settings, session, measurement, retainTokens)
   if (region === null) {
     // Diagnose WHY: report the surface-node count and how much of it is already
     // checkpoint material. The typical "nothing worth compacting" case is a
@@ -280,12 +464,12 @@ async function __compactNowBuiltinBody(ctx, agent, signal) {
     info(ctx,
       `${session.id}: builtin compaction — no compactable region; skipping `
       + `(${surfNodes.length} surface nodes, head=${headIsCheckpoint ? 'previous checkpoint' : 'ordinary history'}, `
-      + `estimated ~${estimateSurfaceTokens(session)} surface tokens)`,
+      + `estimated ~${estimateSurfaceTokens(session)} surface tokens, retainTokens=${retainTokens})`,
     )
     return null
   }
 
-  return runTransaction(ctx, agent, session, region, signal, settings)
+  return runTransaction(ctx, agent, session, region, signal, settings, sourceCommandId, measurement)
 }
 
 /**
@@ -306,16 +490,20 @@ async function __compactNowBuiltinBody(ctx, agent, signal) {
  * @param {number} end last surface-node seq, inclusive.
  * @param {import('@deepseek-ai/dsh-agent').Agent} agent
  * @param {AbortSignal} [signal]
+ * @param {string} [sourceCommandId] optional originating-command id, threaded
+ *                                    into the lifecycle events + checkpoint
+ *                                    source (mirrors official `compactRegion`
+ *                                    taking a 5th positional arg).
  * @returns {Promise<object|null>} the compaction result, or `null` when aborted/skippedped.
  */
 // Internal body of `compactRegionBuiltin` — routed through the crash-net wrapper.
-async function __compactRegionBuiltinBody(ctx, start, end, agent, signal) {
+async function __compactRegionBuiltinBody(ctx, start, end, agent, signal, sourceCommandId) {
   const session = agent.session
   if (session === undefined || typeof session.append !== 'function') return null
   const settings = (await readSettings(ctx)) ?? DEFAULTS
   if (!(settings.builtinEnabled !== false)) return null
   if (start > end) return null
-  return runTransaction(ctx, agent, session, { start, end }, signal, settings)
+  return runTransaction(ctx, agent, session, { start, end }, signal, settings, sourceCommandId)
 }
 
 /** Public entries — wrapped by the universal crash net. */
@@ -327,8 +515,28 @@ export const compactRegionBuiltin = guardFn('builtin.compactRegionBuiltin', __co
  * the region. Every step is guarded; any failure appends `compaction/end` with
  * an `error` and returns `null` (leaving exactly one closed-or-orphaned marker
  * pair so the log stays interpretable on reload).
+ *
+ * SOURCE COMMAND ID (OFFICIAL PARITY, P1): an optional originating-command id
+ * (from `/compact` / `/force-compact`) is threaded into ALL THREE lifecycle
+ * events (`compaction/start` / `compaction/summary` / `compaction/end`) AND
+ * the hand-built checkpoint `source` object. The official `invariant`
+ * listener validates that all three bracket events carry IDENTICAL
+ * `sourceCommandId` values — so threading one value everywhere is mandatory,
+ * not optional. When `undefined`, the field is omitted from all payloads and
+ * the source carries only `{kind,plugin,compactionId}` (backward compatible).
+ *
+ * FLUSH (OFFICIAL PARITY, P0): after a SUCCESSFUL `compaction/end` close, the
+ * transaction invokes `sessions.flush(session)` when available (best-effort —
+ * a missing/unusable service degrades to a deferred-flush-risk note rather
+ * than a fatal error). This mirrors the official `compactSurfaceRegion`
+ * behavior (`if (closed && options.flush !== undefined) await options.flush()`
+ * inside a try/catch that surfaces failures as `CompactionError({cause})`).
+ * The awaited `session/flush` checkpoint in `index.js` ALREADY covers the
+ * lifetime of a successful transaction for most call sites — an explicit flush
+ * here is belt-and-braces for the command-driven entry (where the caller
+ * expects durability BEFORE returning) and the busy-pre-step consume path.
  */
-async function runTransaction(ctx, agent, session, region, signal, settings) {
+async function runTransaction(ctx, agent, session, region, signal, settings, sourceCommandId, measurementArg) {
   emitLoadMarker()
   const llm = ctx.get('llm')
   if (llm === undefined || typeof llm.stream !== 'function') {
@@ -375,11 +583,10 @@ async function runTransaction(ctx, agent, session, region, signal, settings) {
   // lock opens and the call fires: the caller's selection is honored on the
   // NEXT attempt, and once enough head accumulates the span naturally grows
   // past MIN_USEFUL_SPAN_TOKENS and proceeds. This replaces the wasteful
-  // cycle "attempt giant prompt → shrink-gate veto → blank → re-attempt the
+  // cycle "attempt giant prompt → shrink-gate veto → blanket → re-attempt the
   // identical doomed span every step".
   // NOTE: the post-summary SHRINK GATE still applies to everything that
   // passes this pre-check — it remains the authoritative defense.
-  let shadowedTokenCount
   const projected = projectRegion(session, region)
   const messages = projected.messages
   const shadowedSeqs = projected.shadowedSeqs
@@ -387,7 +594,37 @@ async function runTransaction(ctx, agent, session, region, signal, settings) {
     info(ctx, `${session.id}: builtin compaction — region has no surface messages; skipping`)
     return null
   }
-  shadowedTokenCount = estimateTokens(messages)
+
+  // ---- Shadow bill — OFFICIAL shadow-price protocol parity -----------------
+  // Price the EXACT surface range being shadowed under the meter's estimator
+  // family (per-node prices from the same snapshot the selection was cut
+  // from, falling back to a direct price of the log), so the claim the
+  // token-meter fold settles against our `compaction/summary` event
+  // subtracts the TRUE cost of the replaced span. See the estimator-parity
+  // block above for the mirrored official sources.
+  const measurement = (measurementArg && typeof measurementArg === 'object' && Array.isArray(measurementArg.nodes))
+    ? measurementArg
+    : (typeof meter.measure === 'function' ? (() => { try { return meter.measure(session) } catch { return undefined } })() : undefined)
+  let regionPrice
+  try {
+    regionPrice = priceRegionFromMeasurement(session, region, measurement)
+  } catch (error) {
+    // Unresolvable surface state — degrade gracefully (refuse to commit, see
+    // the null branch) rather than propagate out of the transaction.
+    warn(ctx, `${session.id}: builtin compaction — region pricing threw (${messageOf(error)}); refusing to commit`)
+    regionPrice = null
+  }
+  if (regionPrice === null) {
+    // Cannot price the claimed range under any caliber (snapshot unusable AND
+    // the log cannot be resolved): writing a summary WITHOUT a correct shadow
+    // bill would make the fold settle a bogus claim, so refuse to commit
+    // rather than poison the persisted projection. Best-effort degradation:
+    // the next attempt with a fresh snapshot re-prices cleanly.
+    warn(ctx, `${session.id}: builtin compaction ABORTED — could not price region seq[${region.start}..${region.end}] `
+      + `against the shadow-price protocol (meter snapshot unusable and direct log pricing failed); refusing to commit`)
+    return null
+  }
+  const shadowedTokenCount = regionPrice
 
   // ---- Threshold-aware SHADOW-SPAN FLOOR ----------------------------------
   // Mirror of `guard.js`'s threshold-aware shrink gate, applied to the
@@ -404,14 +641,11 @@ async function runTransaction(ctx, agent, session, region, signal, settings) {
   // auto path already suppresses). Skipping here costs nothing — the head
   // grows naturally and becomes compactable on its own once large enough.
   //
-  // CALIBER NOTE: the span figure is char-heuristic (`estimateTokens`,
-  // ceil(chars/4)); `guard.js` prices its identical predicate from a
-  // `tokenMeter.measure` snapshot instead. Heuristic-vs-meter skew is small
-  // relative to the hundreds-of-hundreds-of-tokens margin these decisions
-  // hinge on (a ~16K-char-estimated span vs. a ~59K meter-priced total
-  // leaves ~43K of slack — a realistic ±2K estimation error cannot flip the
-  // verdict). The auto path retains its strict meter pricing unchanged; this
-  // floor merely PREVENTS the idle path from re-entering the same doom.
+  // CALIBER NOTE: `shadowedTokenCount` is now priced from the SAME meter
+  // caliber the fold itself uses (per-node prices from the shared snapshot);
+  // the threshold arithmetic below compares like-for-like figures.
+  // The auto path retains its strict meter pricing unchanged; this floor
+  // merely PREVENTS the idle path from re-entering the same doom.
   if (currentTotalTokens !== undefined && Number.isFinite(currentTotalTokens)
       && currentTotalTokens >= settings.autoThresholdTokens
       && (currentTotalTokens - shadowedTokenCount) >= settings.autoThresholdTokens) {
@@ -457,12 +691,19 @@ async function runTransaction(ctx, agent, session, region, signal, settings) {
   }
 
   // ---- Open the durable lock ---------------------------------------------
+  // `sourceCommandId` (P1): the originating `/compact`/`/force-compact` command
+  // id, threaded conditionally — OMITTED when `undefined` so the event stays
+  // backward-compatible with readers that predate the field (exact mirror of
+  // the official `region.ts` conditional spread). All three bracket events
+  // (start / summary / end) MUST agree on this value — the official invariant
+  // listener enforces it.
   const compactionId = mintCompactionId()
   let startEvent
   try {
     startEvent = session.append('compaction/start', {
       compactionId,
       turn: currentOpenTurn(session),
+      ...(sourceCommandId === undefined ? {} : { sourceCommandId }),
     })
   } catch (error) {
     warn(ctx, `${session.id}: builtin compaction — failed to append compaction/start: ${messageOf(error)}`)
@@ -597,6 +838,7 @@ async function runTransaction(ctx, agent, session, region, signal, settings) {
     shadowedRange: targetRange,
     shadowedSeqs,
     shadowedTokenCount,
+    ...(sourceCommandId === undefined ? {} : { sourceCommandId }),
   }
   // Record the ACTUAL LLM call envelope observed from the summarization
   // invocation (ground-truth provider/model/maxTokens/usage) — this is the
@@ -626,14 +868,23 @@ async function runTransaction(ctx, agent, session, region, signal, settings) {
     return null
   }
 
-  const checkpointContent = [
-    { type: 'text', text: CHECKPOINT_PREAMBLE + '\n\n' + joinBlocks(summaryBlocks) },
-  ]
+  // P0 — OFFICIAL FRAMING: wrap the summary BLOCKS (not a joined blob) in
+  // `CHECKPOINT_PREAMBLE` + `<compacted-summary>` tags block-wise, byte-mirror
+  // of the official `frameSummary` — so a future prior-checkpoint merge finds
+  // the structured region the instruction tells the LLM about ("keep the parts
+  // still true, drop the expired, fold in the newer") instead of an untagged
+  // free-form paragraph.
+  const checkpointContent = frameSummary(summaryBlocks)
+  const checkpointSourceData = {
+    ...CHECKPOINT_SOURCE_BASE,
+    compactionId,
+    ...(sourceCommandId === undefined ? {} : { sourceCommandId }),
+  }
   let replaceEvent
   try {
     replaceEvent = session.append('user/message', {
       content: checkpointContent,
-      source: Object.freeze({ ...CHECKPOINT_SOURCE_BASE, compactionId }),
+      source: Object.freeze(checkpointSourceData),
     }, {
       surfaceOp: { op: 'replace', start: targetRange.start, end: targetRange.end },
       sourceEventSeqs: [startEvent.seq, summaryEvent.seq, ...shadowedSeqs],
@@ -649,12 +900,35 @@ async function runTransaction(ctx, agent, session, region, signal, settings) {
     const endEvent = session.append('compaction/end', {
       compactionId,
       turn: currentOpenTurn(session),
+      // P1 — same conditional spread as start/summary: the third bracket must
+      // agree with the first two (`compaction/invariant` enforces it).
+      ...(sourceCommandId === undefined ? {} : { sourceCommandId }),
     })
     endSeq = endEvent.seq
   } catch {
     // Non-fatal: the summary already landed durably; the missing end marker is
     // tolerated as a (rarely orphaned) lock on next reload.
     info(ctx, `${session.id}: builtin compaction — warning: could not append compaction/end (lock may appear open on next reload)`)
+  }
+
+  // P0 — DURABILITY FLUSH AFTER `compaction/end` (mirror of the official
+  // `compactSurfaceRegion` `if (closed && flush) await flush()` tail). The
+  // transaction's four appends are durable by construction, but a command-
+  // driven caller (`/force-compact`) expects the on-disk state to be settled
+  // BEFORE it returns "Compacted N…". The awaiting `session/flush` checkpoint
+  // in `index.js` already covers the idle/auto call sites; this is belt-and-
+  // braces for the others. BEST-EFFORT by design: unlike the official engine
+  // (which has a typed `CompactionError` to escalate a flush rejection into —
+  // deliberately NOT ported, out of scope) we degrade to a WARN and ignore,
+  // so a flaky or missing `sessions` service can never turn a SUCCESSFUL
+  // committed compaction into a visible failure.
+  const sessions = ctx.get('sessions')
+  if (sessions !== undefined && typeof sessions.flush === 'function') {
+    try {
+      await sessions.flush(session)
+    } catch (flushFailure) {
+      warn(ctx, `${session.id}: builtin compaction — best-effort session/flush after compaction/end failed (ignored): ${messageOf(flushFailure)}`)
+    }
   }
 
   // A successful compaction clears ANY residual failure cooldown for this
@@ -671,6 +945,10 @@ async function runTransaction(ctx, agent, session, region, signal, settings) {
     shadowedRange: targetRange,
     shadowedSeqs,
     shadowedTokenCount,
+    // P1 — echo the originating command id for observability (conditional
+    // spread keeps the key ABSENT for non-command-driven transactions so the
+    // result shape matches pre-port behavior for those paths).
+    ...(sourceCommandId === undefined ? {} : { sourceCommandId }),
   }
 }
 
@@ -706,44 +984,74 @@ function estimateSurfaceTokens(session) {
 }
 
 /**
- * Select a head-anchored compactable region for the MANUAL `compactNow` path
- * (idle turn-end hook, `/force-compact`-when-idle). PRECEDENCE RULE: this is
- * the SELF-SELECTING fallback only — every region-CARRYING caller routes its
- * own span through `compactRegion` (see its doc) and this helper is NOT
- * consulted.
+ * Select a head-anchored compactable region — the SINGLE SELF-SELECTOR for
+ * `compactNow` (manual command entry AND idle/auto entry alike). Called from
+ * {@link __compactNowBuiltinBody} ONLY — region-carrying callers (the
+ * `/force-compact` busy-queue consumption and the `session/flush`
+ * checkpoint path) always route their OWN span through `compactRegion` and
+ * never enter this helper.
  *
- * Semantics (identical to the auto path in `hooks/guard.js`): retain the
- * latest `settings.retainLatestTokens` of the surface VERBATIM; everything
- * before that cutoff forms the head-anchored region compacted into a single
- * summary node.
+ * Manual-vs-auto DISTINCTION (via the OPTIONAL 4th argument, mirroring the
+ * official engine's "explicit opts ⇒ caller supplies its own selection"):
+ *   • MANUAL entry (`/force-compact`, owner `null`) leaves `opts` undefined →
+ *     `__compactNowBuiltinBody` computes `retainTokens = 0` → this helper
+ *     receives `retainOverride = 0` → the meter branch delegates to
+ *     `selectRetainingLatestTokens(session, 0, measurement)`, whose internal
+ *     `budget = max(1, …)` clamp means the tail walk retains effectively
+ *     NOTHING and the compactable span becomes the ENTIRE head up to the
+ *     pairing-balanced boundary NEAR THE TAIL — the official "full-head"
+ *     manual-compaction behavior.
+ *   • AUTO / IDLE entry (`agent/status` idle transition, `session/flush`)
+ *     OPTS INTO legacy semantics by passing
+ *     `opts: { retainTokens: settings.retainLatestTokens }` → the helper
+ *     receives that finite override → retain-the-latest-N-tokens behavior
+ *     unchanged from pre-port.
+ *   • `retainOverride` left `undefined` WITHOUT the caller specifying it (a
+ *     future caller that wants the configured default) falls back to
+ *     `settings.retainLatestTokens` — preserving the historical default.
  *
- * CALIBER — MIRROR OF THE AUTO PATH: the primary source is a `tokenMeter
- * .measure` snapshot passed in by the caller (obtained the same way
- * `guards.js` obtains it, see `hooks/guard.js`). When available, the region
- * comes from `selectRetainingLatestTokens` priced from that very snapshot —
- * the meter's own per-node prices — so the retention budget is expressed in
- * the SAME token caliber the threshold gate measures (not a divergent char/4
- * estimate of flat text, which systematically UNDERCOUNTS nested tool blocks
- * and JSON framing; subtracting a fixed 8000-token retention from an
- * undercounted surface sum starved the head budget until fewer than two head
- * nodes remained — the observed "/force-compact → no compactable range").
+ * Pricing fidelity (two branches converging on the same rule): when a
+ * reliable `meter.measure` snapshot IS available (nodes array present with ≥
+ * 2 entries), both the compactable prefix AND the retained tail are priced
+ * from that single authoritative snapshot via
+ * {@link selectRetainingLatestTokens} — one `measure()` call, consistent
+ * calibration end-to-end (NOT a divergent char/4 estimate of flat text,
+ * which systematically UNDERCOUNTS nested tool blocks / JSON framing and
+ * starved the head budget — the observed "/force-compact → no compactable
+ * range" cause). WITHOUT such a snapshot, fall back to a char heuristic:
+ * price the surface sum (4 chars/token),
+ * `headBudget = max(0, surfaceSum − retain)`, and hand that head budget to
+ * {@link selectEarliestByTokens} (it walks from the head until the running
+ * sum reaches the budget).
  *
- * LEGACY FALLBACK (snapshot `undefined` — tokenMeter absent or `measure`
- * threw): the OLD char-heuristic path, preserved for degraded compositions —
- * keep the latest `settings.retainLatestTokens` via the char estimate of the
- * surface sum and route the residual head budget through
- * `selectEarliestByTokens`.
+ * Boundary snapping: whichever branch selects the span ENDS it at a
+ * TOOL-PAIRING BALANCED position (official pairing-ledger criterion via
+ * `core/pairing.js` — any cut-after with zero unanswered tool calls, a
+ * strict superset of the historical `user/message` boundary) so the
+ * compacted span never splits a tool call/result pair.
  *
  * Edge cases: with a meter snapshot, `selectRetainingLatestTokens` itself
- * reports `null` when the retained tail consumes the whole window (single
- * huge trailing node) or fewer than 2 nodes exist; with the legacy fallback,
- * if the char-estimated surface sum is smaller than the retention budget
- * (very short session), the head budget clamps to zero and no region results.
+ * reports `null` when the retained tail consumes the whole window (fewer
+ * than 2 nodes, or `tailStartIdx <= 0`); with the legacy fallback, if the
+ * char-estimated surface sum is smaller than the retention budget (very
+ * short session), the head budget clamps to zero and no region results.
+ *
+ * @param {object} settings resolved plugin settings (used ONLY when `retainOverride` is undefined).
+ * @param {object} session live session handle.
+ * @param {object|undefined} measurement fresh `tokenMeter.measure(session)` snapshot.
+ * @param {number|undefined} [retainOverride] ABSOLUTE tokens to retain at the
+ *   tail. `0` (the manual-command default) ⇒ full-head region. Finite
+ *   positive values ⇒ legacy retain-latest behavior. `undefined` ⇒ fall
+ *   back to `settings.retainLatestTokens` (historical default for any
+ *   caller that doesn't specify).
+ * @returns {{start:number,end:number}|null} head-anchored span, or `null`.
  */
-function selectHeadAnchoredRegion(settings, session, measurement) {
-  const retain = Number.isFinite(settings.retainLatestTokens)
-    ? Math.max(0, Math.round(settings.retainLatestTokens))
-    : 0
+function selectHeadAnchoredRegion(settings, session, measurement, retainOverride) {
+  const retain = retainOverride !== undefined && Number.isFinite(retainOverride)
+    ? Math.max(0, Math.round(retainOverride))
+    : (Number.isFinite(settings.retainLatestTokens)
+      ? Math.max(0, Math.round(settings.retainLatestTokens))
+      : 0)
   // PRIMARY (mirror of the auto path): price from the meter's own per-node
   // snapshot — the same caliber as the threshold gate's `surfaceTokens`.
   if (measurement !== undefined && Array.isArray(measurement.nodes) && measurement.nodes.length > 1) {

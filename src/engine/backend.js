@@ -111,8 +111,12 @@ async function builtinBackend(ctx, agent) {
   if (llm === undefined || typeof llm.stream !== 'function') return undefined
   return {
     kind: 'builtin',
-    compactNow: (ag, signal) => compactNowBuiltin(ctx, ag, signal),
-    compactRegion: (start, end, ag, signal) => compactRegionBuiltin(ctx, start, end, ag, signal),
+    // P1 — widen positionals so command-driven callers can thread
+    // `sourceCommandId` (3rd arg) and auto/idle callers can supply
+    // `opts` (4th arg) to the builtin engine. The official passthrough
+    // (priority-1 path) ignores extra positionals harmlessly.
+    compactNow: (...args) => compactNowBuiltin(ctx, ...args),
+    compactRegion: (...args) => compactRegionBuiltin(ctx, ...args),
   }
 }
 

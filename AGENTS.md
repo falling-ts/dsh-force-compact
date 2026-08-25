@@ -51,7 +51,49 @@ resolveCompaction
   （它是"原地剪枝超限 tool result"，不是"区域替换"），不移植。
 
 REGION-PICK 诊断行新增 `boundaryKind=` 字段；加载标记升级为
-`v2026-08-25-official-parity`（dev-server stdout 可见）。
+`v2026-08-25-p0-p1-port`（dev-server stdout 可见）。
+
+### Shadow-price 协议对齐（2026-08 升级：内置事务的 `shadowedTokenCount` 与官方计价同源）
+
+**背景**——harness 的 token-meter 折叠器（`packages/llm/token-meter/src/surface-projection.ts`）
+对"压缩"的处理**不是**扫描压缩标记，而是一个**影子价格索赔（shadow-price claim）协议**：
+`compaction/summary` / `compaction/prune` 事件本身 delta 恒 0，只把 `shadowedTokenCount`
+武装成一张待核销的索赔（claim，携带 `shadowedRange` 起止 + tokens）；紧随其后的 surface
+`replace`（`user/message` + `surfaceOp:{op:'replace',start,end}`）用
+`delta = 检查点估价 − claim.tokens` 完成真正的扣减。**范围不匹配的 replace 会 THROW**；
+无索赔的 replace 按中性 0 delta 折入。生产者因此必须做到两点：
+① summary 与 replace **同步相邻**追加（中间不得插入任何其他事件，否则索赔作废）；
+② `shadowedTokenCount` 必须等于**被替换 surface 区间在米表估价器下的总估值**
+（官方 `compaction-basic/src/region.ts` `prepareCompaction` 的做法是
+`selectedNodes.reduce((total, node) => total + node.tokens, 0)`，逐位取自
+`tokenMeter.measure` 的 per-node 价格，与折叠器对每个 surface 节点的估价**同一个数学定义**）。
+
+**历史缺陷**——本插件此前的账单口径是"喂给摘要 LLM 的角色化扁平文本按 chars/4"
+（`estimateTokens(projectRegion(...).messages)`）：既不含 tool-result 原始输出、也不含
+schema/推理块的结构开销，系统性低估真实 surface 成本 → 折叠器结算时
+`delta = 检查点估价 − 虚低账单` 偏正甚至转正 → **压缩完成后右下角 `对话消息`
+（surfaceTokens）反而上涨**，表现为"压缩后计数器不减反增"。
+
+**修复（本 2026-08 版）**——`src/engine/builtin.js` 顶部新增与官方
+`packages/llm/token-meter/src/estimate.ts` **逐字同形的纯 JS 移植块**（CHAR/BLOCK/ROLE
+开销常量 + `estimateContent` 递归 + `estimateHeader` 两部分 + `priceSurfaceNode`
+按官方 `foldSurface` 的逐节点规则 + `priceRegionFromMeasurement` 按官方
+`prepareCompaction` 的 reduce 语义），`runTransaction` 的账单计算改为：
+优先从同一份 `tokenMeter.measure` 快照的 `nodes[].tokens`（与选区截点同源，
+`compactNow` 路径传入、其余入口按需现场采样）累加覆盖区间的 per-node 价；
+快照缺失/不全时退化到对 `session.events` 直接逐位估价（`priceSurfaceNode`）；
+两条路都无法覆盖 → **fail-loud 拒提交**（宁可放弃本次事务，也不写一条会让持久
+投影漂移到错误方向的坏索赔）。`compactNow` 路径的选区、阈值门禁、账单三处
+共享**同一份测量快照**（一次 `meter.measure`），杜绝"阈值用一个口径、选区用
+另一个口径、账单再用第三个口径"的错位。缩容门禁（`summaryTextLen < 账单 ×
+CHARS_PER_TOKEN` 或 meter 估价版）保留不变，确保合规事务净 delta 必为负、
+计数严格下降。
+
+**折叠器侧不变量**（供日后排查）：`pressureTokens`（provider usage 锚定）在
+压缩后不会立即变化，要到**下一次请求**拿到新的 usage sample 才会反映收缩；
+`surfaceTokens` / `messageTokens`（纯估价折叠）则在 replace 落定瞬间完成扣减。
+`projectedTokens = max(0, pressureTokens + surfaceTokens − sampledSurfaceTokens)`
+只在前者存在时才有意义；contextWindow 缺失时整个环形刻度隐藏。
 
 ### 内置引擎（src/engine/builtin.js）
 

@@ -21,6 +21,11 @@ import { guardFn } from '../core/crashnet.js'
  *  `COMPACTION_INSTRUCTION`.) */
 export const SUMMARY_OPEN_TAG = '<compacted-summary>'
 
+/** Closing counterpart of {@link SUMMARY_OPEN_TAG}; wraps the structured
+ *  summary body inside a landed checkpoint (aligned with the official
+ *  `compaction-basic` `frameSummary`, which emits both tags around the body). */
+export const SUMMARY_CLOSE_TAG = '</compacted-summary>'
+
 /**
  * The compaction directive, delivered as the FINAL user message after the
  * replayed conversation rather than as a distinct summarizer system prompt.
@@ -68,6 +73,28 @@ export const COMPACTION_INSTRUCTION = [
 /** Framing that makes the replacement user message established context. */
 export const CHECKPOINT_PREAMBLE =
   'This is an automatically generated checkpoint condensing an earlier span of the conversation to free up context. Treat the captured context as established background and build on it without restating it. Continue the task directly from the messages that follow, without acknowledging this checkpoint.'
+
+/**
+ * Frame summarized content blocks for landing as a `user/message` — aligned with
+ * the official `compaction-basic` `frameSummary` (a BLOCK-LEVEL wrap, NOT a
+ * text splice): the first block carries the preamble and the OPEN
+ * `<compacted-summary>` tag, the summary's own text blocks pass through VERBATIM
+ * (preserving their exact content), and a trailing block carries the CLOSE tag.
+ * Wrapping as discrete blocks (rather than joining into one string) keeps each
+ * fragment individually addressable and matches the durable event shape exactly.
+ * So a later compression recognizing the `<compacted-summary>` anchor applies the
+ * instruction's "merge, don't copy forward" rule correctly.
+ * @param {Array<{type:'text', text:string}>} textBlocks the condensed checkpoint blocks.
+ * @returns {Array<{type:'text', text:string}>} the framed node blocks.
+ */
+export function frameSummary(textBlocks) {
+  const blocks = Array.isArray(textBlocks) ? textBlocks.filter(b => b && b.type === 'text' && typeof b.text === 'string') : []
+  return [
+    { type: 'text', text: `${CHECKPOINT_PREAMBLE}\n\n${SUMMARY_OPEN_TAG}` },
+    ...blocks,
+    { type: 'text', text: SUMMARY_CLOSE_TAG },
+  ]
+}
 
 /**
  * The replayed conversation surface the summarizer condenses. Reproducing the

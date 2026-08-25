@@ -109,7 +109,12 @@ async function __handleAgentStatusBody(ctx, payload, mode) {
     // (they swallow their own failures internally), so a messenger problem
     // can never perturb the compaction transaction itself.
     await publishCompressing(ctx)
-    const result = await backend.compactNow(agent, controller.signal)
+    // P1 — idle is an AUTO entry: pass `opts: { retainTokens }` to preserve
+    // the legacy retain-the-latest-N-tokens selection. Without this, `compactNow`
+    // defaults `retainTokens` to 0 (manual full-head behavior) which would
+    // change idle-path semantics. The 3rd arg (sourceCommandId) stays
+    // undefined — idle has no originating command id.
+    const result = await backend.compactNow(agent, controller.signal, undefined, { retainTokens: settings.retainLatestTokens })
     if (result === undefined || result === null) {
       ctx.logger.debug(`[force-compact] ${session.id}: idle compaction via ${backend?.kind} committed nothing`)
       return

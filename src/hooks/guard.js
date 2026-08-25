@@ -39,13 +39,14 @@ import { publishCompressing, publishDone } from '../core/ui-signal.js'
 import { guardFn, renderCrash, captureThrowSite, appendCrashLine as appendDiag } from '../core/crashnet.js'
 
 /**
- * Process-local "force compact now" flags, one per session (keyed by
+ * Process-local "force compact now" records, one per session (keyed by
  * `session.id`). Set by the `/force-compact` command handler when the agent is
  * busy, and consumed (and cleared) by the `agent/pre-step` hook at the next
- * model step. This is the "insert a js memory record" the command needs: it
- * survives across the agent's steps within the process without any durable
- * state or timer.
- * @type {Map<string, true>}
+ * model step. Each entry is a `{commandId}` object (P1 — carries the
+ * originating slash-command id so the pre-step consumer can thread it into the
+ * `compaction/*` bracket's `sourceCommandId` field). Survives across the
+ * agent's steps within the process without any durable state or timer.
+ * @type {Map<string, {commandId: string|undefined}>}
  */
 const pendingForce = new Map()
 
@@ -55,21 +56,34 @@ const pendingForce = new Map()
  * this flag so the next model step force-compacts instead of requesting the
  * model.
  * @param {string} sessionId
+ * @param {string|undefined} [commandId] the originating slash-command id (P1).
  */
 /** Top-level entry — wrapped by the universal crash net. */
-export const queueForceCompact = guardFn('guard.queueForceCompact', (sessionId) => {
-  if (sessionId !== undefined && sessionId !== null) pendingForce.set(sessionId, true)
+export const queueForceCompact = guardFn('guard.queueForceCompact', (sessionId, commandId) => {
+  if (sessionId !== undefined && sessionId !== null) {
+    pendingForce.set(sessionId, { commandId })
+  }
 })
 
 /**
- * Consume (and clear) any pending forced-compaction flag for one session.
+ * Consume (and clear) any pending forced-compaction record for one session.
  * @param {string} sessionId
  * @returns {boolean} whether a force was pending and is now cleared.
  */
 export const takeForceCompact = guardFn('guard.takeForceCompact', (sessionId) => {
   const pending = pendingForce.get(sessionId)
   if (pending) pendingForce.delete(sessionId)
-  return pending === true
+  return Boolean(pending)
+})
+
+/**
+ * Read the pending forced-compaction record WITHOUT consuming it (peek). Used
+ * by the pre-step consumer to retrieve the `commandId` before clearing.
+ * @param {string} sessionId
+ * @returns {{commandId: string|undefined}|undefined}
+ */
+export const peekForceCompact = guardFn('guard.peekForceCompact', (sessionId) => {
+  return pendingForce.get(sessionId)
 })
 
 
@@ -182,9 +196,10 @@ function estimateRegionTokens(meter, session, region, measurement) {
  * @param {import('@deepseek-ai/dsh-agent').Agent} agent
  * @param {AbortSignal|undefined} signal the current turn's signal (forwarded to compaction).
  * @param {string|undefined} mode the `compactionMode` setting (passed by the caller); undefined re-reads live.
+ * @param {string|undefined} [sourceCommandId] P1 — the originating slash-command id threaded into the `compaction/*` bracket.
  * @returns {Promise<boolean>} whether a compaction was committed.
  */
-async function compactRetainingLatest(ctx, agent, signal, mode) {
+async function compactRetainingLatest(ctx, agent, signal, mode, sourceCommandId) {
   // SAFETY ENVELOPE: this function's CONTRACT is to resolve `false` (let the
   // request proceed) on ANY failure — a missing service, a missing span, a
   // throwing `tokenMeter.measure`, a rejecting backend call, or even a
@@ -193,7 +208,7 @@ async function compactRetainingLatest(ctx, agent, signal, mode) {
   // (the "every request pauses" symptom). The actual logic lives in the inner
   // closure; any exception anywhere inside resolves `false`.
   try {
-    return await __compactRetainingLatestBody(ctx, agent, signal, mode)
+    return await __compactRetainingLatestBody(ctx, agent, signal, mode, sourceCommandId)
   } catch (error) {
     const message = error instanceof Error ? (error.stack || error.message) : String(error)
     const sid = (agent && agent.session && agent.session.id) ? agent.session.id : '?'
@@ -203,7 +218,7 @@ async function compactRetainingLatest(ctx, agent, signal, mode) {
 }
 
 /** Body of {@link compactRetainingLatest}; wrapped by its safe envelope. */
-async function __compactRetainingLatestBody(ctx, agent, signal, mode) {
+async function __compactRetainingLatestBody(ctx, agent, signal, mode, sourceCommandId) {
   const settings = (await readSettings(ctx)) ?? DEFAULTS
   const session = agent.session
   if (session === undefined || session === null) return false
@@ -400,7 +415,10 @@ async function __compactRetainingLatestBody(ctx, agent, signal, mode) {
     // failures — the messenger can never affect whether the compaction itself
     // commits.
     await publishCompressing(ctx)
-    const result = await backend.compactRegion(region.start, region.end, agent, signal)
+    // P1 — forward `sourceCommandId` as the 5th positional arg (official
+    // `compactRegion(start, end, agent, signal, sourceCommandId)` and the
+    // builtin equivalent both absorb it).
+    const result = await backend.compactRegion(region.start, region.end, agent, signal, sourceCommandId)
     if (result === undefined || result === null) {
       ctx.logger.debug(`[force-compact] ${session.id}: retained-tail compaction committed nothing via ${backend?.kind}`)
       return false
@@ -476,9 +494,16 @@ async function __forceCompactIfNeededBody(ctx, agent, signal, mode) {
   // A `/force-compact` command was issued for this agent while it was busy:
   // compact now, regardless of the token threshold — retain the latest
   // `retainLatestTokens` of the surface, compress the head in one batch.
+  // P1 — peek the pending record to recover the originating `commandId`
+  // BEFORE `takeForceCompact` clears it, so the `compaction/*` bracket can
+  // echo the same `sourceCommandId` the idle-manual path used.
+  const pendingRecord = peekForceCompact(session.id)
   if (takeForceCompact(session.id)) {
-    ctx.logger.info(`[force-compact] ${session.id}: /force-compact queued; force-compacting the head (keeping the latest ~${settings.retainLatestTokens} tokens) immediately`)
-    const committed = await compactRetainingLatest(ctx, agent, signal, mode)
+    const queuedCommandId = (pendingRecord && typeof pendingRecord.commandId === 'string' && pendingRecord.commandId.length > 0)
+      ? pendingRecord.commandId
+      : undefined
+    ctx.logger.info(`[force-compact] ${session.id}: /force-compact queued; force-compacting the head (keeping the latest ~${settings.retainLatestTokens} tokens) immediately${queuedCommandId ? ` (commandId=${queuedCommandId})` : ''}`)
+    const committed = await compactRetainingLatest(ctx, agent, signal, mode, queuedCommandId)
     ctx.logger.debug(`[force-compact] ${session.id}: /force-compact forced compaction ${committed ? 'COMMITTED' : 'did not commit'} — letting the request proceed`)
     return committed
   }
