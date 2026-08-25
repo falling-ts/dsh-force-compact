@@ -326,6 +326,11 @@ async function __compactRetainingLatestBody(ctx, agent, signal, mode) {
   ctx.logger.debug(
     `[force-compact] ${session.id}: compacting head spanning seqs ${region?.start}..${region?.end} `
     + `while retaining the latest ~${settings.retainLatestTokens} tokens, via ${backend?.kind} backend (totalTokens=${totalTokens})`
+    + ` | REGION-PICK budget=${settings.retainLatestTokens} `
+    + `crossingAccBefore=${region.crossingAccBefore} `
+    + `crossingNodeSize=${region.crossingNodeSize} `
+    + `crossingAccAfter=${region.crossingAccAfter} `
+    + `retainedTokens(after-boundary-snap)=${region.retainedTokens}`
   )
   try {
     // LIVE UI SIGNAL — PIN RED "compressing" BEFORE the region compaction

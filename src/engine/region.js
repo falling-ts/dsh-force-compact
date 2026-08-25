@@ -272,11 +272,20 @@ function __selectRetainingLatestTokensBody(session, retainLatestTokens, measurem
   // node's weight — that is the closest achievable "exactly N" boundary.
   let acc = 0
   let tailStartIdx = total // exclusive: index just AFTER the last retained node
+  let crossingAccBefore = -1 // accumulator value JUST BEFORE the crossing node was added (-1 when the walk consumed the whole window)
+  let crossingNodeSize = -1 // size of the node that pushed the accumulator over budget
+  let crossingAccAfter = -1 // accumulator value AFTER the crossing node was added
   for (let i = total - 1; i >= 0; i -= 1) {
     tailStartIdx = i
     const t = Number(nodes[i].tokens) > 0 ? Number(nodes[i].tokens) : 0
+    const before = acc
     acc += t
-    if (acc >= budget) break
+    if (acc >= budget) {
+      crossingAccBefore = before
+      crossingNodeSize = t
+      crossingAccAfter = acc
+      break
+    }
   }
   // The tail occupied indices [tailStartIdx .. total-1]; the compactable
   // prefix occupies [0 .. tailStartIdx-1]. Need at least one node to compact.
@@ -313,7 +322,25 @@ function __selectRetainingLatestTokensBody(session, retainLatestTokens, measurem
     const t = Number(nodes[i].tokens) > 0 ? Number(nodes[i].tokens) : 0
     retainedTokens += t
   }
-  return { start: Math.min(start, end), end: Math.max(start, end), retainedTokens }
+  // DIAGNOSTIC FIELDS — expose the exact moment the backward walk crossed the
+  // `budget` boundary so callers can log WHY the retained tail overshoots:
+  //   crossingAccBefore — the accumulated sum JUST BEFORE the crossing node
+  //                       (what the tail looked like one node earlier)
+  //   crossingNodeSize  — the size of the node that pushed the sum over budget
+  //                       (this single node is what makes "≥8000" become e.g.
+  //                       "~9423")
+  //   crossingAccAfter  — the accumulated sum INCLUDING the crossing node
+  //                       (= crossingAccBefore + crossingNodeSize)
+  // All three are -1 when the walk consumed the whole window without ever
+  // reaching the budget (the degenerate tiny-session case).
+  return {
+    start: Math.min(start, end),
+    end: Math.max(start, end),
+    retainedTokens,
+    crossingAccBefore,
+    crossingNodeSize,
+    crossingAccAfter,
+  }
 }
 
 /**
