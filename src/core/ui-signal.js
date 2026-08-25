@@ -250,13 +250,21 @@ const DONE_FALLBACK_MS = 3000
  * the COMPRESSING/DONE banners): the intent is "back to a normal working
  * look", which a freshly-drawn working pair satisfies.
  *
- * Does NOT pass `isImportant=true` for the initial DONE push: a DONE banner is
- * transient and should not clobber a manually-set custom banner.
+ * Passes `isImportant=true` for the initial DONE push: reaching `publishDone`
+ * PRECEDED BY `publishCompressing`, which has already written the pinned red
+ * `[强制压缩中>>>]` bracket-form text. Without `isImportant=true` the gate inside
+ * {@link publishUiStatus} (which refuses non-important pushes over a currently
+ * displayed `[`-bracket text) would see our OWN still-displayed `compressing`
+ * banner and bail out, so the green `[压缩完成!]` would silently never be written
+ * and the 3 s fallback would jump straight from COMPRESSING to a fresh working
+ * pair — the DONE banner never appearing at all. Since a DONE push can only
+ * follow a `compressing` push from THIS plugin, there is no manually-set custom
+ * banner to protect, and overriding our own prior banner is exactly intended.
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @returns {Promise<void>}
  */
 export async function publishDone(ctx) {
-  await publishUiStatus(ctx, pinnedPayload(PHASE_DONE))
+  await publishUiStatus(ctx, pinnedPayload(PHASE_DONE), true)
   setTimeout(() => {
     void publishUiStatus(ctx, randomWorkingPair(), true)
   }, DONE_FALLBACK_MS)

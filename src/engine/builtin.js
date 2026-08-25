@@ -37,6 +37,7 @@ import { summarize, headerPrefix, frameSummary } from './summarizer.js'
 import { selectEarliestByTokens, selectRetainingLatestTokens } from './region.js'
 import { readSettings, DEFAULTS } from '../core/settings.js'
 import { guardFn } from '../core/crashnet.js'
+import { publishDone } from '../core/ui-signal.js'
 
 /**
  * ONE-SHOT LOAD MARKER — proves WHICH built engine is actually loaded on a
@@ -935,6 +936,18 @@ async function runTransaction(ctx, agent, session, region, signal, settings, sou
   // session so the NEXT idle tick isn't suppressed by a stale mark.
   clearFailureCooldown(session.id)
   info(ctx, `${session.id}: builtin compaction OK — replaced span seq[${targetRange?.start}..${targetRange?.end}] (${shadowedSeqs?.length} nodes, ~${shadowedTokenCount} tokens) with a ${summaryTextLen}-char checkpoint`)
+  // LIVE UI SIGNAL — pin GREEN "[压缩完成!]" NOW that the compaction RESULT is
+  // durable: the four-bracket transaction has committed (span shadowed + checkpoint
+  // appended), the durability flush above has settled, and the failure cooldown is
+  // cleared. This is the ONE authoritative "compaction result landed in the session"
+  // boundary, so we emit DONE HERE regardless of WHICH path initiated the compaction
+  // (idle / checkpoint / manual / threshold). `publishDone` swallows its own failures
+  // (see ui-signal.js) so a messenger hiccup can never disturb the committed outcome
+  // returned below. Callers' own `publishDone` sites remain as harmless duplicates
+  // (idempotent — republishing the same pinned green payload is a no-op visually).
+  try {
+    await publishDone(ctx)
+  } catch { /* publisher is self-contained; a throw here would corrupt a committed tx */ }
   return {
     kind: 'builtin',
     compactionId,
