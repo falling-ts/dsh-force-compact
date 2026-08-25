@@ -36,7 +36,40 @@ export function selectRegion(session, config) {
   const compactableCount = keepFromIdx - 1
   if (compactableCount < config.minCompactableNodes) return null
 
-  return { start: nodes[0], end: nodes[keepFromIdx - 1] }
+  // The compactable PREFIX is indices [0 .. keepFromIdx-2]. Emit its bounds as
+  // the MIN and MAX SEQ BY VALUE (not by array position). After a prior
+  // checkpoint REPLACES earlier nodes but APPENDS the new checkpoint node at a
+  // later log position, the surviving early nodes keep their ORIGINAL (higher)
+  // seqs at HIGHER array indices than the checkpoint — so `surface.nodes` is
+  // NOT necessarily in ascending-seq order. Reading `nodes[0]` / `nodes[i]`
+  // directly could therefore yield `start > end` (an INVERTED span), which
+  // downstream `compactRegion` rejects or mishandles. Taking the value-extremes
+  // guarantees `start <= end`, and the region still denotes the same leading
+  // segment of the projection (bounds are inclusive index segments interpreted
+  // by the session core, so the seq ORDERING within the segment is irrelevant).
+  // Snap the OUTWARD bounds to `user/message` seqs so the replacement stays
+  // tool-pair-balanced: widen `start` downward / shrink `end` upward to the
+  // nearest surrounding user-message seq within the compactable prefix.
+  const prefix = nodes.slice(0, keepFromIdx - 1)
+  let start = Infinity
+  let end = -Infinity
+  for (const seq of prefix) {
+    if (seq < start) start = seq
+    if (seq > end) end = seq
+  }
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return null
+  // Snap both bounds to `user/message` seqs WITHIN the prefix so the replacement
+  // stays tool-pair-balanced: the LOWEST user-message seq becomes `start` and
+  // the HIGHEST becomes `end`. The session core interprets a replace region as
+  // the inclusive index segment between those two nodes, so the segment still
+  // spans the intended leading history. When the prefix contains no user message
+  // at all (unusual — the head is normally one), fall back to the raw value
+  // extremes so a valid span is preserved.
+  const userSeqsInRange = [...prefix].filter(s => userMessageSeqs.has(s)).sort((a, b) => a - b)
+  const snappedStart = userSeqsInRange.length > 0 ? userSeqsInRange[0] : start
+  const snappedEnd = userSeqsInRange.length > 0 ? userSeqsInRange[userSeqsInRange.length - 1] : end
+  if (snappedStart > snappedEnd) return null
+  return { start: snappedStart, end: snappedEnd }
 }
 
 /**

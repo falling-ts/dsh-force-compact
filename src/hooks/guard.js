@@ -147,6 +147,49 @@ function clearCompactCooldown(sessionId) {
 }
 
 /**
+ * Estimate the total token count of the messages contained in a region span,
+ * using the `tokenMeter.estimateMessage` service when available and falling
+ * back to a 4-chars-per-token character heuristic. Mirrors the projection the
+ * builtin engine performs (`projectRegion`), but only to SUM sizes for the
+ * threshold-aware shrink gate — it builds no durable artifacts.
+ * @param {object|undefined} meter the `tokenMeter` service (may be undefined).
+ * @param {import('@deepseek-ai/dsh-session').Session} session
+ * @param {{start: number, end: number}} region the head-anchored span (inclusive seqs).
+ * @returns {number} the summed token estimate (0 when nothing measurable).
+ */
+function estimateRegionTokens(meter, session, region) {
+  const nodes = Array.from(session.surface.nodes)
+  const firstIdx = nodes.indexOf(region.start)
+  const lastIdx = nodes.lastIndexOf(region.end)
+  const segment = (firstIdx >= 0 && lastIdx >= firstIdx)
+    ? nodes.slice(firstIdx, lastIdx + 1)
+    : []
+  let tokens = 0
+  const useMeter = meter !== undefined && typeof meter.estimateMessage === 'function'
+  for (const seq of segment) {
+    const event = session.events[seq]
+    if (event === undefined) continue
+    let content
+    if (event.type === 'user/message') content = event.data.content
+    else if (event.type === 'assistant/message') content = event.data.message && event.data.message.content
+    else if (event.type === 'tool/result') content = event.data.message && event.data.message.content
+    if (content === undefined || content === null) continue
+    if (useMeter) {
+      try {
+        tokens += meter.estimateMessage({ role: 'user', content })
+      } catch {
+        /* estimator hiccup — ignore this block */
+      }
+    } else {
+      let chars = 0
+      for (const block of content) if (block && typeof block.text === 'string') chars += block.text.length
+      tokens += Math.ceil(chars / 4)
+    }
+  }
+  return tokens
+}
+
+/**
  * Compact the **earliest** `ratio` fraction of a session's **tokens** via
  * `compactRegion` (the "earliest conversation token ratio" knob). Measures the
  * session's total context tokens (via `tokenMeter` or a character-based
@@ -194,6 +237,33 @@ async function compactEarliestRatio(ctx, agent, signal, ratio, mode) {
     ctx.logger.debug(`[force-compact] ${session.id}: no earliest ${ratio} token region to compact (totalTokens=${totalTokens == null ? 'unknown(fallback est)' : totalTokens})`)
     return false
   }
+
+  // THRESHOLD-AWARE SHRINK GATE (root fix for the low-threshold dead loop).
+  // Predict whether compacting this region can ACTUALLY pull the session below
+  // `autoThresholdTokens` before paying for a summarization LLM call. When the
+  // chosen region is too small relative to the total — i.e. even removing it
+  // WHOLE would leave total >= threshold — this compaction cannot achieve the
+  // goal, so attempting it just burns an LLM call and (because total hardly
+  // drops) re-arms the same gate on the next step: the "send 3 times, third
+  // wedges" storm. Skip early and let the request proceed.
+  //
+  // Only applied when we KNOW the total (tokenMeter available). With an unknown
+  // total there is no threshold comparison to make, so we proceed normally.
+  // This gate intentionally serves BOTH the auto-threshold path AND the
+  // explicit `/force-compact` path (both funnel here), so a command that
+  // cannot shrink below the threshold is likewise deferred rather than spammed.
+  if (totalTokens !== undefined && totalTokens >= settings.autoThresholdTokens) {
+    const regionTokens = estimateRegionTokens(meter, session, region)
+    if (regionTokens > 0 && totalTokens - regionTokens >= settings.autoThresholdTokens) {
+      ctx.logger.debug(
+        `[force-compact] ${session.id}: threshold-aware gate — earliest ${ratio} region (~${regionTokens} tokens) `
+        + `cannot pull total ~${totalTokens} below threshold ${settings.autoThresholdTokens} `
+        + `(would still be ~${totalTokens - regionTokens}); SKIPPING compaction, letting the request proceed`
+      )
+      return false
+    }
+  }
+
   ctx.logger.debug(`[force-compact] ${session.id}: compacting earliest ${ratio} via ${backend.kind} backend -> span seqs ${region.start}..${region.end} (totalTokens=${totalTokens})`)
   try {
     // LIVE UI SIGNAL — PIN RED "compressing" BEFORE the region compaction

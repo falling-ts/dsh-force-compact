@@ -50,6 +50,50 @@ import { registerLlmStreamHook } from './src/hooks/wire-rewrite.js'
 export const name = 'force-compact'
 
 /**
+ * Per-session COMPRESSION SLOT — one in-flight `compactSession` operation per
+ * session id (keyed by `session.id`, value the SETTLING PROMISE of that
+ * operation). Process-local, bounded naturally by the number of live sessions —
+ * no timer, no persistent state.
+ *
+ * WHY THE LISTENER MUST BE SYNCHRONOUS (the "third send wedges" root cause):
+ * `session/flush` is an AWAITED `parallel` checkpoint — the dispatcher runs every
+ * listener via `Promise.allSettled` and proceeds once they ALL settle. One of
+ * those listeners is the PERSISTENCE COORDINATOR's own handler, which awaits
+ * `live.writes.flush()` — a SHARED write-behind barrier for the session id. If
+ * OUR listener `await`s `compactSession` INSIDE the checkpoint (as it used to),
+ * we participate in the flush's await path: our compaction's durable appends
+ * enqueue onto the coordinator's PER-ID serial `chains` bucket, and when two
+ * `sessions.flush` callers overlap on the same id within one event-loop tick
+ * (observed live: two flush checkpoints a millisecond apart, the inner firing
+ * while the outer was mid-`compactRegion`), the barrier and the per-id queue
+ * enter a mutual-wait interleave — the barrier waits on a `serialize` op whose
+ * `prior` never settles, so the barrier never resolves, so the outer `sessions.
+ * flush` never returns, so the caller's pre-step waterfall never resumes, and
+ * EVERY later `session.list` / `history` for that id queues behind the poisoned
+ * `prior` forever (event loop alive, CPU idle, specific id permanently stalled).
+ *
+ * FIX — decouple the compaction FROM the checkpoint's await path:
+ * 1. The listener STARTS the compaction but does NOT `await` it; it returns
+ *    immediately (synchronously), so we are never on the flush's await path and
+ *    cannot hold the barrier open. The `SessionStore.flush` dispatcher sees our
+ *    listener settle instantly.
+ * 2. A PER-ID SLOT serializes compactions: if a compaction for the same id is
+ *    ALREADY running, a repeat `session/flush` dispatch STARTS NOTHING (skip);
+ *    the slot clears only when the in-flight op SETTLES, so a following flush
+ *    after it completes starts a fresh attempt. No concurrent same-id
+ *    `compactRegion` calls, no re-entrant recursion, no barrier interleave.
+ *
+ * DURABILITY NOTE: the checkpoint still GUARANTEES the compaction was STARTED by
+ * the time it fires (started-before-return, not completed-before-return). Ordering
+ * with the next flush is preserved because the slot suppresses overlap until
+ * settlement. A crash mid-compaction loses the slot (process-local) and relies on
+ * the durable `compaction/*` bracket (an unclosed `compaction/start` surfaces as
+ * a `busy` assertion on reload — the expected, safe failure mode).
+ * @type {Map<string, Promise<void>>}
+ */
+const compactSlot = new Map()
+
+/**
  * Register the model-request Waterfalls, the `session/flush` listener, and the
  * `falling-ts-force-compact` settings namespace (the "强制压缩配置" surface).
  *
@@ -389,7 +433,7 @@ export function apply(ctx) {
   // compactRegion), independent of the per-request guard.
   ctx.logger.info('[force-compact][diagnostic] apply END (all registrations attempted)')
 
-  guard('session/flush listener', () => ctx.on('session/flush', async (session) => {
+  guard('session/flush listener', () => ctx.on('session/flush', (session) => {
     maybeInstallDebugSink()
     maybeRegisterSettingsNamespace()
     maybeRegisterCommand()
@@ -400,13 +444,31 @@ export function apply(ctx) {
       ctx.logger.debug(`[force-compact] ${session.id}: no live agent — skipping`)
       return
     }
+    // COMPRESSION SLOT: if a flush-driven compaction for this session id is
+    // ALREADY running, a repeat `session/flush` dispatch starts NOTHING and
+    // returns immediately — suppressing the concurrent / re-entrant same-id
+    // `compactRegion` call that interleaves with the persistence coordinator's
+    // per-id chain (the "third send wedges" deadlock vector). The listener is
+    // SYNCHRONOUS: it starts the op and returns at once so it is never on the
+    // checkpoint's await path (which is what lets the write-behind barrier
+    // settle and `session.list` stay responsive). See `compactSlot` above.
+    if (compactSlot.has(session.id)) {
+      ctx.logger.debug(`[force-compact] ${session.id}: session/flush dispatched while a compaction slot is still settling — starting no duplicate (serialized by the slot)`)
+      return
+    }
     const controller = new AbortController()
-    try {
+    // Start the compaction, attach settlement cleanup, store the settling
+    // promise as the id's slot. Never `await`ed here — the listener returns
+    // before this op progresses, keeping the checkpoint non-blocking.
+    const op = (async () => {
       const mode = await readRawSetting(ctx, 'compactionMode')
       await compactSession(ctx, agent, controller, mode)
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      ctx.logger.warn(`[force-compact] ${session.id}: compaction failed — ${message}`)
-    }
+    })()
+      .catch(error => {
+        const message = error instanceof Error ? error.message : String(error)
+        ctx.logger.warn(`[force-compact] ${session.id}: flush-triggered compaction failed — ${message}`)
+      })
+      .finally(() => { compactSlot.delete(session.id) })
+    compactSlot.set(session.id, op)
   }))
 }
