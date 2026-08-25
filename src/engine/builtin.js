@@ -288,16 +288,34 @@ function selectHeadAnchoredRegion(settings, session) {
 
 /**
  * Project a region's surface nodes into LLM messages and collect their seqs.
- * Mirrors the official backend's projection: user/assistant/tool-result become
- * messages; log-only events contribute nothing.
+ *
+ * A replace op's bounds are interpreted by the session core over the CURRENT
+ * SURFACE PROJECTION as an INCLUSIVE INDEX SEGMENT: everything the projection
+ * holds between `nodes.indexOf(start)` and `nodes.indexOf(end)` is shadowed
+ * (`surface.replacementRange` slices by index, not by seq value). Because a
+ * previously-generated checkpoint REPLACES earlier nodes but APPENDS at its
+ * own (later) log position, the surviving early survivors keep LOWER seqs yet
+ * HIGHER indices than the checkpoint node. An inclusive SEQ-value-range filter
+ * (`seq >= start && seq <= end`) therefore MISSES those surviving mid-span
+ * nodes whenever a prior checkpoint sits at the head — exactly the second
+ * compaction round — and the session core rejects the replace for incomplete
+ * provenance ("sourceEventSeqs must include every shadowed surface node").
+ *
+ * So we compute the shadowed set by the SAME rule the core applies: the index
+ * segment from `start` to `end` in the live projection. Log-only events
+ * contribute nothing; a projected node that yields no message still counts as
+ * shadowed.
  */
 function projectRegion(session, region) {
-  const nodes = session.surface.nodes
-  const seqSet = new Set(nodes.filter(seq => seq >= region.start && seq <= region.end))
+  const nodes = Array.from(session.surface.nodes)
+  const firstIdx = nodes.indexOf(region.start)
+  const lastIdx = nodes.lastIndexOf(region.end)
+  const segment = (firstIdx >= 0 && lastIdx >= firstIdx)
+    ? nodes.slice(firstIdx, lastIdx + 1)
+    : []
   const messages = []
   const shadowedSeqs = []
-  for (const seq of nodes) {
-    if (!seqSet.has(seq)) continue
+  for (const seq of segment) {
     const event = session.events[seq]
     if (event === undefined) continue
     if (event.type === 'user/message') {
@@ -313,6 +331,11 @@ function projectRegion(session, region) {
         shadowedSeqs.push(seq)
         messages.push({ role: 'user', content: msg.content, tool_call_id: msg.toolCallId })
       }
+    } else {
+      // Still a surface node that yields no message (empty assistant usage
+      // host); it is shadowed by the replace even though it contributes no
+      // message.
+      shadowedSeqs.push(seq)
     }
   }
   return { shadowedSeqs, messages }
@@ -324,11 +347,13 @@ function projectRegion(session, region) {
  * or `null` when invalid.
  */
 function validateReplacementBounds(session, region) {
-  const nodes = session.surface.nodes
-  if (!nodes.includes(region.start) || !nodes.includes(region.end)) return null
-  const startIdx = nodes.indexOf(region.start)
-  const endIdx = nodes.indexOf(region.end)
-  if (startIdx > endIdx) return null
+  const nodes = Array.from(session.surface.nodes)
+  const firstIdx = nodes.indexOf(region.start)
+  const lastIdx = nodes.lastIndexOf(region.end)
+  // Same validity predicate the session core applies: both bounds exist in the
+  // projection and start precedes end BY INDEX (not by seq value — see
+  // projectRegion).
+  if (firstIdx < 0 || lastIdx < 0 || firstIdx > lastIdx) return null
   return { start: region.start, end: region.end }
 }
 
