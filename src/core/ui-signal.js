@@ -157,14 +157,30 @@ export function pinnedPayload(phase) {
  *
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @param {{phase: string, text: string, color: string}} status
+ * @param {boolean} [isImportant=false] — `true` bypasses the guard entirely
+ *   and writes unconditionally. `false` (the default) refuses to overwrite a
+ *   currently displayed text that starts with `[` (i.e. a pinned bracket-form
+ *   message such as `[强制压缩中>>>]`), returning early without touching
+ *   settings.
  * @returns {Promise<void>}
  */
 let warnedOnce = false
-export async function publishUiStatus(ctx, status) {
+export async function publishUiStatus(ctx, status, isImportant = false) {
   try {
     const settings = ctx.get('settings')
     if (settings === undefined || typeof settings.update !== 'function') return
     const NS = 'falling-ts-force-compact'
+    // Non-important pushes refuse to overwrite a pinned bracket-form text.
+    if (!isImportant) {
+      let currentText
+      try {
+        const nsValue = (typeof settings.get === 'function') ? settings.get(NS) : undefined
+        currentText = (nsValue != null && typeof nsValue === 'object')
+          ? nsValue[LIVE_UI_FIELD]?.text
+          : (typeof nsValue === 'string' ? nsValue : undefined)
+      } catch { /* read failure must not block the important path — fall through */ }
+      if (typeof currentText === 'string' && currentText.startsWith('[')) return
+    }
     await settings.update(NS, { [LIVE_UI_FIELD]: status })
     if (!warnedOnce) {
       warnedOnce = true
@@ -198,20 +214,24 @@ export async function publishRandomWorking(ctx) {
 }
 
 /**
- * Publish the pinned RED "正在压缩…" status. Call BEFORE a `compactNow` /
- * `compactRegion` invocation.
+ * Publish the pinned RED "[强制压缩中>>>]" status. Call BEFORE a `compactNow` /
+ * `compactRegion` invocation. Passes `isImportant=true` so the pinned
+ * bracket-form message can overwrite whatever is currently displayed (including
+ * another pinned text).
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @returns {Promise<void>}
  */
 export async function publishCompressing(ctx) {
-  await publishUiStatus(ctx, pinnedPayload(PHASE_COMPRESSING))
+  await publishUiStatus(ctx, pinnedPayload(PHASE_COMPRESSING), true)
 }
 
 /**
- * Publish the pinned GREEN "压缩完成!!!" status. Call AFTER a `compactNow` /
+ * Publish the pinned GREEN "[压缩完成!]" status. Call AFTER a `compactNow` /
  * `compactRegion` invocation commits. The following model step's
  * `llm/stream` listener replaces it with a fresh random working pair (~within
- * 3 s in normal cadence — see {@link publishRandomWorking}).
+ * 3 s in normal cadence — see {@link publishRandomWorking}). Does NOT pass
+ * `isImportant=true`: a DONE banner is transient (self-corrects at the next
+ * model step) and should not clobber a manually-set custom banner.
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @returns {Promise<void>}
  */
