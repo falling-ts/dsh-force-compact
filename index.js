@@ -240,6 +240,31 @@ export function apply(ctx) {
   // degradation: the rest of the plugin continues working, the command simply
   // remains unregistered.
   const commandState = { settled: false, warnedAbsent: false }
+  const COMMAND_WARN_AFTER_MS = 10 * 60 * 1000
+  const commandWarnScheduled = { value: false }
+  // Make a PERMANENTLY absent `commands` service diagnosable. While the service
+  // is simply still arriving (the normal boot→preset-plane window) nothing is
+  // emitted; only if the command has STILL not registered ten minutes after
+  // `apply` does a single warn explain the silent symptom (empty slash-command
+  // picker). Self-cancelling: nothing left running past the plugin's lifetime.
+  const scheduleAbsenceWarning = () => {
+    if (commandState.settled || commandWarnScheduled.value) return
+    commandWarnScheduled.value = true
+    ctx.effect(() => () => {
+      if (timerValue !== undefined) clearTimeout(timerValue)
+      timerValue = undefined
+    }, 'force-compact: command-absence warning cleanup')
+    let timerValue
+    timerValue = setTimeout(() => {
+      timerValue = undefined
+      if (!commandState.settled) {
+        ctx.logger.warn(
+          '[force-compact] /force-compact command still UNREGISTERED 10 min after plugin boot — '
+          + 'the `commands` service does not appear to be mounted in this composition.',
+        )
+      }
+    }, COMMAND_WARN_AFTER_MS)
+  }
   const maybeRegisterCommand = () => {
     if (commandState.settled) return
     if (typeof registerCommand !== 'function') return
@@ -257,7 +282,9 @@ export function apply(ctx) {
     if (ok) {
       commandState.settled = true
       ctx.logger.info('[force-compact] /force-compact command registered (deferred)')
+      return
     }
+    scheduleAbsenceWarning()
   }
   // NOTE: no boot-time invocation here. At `apply` execution the `commands`
   // service is guaranteed absent (preset plane hasn't mounted yet), so a
@@ -324,6 +351,13 @@ export function apply(ctx) {
   // when the agent transitions to `idle` (all turns done, including sub-
   // agents, before the next human turn).
   guard('agent/status listener', () => ctx.on('agent/status', (payload) => {
+    // This listener fires FIRST for a fresh session (the agent goes `idle`
+    // almost immediately) — often before ANY `agent/request` / `agent/pre-step`
+    // event has arrived, i.e. possibly before the preset plane has mounted the
+    // `commands` service. It therefore joins the deferred-registration loop too
+    // (as the other guarded listeners do) so the first idle transition is what
+    // typically settles the `/force-compact` command registration.
+    maybeRegisterCommand()
     // Fire-and-forget: trace listener liveness on the idle transition, read the
     // compactionMode raw (cheap), then hand off to the turn-end handler which
     // locates the per-realm compaction backend via `agent.ctx`.
