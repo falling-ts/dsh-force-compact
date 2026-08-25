@@ -39,10 +39,9 @@
  */
 
 import { compactSession } from './src/engine/checkpoint.js'
-import { registerNamespace, readSettings, readRawSetting } from './src/core/settings.js'
+import { registerNamespace, readRawSetting } from './src/core/settings.js'
 import { ensureDebugLogger } from './src/core/log.js'
 import { forceCompactIfNeeded, thinkingDisabled, dbg } from './src/hooks/guard.js'
-import { resolveCompaction } from './src/engine/backend.js'
 import { registerCommand } from './src/hooks/command.js'
 import { handleAgentStatus } from './src/hooks/idle.js'
 import { registerLlmStreamHook } from './src/hooks/wire-rewrite.js'

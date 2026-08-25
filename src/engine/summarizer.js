@@ -12,9 +12,12 @@
  * @module @falling-ts/dsh-force-compact/summarizer
  */
 
-/** Tags wrapping the structured summary inside the landed checkpoint node. */
+/** Tag opening the structured summary block inside a landed checkpoint node.
+ *  (The matching close tag is the symmetric `</compacted-summary>`; it is kept
+ *  as a literal where emitted rather than a second constant, since the open tag
+ *  is the sole anchor referenced elsewhere — by the prior-checkpoint rule in
+ *  `COMPACTION_INSTRUCTION`.) */
 export const SUMMARY_OPEN_TAG = '<compacted-summary>'
-export const SUMMARY_CLOSE_TAG = '</compacted-summary>'
 
 /**
  * The compaction directive, delivered as the FINAL user message after the
