@@ -59,33 +59,35 @@ export const PINNED_COLORS = Object.freeze({
 })
 
 /**
- * The 20 WORKING-phase texts. Four-character, plainly-worded verbs describing
- * what the agent is doing right now ("思考中..." / "整理中..." / …) followed by
- * a trailing ellipsis. Colors are unchanged and remain randomly paired with
- * these labels.
+ * The 20 WORKING-phase texts. Deliberately irreverent, meme-flavored one-liners
+ * aimed at the agent ITSELF ("我正在憋大招..." / "我在偷渡..." / ...) — the
+ * badge talks about what the agent is supposedly up to in a playful voice
+ * instead of dry status verbs. Lengths intentionally exceed the old four-char
+ * constraint; the client paints the raw string with no width assumption.
+ * Colors are unchanged and remain randomly paired with these labels.
  * @readonly
  */
 export const WORKING_TEXTS = Object.freeze([
-  '正在思考...',
-  '正在整理...',
-  '正在规划...',
-  '正在分析...',
-  '正在检索...',
-  '正在推理...',
-  '正在校验...',
-  '正在比对...',
-  '正在权衡...',
-  '正在归纳...',
-  '正在总结...',
-  '正在撰写...',
-  '正在执行...',
-  '正在运行...',
-  '正在处理...',
-  '正在计算...',
-  '正在核实...',
-  '正在生成...',
-  '正在准备...',
-  '正在继续...',
+  '正在酝酿骚操作...',
+  '正在憋大招...',
+  '灵感正在路上...',
+  '脑细胞开会中...',
+  '灵魂拷问进行中...',
+  '偷偷翻你底牌...',
+  '量子纠缠计算中...',
+  '假装很忙...',
+  '摸鱼式工作中...',
+  '疯狂敲键盘(精神上)...',
+  '正在缝合上下文...',
+  '正在驯服混沌...',
+  '正在召唤赛博大脑...',
+  '正在翻阅《天机》...',
+  'CPU 正在冒烟...',
+  '正在跟熵值搏斗...',
+  '正在画饼给你吃...',
+  '正在偷渡灵感...',
+  '正在暗中观察...',
+  '马上就好(大概)...',
 ])
 
 /**
