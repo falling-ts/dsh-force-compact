@@ -24,9 +24,9 @@
  * drawn from the 20×20 tables below — the "工作中的状态" set). Around a
  * force-compaction the display is OVERRIDDEN deterministically, not randomly:
  *
- *   • COMPRESSING — pinned red `正在压缩…`, fired BEFORE the `compactNow` /
+ *   • COMPRESSING — pinned red `[强制压缩中>>>]`, fired BEFORE the `compactNow` /
  *     `compactRegion` call;
- *   • DONE        — pinned green `压缩完成!!!`, fired right AFTER the call
+ *   • DONE        — pinned green `[压缩完成!]`, fired right AFTER the call
  *     commits; then after `DONE_FALLBACK_MS` (3 s) the next LLM-call moment
  *     redraws a fresh random working pair (no dedicated timer — the badge
  *     self-corrects at the very next model step, which is the natural visual
@@ -49,8 +49,8 @@ export const PHASE_DONE = 'done'
 
 /** Pinned (never randomized) payloads for the deterministic phases. */
 export const PINNED_TEXTS = Object.freeze({
-  [PHASE_COMPRESSING]: '正在压缩…',
-  [PHASE_DONE]: '压缩完成!!!',
+  [PHASE_COMPRESSING]: '[强制压缩中>>>]',
+  [PHASE_DONE]: '[压缩完成!]',
 })
 
 /** Pinned colors matching {@link PINNED_TEXTS} — red while compacting, green on completion. */
