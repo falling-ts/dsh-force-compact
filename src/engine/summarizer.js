@@ -12,6 +12,8 @@
  * @module @falling-ts/dsh-force-compact/summarizer
  */
 
+import { guardFn } from '../core/crashnet.js'
+
 /** Tag opening the structured summary block inside a landed checkpoint node.
  *  (The matching close tag is the symmetric `</compacted-summary>`; it is kept
  *  as a literal where emitted rather than a second constant, since the open tag
@@ -132,7 +134,12 @@ export const CHECKPOINT_PREAMBLE =
  *   labeled failure, so a bad provider response can never surface a TypeError
  *   nor trap the idle path in an uncaught-exception retry loop.
  */
-export async function summarize(ctx, config, agent, input, signal, extra) {
+// Internal body of `summarize` — routed through the crash-net wrapper. The
+// documented contract is "NEVER THROWS", but a genuinely novel throw shape
+// (e.g. a `JSON.stringify` on a cycle, an exotic iterator) escapes into the
+// crash net, leaving a durable trace and propagating the original value
+// unchanged (existing callers keep their semantics).
+async function __summarizeBody(ctx, config, agent, input, signal, extra) {
   // NEVER THROWS. Always resolves to a structured result the caller branches on
   // by `status`:
   //   { status: 'ok',        summary[], provider, model, maxTokens?, usage? }
@@ -438,6 +445,9 @@ function resolveTarget(config, agent) {
   }
   return undefined
 }
+
+/** Public entry — wrapped by the universal crash net. */
+export const summarize = guardFn('summarizer.summarize', __summarizeBody)
 
 /**
  * Read the session's latest request header and project the prefix-cache

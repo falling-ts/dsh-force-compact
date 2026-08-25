@@ -17,6 +17,7 @@ import { queueForceCompact } from './guard.js'
 import { resolveCompaction } from '../engine/backend.js'
 import { readRawSetting } from '../core/settings.js'
 import { publishCompressing, publishDone } from '../core/ui-signal.js'
+import { guardFn, renderCrash, captureThrowSite, appendCrashLine as appendDiag } from '../core/crashnet.js'
 
 /**
  * Register the global `/force-compact` command. A no-op when the `commands`
@@ -26,7 +27,8 @@ import { publishCompressing, publishDone } from '../core/ui-signal.js'
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @returns {boolean} whether the command was registered this call.
  */
-export function registerCommand(ctx) {
+// Internal body of `registerCommand` — routed through the crash-net wrapper.
+function __registerCommandBody(ctx) {
   const commands = ctx.get('commands')
   if (commands === undefined || typeof commands.register !== 'function') {
     // Silent on purpose: a transient miss during the boot→preset-plane window
@@ -52,6 +54,12 @@ export function registerCommand(ctx) {
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         ctx.logger.warn(`[force-compact] /force-compact handler degraded — ${message}`)
+        // UNIVERSAL-CRASH-NET diagnostic alongside the ctx.logger line above —
+        // a durable, parseable trail independent of logger wiring.
+        try {
+          const lines = renderCrash('command.handler', error, captureThrowSite())
+          for (const line of lines) appendDiag(line)
+        } catch (_netFailure) { /* swallow */ }
         return { kind: 'error', text: `compaction could not be started: ${message}` }
       }
     },
@@ -60,6 +68,9 @@ export function registerCommand(ctx) {
   ctx.logger.debug('[force-compact] registered /force-compact command')
   return true
 }
+
+/** Public entry — wrapped by the universal crash net. */
+export const registerCommand = guardFn('command.registerCommand', __registerCommandBody)
 
 /** Body of the `/force-compact` command handler; wrapped by its safe envelope. */
 async function __forceCompactCommandBody(ctx, invocation) {

@@ -31,6 +31,7 @@
 import { readRawSetting, COMPACT_MODE_GLOBAL } from '../core/settings.js'
 
 import { compactNowBuiltin, compactRegionBuiltin } from './builtin.js'
+import { guardFn } from '../core/crashnet.js'
 
 /**
  * Find a usable compaction backend for one agent.
@@ -52,13 +53,19 @@ import { compactNowBuiltin, compactRegionBuiltin } from './builtin.js'
  * @param {string|undefined} mode the `compactionMode` setting value (`'realm'`|`'global'`).
  * @returns {Promise<{ compactNow: Function, compactRegion: Function, kind: 'official'|'builtin' }|undefined>} a normalized backend, or `undefined` when neither the official service nor the builtin engine is usable.
  */
-export async function resolveCompaction(ctx, agent, mode) {
+// Internal body of `resolveCompaction` — routed through the crash-net wrapper
+// so an unusual throw (a throwing `ctx.get` proxy, a rejecting `readRawSetting`)
+// becomes a visible diagnostic rather than a silent propagation.
+async function __resolveCompactionBody(ctx, agent, mode) {
   const official = await findOfficialService(ctx, agent, mode)
   if (official !== undefined) {
     return { compactNow: official.compactNow, compactRegion: official.compactRegion, kind: 'official' }
   }
   return await builtinBackend(ctx, agent)
 }
+
+/** Public entry — wrapped by the universal crash net. */
+export const resolveCompaction = guardFn('backend.resolveCompaction', __resolveCompactionBody)
 
 /**
  * Locate the OFFICIAL `compaction` service for this agent via the historical

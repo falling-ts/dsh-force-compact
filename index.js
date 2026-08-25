@@ -47,6 +47,7 @@ import { forceCompactIfNeeded, thinkingDisabled } from './src/hooks/guard.js'
 import { registerCommand } from './src/hooks/command.js'
 import { handleAgentStatus } from './src/hooks/idle.js'
 import { registerLlmStreamHook } from './src/hooks/wire-rewrite.js'
+import { guardFn, installCrashNet } from './src/core/crashnet.js'
 
 /** @type {string} the function plugin's display name. */
 export const name = 'force-compact'
@@ -118,7 +119,7 @@ const compactSlot = new Map()
  *
  * @param {import('@deepseek-ai/cordis').Context} ctx
  */
-export function apply(ctx) {
+const __applyInner = (ctx) => {
   ctx.logger.info('[force-compact] apply START; settings=' + (ctx.get('settings') !== undefined ? 'present' : 'ABSENT') + ' compaction=' + (ctx.get('compaction') !== undefined ? 'present' : 'ABSENT'))
   // Register the `falling-ts-force-compact` settings namespace. This is done
   // LAZILY and IDEMPOTENTLY rather than in a boot-time effect because the
@@ -529,3 +530,21 @@ async function __agentRequestListenerBody(ctx, payload, next) {
     }
   }))
 }
+
+/**
+ * Plugin entry — the UNIVERSAL-CRASH-NET-covered form of {@link __applyInner}.
+ *
+ * Every public entry in the plugin is routed through {@link guardFn}: the
+ * wrapper catches any throw (sync or promise rejection) crossing this
+ * boundary, appends a full diagnostic (function name, thrownAt
+ * `file:line:col`, deepest plugin frame, nearest non-plugin frame, full call
+ * stack) to the durable crash log, and propagates the original outcome
+ * unchanged. `apply` is called ONCE per fiber at boot — the process-wide net
+ * ({@link installCrashNet}) is installed from inside the inner body before
+ * any listener is registered.
+ */
+export const apply = guardFn('index.apply', (ctx) => {
+  // Process-wide net — at most one install per process, before anything else.
+  installCrashNet()
+  return __applyInner(ctx)
+})

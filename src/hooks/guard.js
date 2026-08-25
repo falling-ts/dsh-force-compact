@@ -35,6 +35,7 @@ import {
 } from '../engine/region.js'
 import { resolveCompaction } from '../engine/backend.js'
 import { publishCompressing, publishDone } from '../core/ui-signal.js'
+import { guardFn, renderCrash, captureThrowSite, appendCrashLine as appendDiag } from '../core/crashnet.js'
 
 /**
  * Process-local "force compact now" flags, one per session (keyed by
@@ -54,20 +55,21 @@ const pendingForce = new Map()
  * model.
  * @param {string} sessionId
  */
-export function queueForceCompact(sessionId) {
+/** Top-level entry — wrapped by the universal crash net. */
+export const queueForceCompact = guardFn('guard.queueForceCompact', (sessionId) => {
   if (sessionId !== undefined && sessionId !== null) pendingForce.set(sessionId, true)
-}
+})
 
 /**
  * Consume (and clear) any pending forced-compaction flag for one session.
  * @param {string} sessionId
  * @returns {boolean} whether a force was pending and is now cleared.
  */
-export function takeForceCompact(sessionId) {
+export const takeForceCompact = guardFn('guard.takeForceCompact', (sessionId) => {
   const pending = pendingForce.get(sessionId)
   if (pending) pendingForce.delete(sessionId)
   return pending === true
-}
+})
 
 
 
@@ -367,22 +369,34 @@ async function __compactRetainingLatestBody(ctx, agent, signal, mode) {
  * @param {string|undefined} mode the `compactionMode` setting (passed by the caller); undefined re-reads live.
  * @returns {Promise<boolean>} `true` when the caller should return `{ kind: 'reject' }`.
  */
-export async function forceCompactIfNeeded(ctx, agent, signal, mode) {
-  // SAFETY ENVELOPE (pre-step gate): the CONTRACT is to resolve `false` (let
-  // the model request proceed) whenever ANYTHING goes wrong — missing/malformed
-  // `agent.session`, a rejecting `readSettings`, a throwing `tokenMeter.measure`,
-  // or a failing compaction. An uncaught throw HERE would surface as a broken
-  // `agent/pre-step` step (a stall), which is precisely the "every request
-  // pauses" symptom we are eliminating. So the entire body is contained; any
-  // anomaly logs and lets the request through.
+// SAFETY ENVELOPE (pre-step gate): the CONTRACT is to resolve `false` (let
+// the model request proceed) whenever ANYTHING goes wrong — missing/malformed
+// `agent.session`, a rejecting `readSettings`, a throwing `tokenMeter.measure`,
+// or a failing compaction. An uncaught throw HERE would surface as a broken
+// `agent/pre-step` step (a stall), which is precisely the "every request
+// pauses" symptom we are eliminating. So the entire body is contained; any
+// anomaly logs and lets the request through.
+// Additionally, the wrapper appends a UNIVERSAL-CRASH-NET diagnostic
+// (message, thrownAt file:line:col, deepest plugin frame, nearest
+// non-plugin frame, full call stack) to the durable crash log — belt-
+// and-braces beyond the ctx.logger line above.
+async function __forceCompactIfNeededEnvelope(ctx, agent, signal, mode) {
   try {
     return await __forceCompactIfNeededBody(ctx, agent, signal, mode)
   } catch (error) {
     const message = error instanceof Error ? (error.stack || error.message) : String(error)
     ctx.logger.warn(`[force-compact] forceCompactIfNeeded degraded to false (letting the request proceed) — ${message}`)
+    // Crash-net side-channel: always-visible file entry even if ctx.logger
+    // is miswired. Swallows its own errors (never disturbs the degradation).
+    try {
+      const lines = renderCrash('guard.forceCompactIfNeeded', error, captureThrowSite())
+      for (const line of lines) appendDiag(line)
+    } catch (_netFailure) { /* never affect the request path */ }
     return false
   }
 }
+
+export const forceCompactIfNeeded = guardFn('guard.forceCompactIfNeeded', __forceCompactIfNeededEnvelope)
 
 /** Body of {@link forceCompactIfNeeded}; wrapped by its safe envelope. */
 async function __forceCompactIfNeededBody(ctx, agent, signal, mode) {
@@ -517,19 +531,26 @@ async function __forceCompactIfNeededBody(ctx, agent, signal, mode) {
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @returns {Promise<boolean>}
  */
-export async function thinkingDisabled(ctx) {
-  // `agent/request` entry — a throw here would corrupt EVERY outgoing model
-  // request. Contain it: any settings anomaly resolves `false` (thinking left
-  // at its provider default) rather than breaking the request path.
+// `agent/request` entry — a throw here would corrupt EVERY outgoing model
+// request. Contain it: any settings anomaly resolves `false` (thinking left
+// at its provider default) rather than breaking the request path.
+// Also append a UNIVERSAL-CRASH-NET diagnostic on any degradation.
+async function __thinkingDisabledBody(ctx) {
   try {
     const settings = (await readSettings(ctx)) ?? DEFAULTS
     return settings.disableThinking === true
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     ctx.logger.warn(`[force-compact] thinkingDisabled degraded to false — ${message}`)
+    try {
+      const lines = renderCrash('guard.thinkingDisabled', error, captureThrowSite())
+      for (const line of lines) appendDiag(line)
+    } catch (_netFailure) { /* swallow */ }
     return false
   }
 }
+
+export const thinkingDisabled = guardFn('guard.thinkingDisabled', __thinkingDisabledBody)
 
 /**
  * Coarse token estimate for a session's whole surface content, used only when

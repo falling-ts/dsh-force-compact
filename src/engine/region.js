@@ -8,13 +8,16 @@
  * @module @falling-ts/dsh-force-compact/region
  */
 
+import { guardFn } from '../core/crashnet.js'
+
 /**
  * Select the compactable region for a session.
  * @param {import('@deepseek-ai/dsh-session').Session} session
  * @param {Readonly<object>} config
  * @returns {{start: number, end: number} | null} the head-anchored span to compact, or `null` when there is nothing worth compacting.
  */
-export function selectRegion(session, config) {
+// Internal body of `selectRegion` — routed through the crash-net wrapper.
+function __selectRegionBody(session, config) {
   // A malformed surface (missing `session.surface` / non-array `nodes`) yields
   // nothing to compact — return null rather than throw.
   const nodes = (session && session.surface && Array.isArray(session.surface.nodes)) ? session.surface.nodes : []
@@ -73,6 +76,9 @@ export function selectRegion(session, config) {
   if (snappedStart > snappedEnd) return null
   return { start: snappedStart, end: snappedEnd }
 }
+
+/** Public entry — wrapped by the universal crash net. */
+export const selectRegion = guardFn('region.selectRegion', __selectRegionBody)
 
 /**
  * The set of seqs that are `user/message` surface events, so the region
@@ -135,7 +141,9 @@ function userMessageEventSeqs(session) {
  *   chip away the head until the session settles below the threshold.
  * @returns {{start: number, end: number} | null} the head-anchored span to compact, or `null`.
  */
-export function selectEarliestByMeasurements(session, ratio, measurement, maxRegionNodes) {
+// Internal body of `selectEarliestByMeasurements` — routed through the
+// crash-net wrapper.
+function __selectEarliestByMeasurementsBody(session, ratio, measurement, maxRegionNodes) {
   const nodes = (measurement && Array.isArray(measurement.nodes) && measurement.nodes.length > 0)
     ? measurement.nodes
     : []
@@ -242,7 +250,9 @@ export function selectEarliestByMeasurements(session, ratio, measurement, maxReg
  *   head-anchored span to compact plus the actual retained tail's token sum,
  *   or `null` when there is not enough surface to compact.
  */
-export function selectRetainingLatestTokens(session, retainLatestTokens, measurement) {
+// Internal body of `selectRetainingLatestTokens` — routed through the
+// crash-net wrapper.
+function __selectRetainingLatestTokensBody(session, retainLatestTokens, measurement) {
   const nodes = (measurement && Array.isArray(measurement.nodes) && measurement.nodes.length > 0)
     ? measurement.nodes
     : []
@@ -337,7 +347,8 @@ export function selectRetainingLatestTokens(session, retainLatestTokens, measure
  *   {@link selectEarliestByMeasurements}.
  * @returns {{start: number, end: number} | null} the head-anchored span to compact, or `null`.
  */
-export function selectEarliestByTokens(session, totalTokens, maxRegionNodes) {
+// Internal body of `selectEarliestByTokens` — routed through the crash-net wrapper.
+function __selectEarliestByTokensBody(session, totalTokens, maxRegionNodes) {
   // A malformed surface yields nothing to compact — return null rather than
   // throwing on a missing `session.surface.nodes`.
   const nodes = (session && session.surface && Array.isArray(session.surface.nodes)) ? session.surface.nodes : []
@@ -436,3 +447,8 @@ function estimateSurfaceTokens(session) {
   }
   return Math.ceil(chars / 4)
 }
+
+/** Public entries — wrapped by the universal crash net. */
+export const selectEarliestByMeasurements = guardFn('region.selectEarliestByMeasurements', __selectEarliestByMeasurementsBody)
+export const selectRetainingLatestTokens = guardFn('region.selectRetainingLatestTokens', __selectRetainingLatestTokensBody)
+export const selectEarliestByTokens = guardFn('region.selectEarliestByTokens', __selectEarliestByTokensBody)

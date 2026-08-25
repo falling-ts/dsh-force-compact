@@ -36,6 +36,7 @@
 import { summarize, CHECKPOINT_PREAMBLE, headerPrefix } from './summarizer.js'
 import { selectEarliestByTokens } from './region.js'
 import { readSettings, DEFAULTS } from '../core/settings.js'
+import { guardFn } from '../core/crashnet.js'
 
 /**
  * ONE-SHOT LOAD MARKER — proves WHICH built engine is actually loaded on a
@@ -218,7 +219,10 @@ function mintCompactionId() {
  * @param {AbortSignal} [signal]
  * @returns {Promise<object|null>} the compaction result, or `null` when skipped.
  */
-export async function compactNowBuiltin(ctx, agent, signal) {
+// Internal body of `compactNowBuiltin` — routed through the crash-net wrapper
+// so an unexpected throw escaping the internal guards becomes a durable,
+// parseable diagnostic rather than a silent propagation up the call stack.
+async function __compactNowBuiltinBody(ctx, agent, signal) {
   const session = agent.session
   if (session === undefined || typeof session.append !== 'function') return null
   const settings = (await readSettings(ctx)) ?? DEFAULTS
@@ -275,7 +279,8 @@ export async function compactNowBuiltin(ctx, agent, signal) {
  * @param {AbortSignal} [signal]
  * @returns {Promise<object|null>} the compaction result, or `null` when aborted/skippedped.
  */
-export async function compactRegionBuiltin(ctx, start, end, agent, signal) {
+// Internal body of `compactRegionBuiltin` — routed through the crash-net wrapper.
+async function __compactRegionBuiltinBody(ctx, start, end, agent, signal) {
   const session = agent.session
   if (session === undefined || typeof session.append !== 'function') return null
   const settings = (await readSettings(ctx)) ?? DEFAULTS
@@ -283,6 +288,10 @@ export async function compactRegionBuiltin(ctx, start, end, agent, signal) {
   if (start > end) return null
   return runTransaction(ctx, agent, session, { start, end }, signal, settings)
 }
+
+/** Public entries — wrapped by the universal crash net. */
+export const compactNowBuiltin = guardFn('builtin.compactNowBuiltin', __compactNowBuiltinBody)
+export const compactRegionBuiltin = guardFn('builtin.compactRegionBuiltin', __compactRegionBuiltinBody)
 
 /**
  * The core transaction: append the durable bracket + a replace node shadowing

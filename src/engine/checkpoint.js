@@ -17,6 +17,7 @@ import { resolveConfig } from '../core/policy.js'
 import { selectRegion } from './region.js'
 import { readSettings, DEFAULTS } from '../core/settings.js'
 import { resolveCompaction } from './backend.js'
+import { guardFn, renderCrash, captureThrowSite, appendCrashLine as appendDiag } from '../core/crashnet.js'
 
 /** Characters per token, mirroring the token meter's coarse estimate. */
 const CHARS_PER_TOKEN = 4
@@ -38,7 +39,12 @@ const CHARS_PER_TOKEN = 4
  *   endSeq, summary, shadowedRange, shadowedSeqs, shadowedTokenCount }`), or `null`
  *   when nothing was worth compacting or no backend was available.
  */
-export async function compactSession(ctx, agent, controller, mode) {
+// Internal body of `compactSession` — routed through the crash-net wrapper.
+// The existing try/catch around `backend.compactRegion` handles the
+// expected-backend-failure path; the crash-net layer adds observability
+// for ANOMALOUS throws escaping that catch (malformed `selectRegion` inputs,
+// an unexpected throw out of the backend facade, etc.).
+async function __compactSessionBody(ctx, agent, controller, mode) {
   // SAFETY GUARD: a missing/unusable `agent.session` means there is nothing to
   // compact — degrade to `null` (skip) rather than a downstream `session.id` /
   // `session.events` dereference throwing out of the flush-checkpoint path.
@@ -98,6 +104,12 @@ export async function compactSession(ctx, agent, controller, mode) {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     ctx.logger.warn(`[force-compact] ${session.id}: checkpoint compaction via ${backend?.kind} FAILED — ${message}`)
+    // UNIVERSAL-CRASH-NET diagnostic — a durable trail for every anomalous
+    // backend failure, independent of logger wiring.
+    try {
+      const lines = renderCrash('checkpoint.compactSession.backend-call', error, captureThrowSite())
+      for (const line of lines) appendDiag(line)
+    } catch (_netFailure) { /* swallow */ }
     return null
   }
   if (result === undefined || result === null) {
@@ -110,6 +122,9 @@ export async function compactSession(ctx, agent, controller, mode) {
   )
   return result
 }
+
+/** Public entry — wrapped by the universal crash net. */
+export const compactSession = guardFn('checkpoint.compactSession', __compactSessionBody)
 
 /**
  * Coarse token estimate for a session's whole surface content (user +

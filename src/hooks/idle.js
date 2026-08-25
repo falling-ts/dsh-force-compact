@@ -22,6 +22,7 @@
 import { readSettings, DEFAULTS } from '../core/settings.js'
 import { resolveCompaction } from '../engine/backend.js'
 import { publishCompressing, publishDone } from '../core/ui-signal.js'
+import { guardFn, renderCrash, captureThrowSite, appendCrashLine as appendDiag } from '../core/crashnet.js'
 
 /**
  * Handle one `agent/status` emission: when the agent transitions to `idle` and
@@ -33,21 +34,29 @@ import { publishCompressing, publishDone } from '../core/ui-signal.js'
  * @param {string|undefined} mode the `compactionMode` setting (passed by the caller); undefined re-reads live.
  * @returns {Promise<void>}
  */
-export async function handleAgentStatus(ctx, payload, mode) {
-  // SAFETY ENVELOPE: this handler fires on EVERY `agent/status` transition.
-  // `compactNow` is a heavyweight LLM round-trip and the idle tick recurs ~every
-  // 5s, so ANY uncaught throw here would repeat on every tick — the concrete
-  // "stutters every request / stuck" symptom. The ENTIRE body is therefore
-  // contained: any anomaly (malformed payload, a rejecting `readSettings`, a
-  // missing `agent.session`, a failing backend call) logs and returns; it NEVER
-  // throws into the `agent/status` dispatch.
+// SAFETY ENVELOPE: this handler fires on EVERY `agent/status` transition.
+// `compactNow` is a heavyweight LLM round-trip and the idle tick recurs ~every
+// 5s, so ANY uncaught throw here would repeat on every tick — the concrete
+// "stutters every request / stuck" symptom. The ENTIRE body is therefore
+// contained: any anomaly (malformed payload, a rejecting `readSettings`, a
+// missing `agent.session`, a failing backend call) logs and returns; it NEVER
+// throws into the `agent/status` dispatch. Additionally, a UNIVERSAL-CRASH-NET
+// diagnostic (thrownAt site, deepest plugin frame, nearest non-plugin frame,
+// full stack) is appended to the durable crash log on every degradation.
+async function __handleAgentStatusEnveloped(ctx, payload, mode) {
   try {
     await __handleAgentStatusBody(ctx, payload, mode)
   } catch (error) {
     const message = error instanceof Error ? (error.stack || error.message) : String(error)
     ctx.logger.warn(`[force-compact] handleAgentStatus degraded (swallowed) — ${message}`)
+    try {
+      const lines = renderCrash('idle.handleAgentStatus', error, captureThrowSite())
+      for (const line of lines) appendDiag(line)
+    } catch (_netFailure) { /* swallow */ }
   }
 }
+
+export const handleAgentStatus = guardFn('idle.handleAgentStatus', __handleAgentStatusEnveloped)
 
 /** Body of {@link handleAgentStatus}; wrapped by its safe envelope. */
 async function __handleAgentStatusBody(ctx, payload, mode) {
