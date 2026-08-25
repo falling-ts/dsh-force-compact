@@ -333,9 +333,14 @@ export function headerPrefix(session) {
  * plain JS outside the DSH workspace and must not import `@deepseek-ai/dsh-llm`
  * symbols (they are not resolvable at plugin load time).
  *
+ * `finish` is stored AS-IS as the raw `FinishReason` object (`{ kind,
+ * failure? }`) — the same thing the official `BlockAssembler` retains — so the
+ * caller switches on `finish.kind` and reads `finish.failure` per protocol.
+ *
  * @param {AsyncIterable<object>} stream
  * @param {AbortSignal} [signal]
- * @returns {Promise<{ blocks: Array, text: string, hasImage: boolean, finish: object|undefined, usage: object|undefined, finishReason: string|undefined }> }
+ * @param {{recordOnEmpty?: boolean}} [opts]
+ * @returns {Promise<{ blocks: Array, text: string, hasImage: boolean, finish: object|undefined, usage: object|undefined }> }
  */
 async function collectChunks(stream, signal, opts) {
   const blocks = []
@@ -343,27 +348,59 @@ async function collectChunks(stream, signal, opts) {
   let hasImage = false
   let finish
   let usage
-  let finishReason
-  let curReasoning = null
-  let curToolCall = null
 
-  const flushPending = () => {
-    if (curReasoning !== null) {
-      blocks.push(curReasoning)
-      curReasoning = null
+  // Accumulators keyed by BLOCK INDEX, mirroring the official `BlockAssembler`:
+  // a `block-start` opens a slot; `*-delta`s fill it; `block-end` closes it.
+  // When no `block-start` precedes a delta (some adapters omit it), we lazily
+  // open the slot on first delta using the chunk's own index. This keeps streamed
+  // output and the final assembled blocks in agreement regardless of whether the
+  // adapter emits explicit delimiters.
+  const partials = new Map()
+  const order = []
+
+  const ensure = (index, blockType) => {
+    let p = partials.get(index)
+    if (!p) {
+      p = { blockType, text: '', toolCallId: undefined, toolCallName: '', toolCallArgs: '' }
+      partials.set(index, p)
+      order.push(index)
     }
-    if (curToolCall !== null) {
-      blocks.push(curToolCall)
-      curToolCall = null
+    return p
+  }
+
+  const finalizeSlot = (index) => {
+    const p = partials.get(index)
+    if (!p) return
+    if (p.assembled) return // block-end already settled it
+    if (p.blockType === 'text') {
+      blocks.push({ type: 'text', text: p.text })
+      text += p.text
+    } else if (p.blockType === 'reasoning') {
+      if (p.text !== '') blocks.push({ type: 'reasoning', text: p.text })
+    } else if (p.blockType === 'tool-call') {
+      blocks.push({
+        type: 'tool-call',
+        toolCallId: p.toolCallId,
+        name: p.toolCallName,
+        arguments: p.toolCallArgs,
+      })
+    }
+    p.assembled = true
+  }
+
+  const flushOpenSlots = () => {
+    // Close any slot that received content but never got a `block-end`
+    // (lenient tail-handling). Only slots that actually hold data matter.
+    for (const idx of order) {
+      const p = partials.get(idx)
+      if (p && !p.assembled && (p.text !== '' || p.toolCallArgs !== '')) finalizeSlot(idx)
     }
   }
 
   // TEMPORARY CHUNK-SHAPE PROBE: when a stream finishes yet produced NO text
-  // blocks, record the raw shape (type + keys + first 120 chars of any text
-  // field) of the FIRST few chunks. This is the only reliable way to see what
-  // the harness actually hands us versus the `chunk.type` literals the switch
-  // below expects. Guarded: logging never propagates; self-limiting to ≤3 chunks
-  // so it cannot spam on a long stream.
+  // blocks, record the raw shape (type + keys + first 160 chars) of the FIRST
+  // few chunks. Self-limiting to ≤3 chunks so it cannot spam on a long stream.
+  // Guarded: logging never propagates.
   let probeBuf = []
   const recording = Boolean(opts && opts.recordOnEmpty)
   let chunkCount = 0
@@ -372,73 +409,81 @@ async function collectChunks(stream, signal, opts) {
     if (signal !== undefined && signal.aborted) break
     chunkCount++
     if (recording && probeBuf.length < 3 && chunkCount <= 3) {
-      probeBuf.push({ type: chunk && chunk.type, keys: Object.keys(chunk || {}).join(','), sample: typeof chunk.text === 'string' ? chunk.text.slice(0, 120) : JSON.stringify(chunk).slice(0, 160) })
+      probeBuf.push({ type: chunk && chunk.type, keys: Object.keys(chunk || {}).join(','), sample: JSON.stringify(chunk).slice(0, 160) })
     }
     switch (chunk.type) {
-      case 'text-delta':
-        flushPending()
-        if (typeof chunk.text === 'string') {
-          blocks.push({ type: 'text', text: chunk.text })
-          text += chunk.text
+      case 'block-start':
+        ensure(chunk.index, chunk.blockType)
+        break
+      case 'text-delta': {
+        const p = ensure(chunk.index, 'text')
+        if (!p.assembled) p.text += typeof chunk.text === 'string' ? chunk.text : ''
+        break
+      }
+      case 'reasoning-delta': {
+        const p = ensure(chunk.index, 'reasoning')
+        if (!p.assembled) p.text += typeof chunk.text === 'string' ? chunk.text : ''
+        break
+      }
+      case 'tool-call-delta': {
+        const p = ensure(chunk.index, 'tool-call')
+        if (!p.assembled) {
+          if (chunk.id !== undefined) p.toolCallId = chunk.id
+          if (chunk.name) p.toolCallName = chunk.name
+          if (typeof chunk.argumentsDelta === 'string') p.toolCallArgs += chunk.argumentsDelta
         }
         break
-      case 'reasoning-delta':
-        if (curReasoning === null) curReasoning = { type: 'reasoning', text: '' }
-        if (typeof chunk.text === 'string') curReasoning.text += chunk.text
-        break
-      case 'reasoning-chunks':
-        flushPending()
-        if (Array.isArray(chunk.chunks)) {
-          for (const c of chunk.chunks) {
-            if (typeof c === 'string') {
-              blocks.push({ type: 'reasoning', text: c })
-            } else if (c && typeof c.text === 'string') {
-              blocks.push({ type: 'reasoning', text: c.text })
-            }
-          }
+      }
+      case 'block-end': {
+        // Authoritative settlement: the adapter hands the COMPLETE block. Take
+        // it verbatim rather than trusting accumulated deltas.
+        const b = chunk.block
+        if (b && b.type) {
+          if (b.type === 'text' && typeof b.text === 'string') text += b.text
+          if (b.type === 'image' || b.mediaType !== undefined) hasImage = true
+          blocks.push(b)
         }
+        const p = ensure(chunk.index, b && b.type ? b.type : 'text')
+        p.assembled = true
         break
-      case 'tool-call-start':
-        flushPending()
-        curToolCall = {
-          type: 'tool-call',
-          toolCallId: chunk.toolCallId,
-          name: chunk.name,
-          arguments: '',
-        }
-        break
-      case 'tool-call-delta':
-        if (curToolCall === null) curToolCall = { type: 'tool-call', toolCallId: chunk.toolCallId, name: chunk.name || '', arguments: '' }
-        if (typeof chunk.argumentsDelta === 'string') curToolCall.arguments += chunk.argumentsDelta
-        break
-      case 'image':
-        flushPending()
-        hasImage = true
-        blocks.push({ type: 'image', mediaType: chunk.mediaType, url: chunk.url })
-        break
+      }
       case 'usage':
         usage = chunk.usage
         break
       case 'finish':
-        finishReason = chunk.finishReason
-        finish = {
-          kind: chunk.kind || (finishReason === 'max_tokens' ? 'max-tokens' : finishReason),
-          reason: chunk.finishReason,
-          ...(chunk.failure !== undefined ? { failure: chunk.failure } : {}),
+        // The RAW `finish` chunk carries `reason` — a `FinishReason`
+        // `{ kind, failure? }` — directly (NOT a nested re-wrap). Store it as-is
+        // so the caller can read `finish.kind` / `finish.failure` per the
+        // protocol, matching the official `BlockAssembler` (`_finish =
+        // chunk.reason`). Previously this branch re-wrapped into a synthetic
+        // `{kind, reason, failure}` shape, losing the discriminator and making
+        // every terminal finish classify as SUCCESS → spurious "no usable text".
+        finish = chunk.reason
+        break
+      case 'reasoning-chunks':
+        // Legacy/aggregate reasoning variant (not in the core protocol but seen
+        // on some routes): fold each element into a reasoning block.
+        if (Array.isArray(chunk.chunks)) {
+          for (const c of chunk.chunks) {
+            if (typeof c === 'string') blocks.push({ type: 'reasoning', text: c })
+            else if (c && typeof c.text === 'string') blocks.push({ type: 'reasoning', text: c.text })
+          }
         }
         break
       default:
         break
     }
   }
-  flushPending()
-  // TEMPORARY CHUN K-SHAPE PROBE emission: only fires when the caller asked to
-  // record and this run produced ZERO text blocks (the exact failing case).
+  flushOpenSlots()
+  // TEMPORARY CHUNK-SHAPE PROBE emission: only when the caller asked to record
+  // AND this run yielded zero text blocks — i.e. the exact failure signature
+  // ("produced no usable text"). Self-limiting; guarded.
   if (recording && !blocks.some(b => b && b.type === 'text')) {
-    const desc = probeBuf.map(p => `#${p.type}[${p.keys}] "${p.sample}"`).join(' | ')
-    process.stdout.write(`[force-compact] CHUNK-SHAPE PROBE (no text blocks): finish=${JSON.stringify(finish)} count=${chunkCount} :: ${desc}\n`)
+    const desc = probeBuf.map(p => `#${p.type}[${p.keys}] ${p.sample}`).join(' | ')
+    const reasonJson = finish && typeof finish === 'object' ? JSON.stringify(finish) : String(finish)
+    process.stdout.write(`[force-compact] CHUNK-SHAPE PROBE (no text blocks): finishReason=${reasonJson} count=${chunkCount} :: ${desc}\n`)
   }
-  return { blocks, text, hasImage, finish, usage, finishReason }
+  return { blocks, text, hasImage, finish, usage }
 }
 
 /**
