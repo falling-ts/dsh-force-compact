@@ -111,8 +111,30 @@ async function __forceCompactCommandBody(ctx, invocation) {
         await publishCompressing(ctx)
         const result = await backend.compactNow(agent, invocation.signal)
         if (result === undefined || result === null) {
-          ctx.logger.debug(`[force-compact] ${session.id}: no safe range to compact via ${backend?.kind}`)
-          return { kind: 'success', text: 'no compactable range' }
+          // Persist this diagnosis (WARN level so it survives the default INFO
+          // floor AND the `[force-compact]` marker routes it into the plugin's
+          // own durable log file — previously the reason lived ONLY in a
+          // `ctx.logger.info` line that the stock in-memory sink dropped,
+          // leaving the user with a bare "no compactable range"). Surface
+          // facets: node count (below the 6-node minimum?), head source
+          // (a previous checkpoint? re-running on an already-condensed head),
+          // and the char-estimated surface sum (vs the 8000 retention floor).
+          // The richer meter-priced detail (per-node prices, boundaryKind,
+          // crossing points) is additionally recorded by the builtin engine's
+          // own skip diagnostic (its `info`/`warn` helpers feed this same
+          // durable file).
+          const surfNodes = (session && session.surface && Array.isArray(session.surface.nodes)) ? session.surface.nodes : []
+          let headIsCheckpoint = false
+          if (surfNodes.length > 0 && Array.isArray(session.events)) {
+            const headEvent = session.events[surfNodes[0]]
+            const headSource = headEvent && headEvent.data && typeof headEvent.data === 'object' ? headEvent.data.source : undefined
+            headIsCheckpoint = !!(headSource && typeof headSource === 'object' && (headSource.plugin === 'force-compact-builtin' || headSource.plugin === 'compact'))
+          }
+          ctx.logger.warn(
+            `[force-compact] ${session.id}: no compactable range via ${backend?.kind} — `
+            + `${surfNodes.length} surface nodes (min 6 required), head=${headIsCheckpoint ? 'previous checkpoint' : 'ordinary history'}`,
+          )
+          return { kind: 'success', text: `no compactable range (${surfNodes.length} surface nodes) — say something to build up more history, or raise the surface size` }
         }
         // COMMITTED (range shadowed + summary added) — pin GREEN "done"; the
         // next model request's `llm/stream` watermark overwrites it with a

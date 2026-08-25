@@ -34,7 +34,7 @@
  */
 
 import { summarize, CHECKPOINT_PREAMBLE, headerPrefix } from './summarizer.js'
-import { selectEarliestByTokens } from './region.js'
+import { selectEarliestByTokens, selectRetainingLatestTokens } from './region.js'
 import { readSettings, DEFAULTS } from '../core/settings.js'
 import { guardFn } from '../core/crashnet.js'
 
@@ -91,8 +91,14 @@ const MAX_FAILURE_COOLDOWN_ENTRIES = 32
 const FAILURE_RETRY_GROWTH_TOL = 500
 /** Grace period (ms) after a failure before a retry is permitted EVEN IF the
  *  token count has not grown (guards the "identical doomed span" livelock where
- *  the surface never changes, so the growth test alone would never clear). */
-const FAILURE_RETRY_GRACE_MS = 60_000
+ *  the surface never changes, so the growth test alone would never clear).
+ *  180s (raised from 60s, 2026-08-25): a DETERMINISTIC upstream failure — e.g.
+ *  a streaming pipeline defect that always truncates the same head span — will
+ *  burn an entire ~40s summarization round-trip on EVERY retry, so a shorter
+ *  grace window merely re-hammers the identical doomed span at higher
+ *  frequency. Three minutes gives the underlying condition time to change
+ *  (server restart, transient overload clearing, …) before the next attempt. */
+const FAILURE_RETRY_GRACE_MS = 180_000
 /** How often (ms) a still-cooled session re-evaluates, bounding how long a
  *  genuinely-stuck span suppresses further attempts; also caps map retention. */
 const FAILURE_REEVAL_INTERVAL_MS = 15_000
@@ -235,7 +241,29 @@ async function __compactNowBuiltinBody(ctx, agent, signal) {
     return null
   }
 
-  const region = selectHeadAnchoredRegion(settings, session)
+  // ---- AUTHORITATIVE METER SNAPSHOT (SAME CALIBER AS THE AUTO PATH) -------
+  // The manual/self-selecting path prices its region from the OFFICIAL
+  // `tokenMeter.measure` snapshot — the exact same measurement the
+  // `agent/pre-step` auto path uses (see `hooks/guard.js`): the meter's own
+  // per-node prices, so the `retainLatestTokens` budget is expressed in the
+  // SAME token caliber that the threshold gate measures, not in a divergent
+  // char/4 estimate of flat text (which systematically undercounts nested
+  // tool blocks / JSON framing and starves the head budget on short-ish
+  // sessions — the observed "/force-compact → no compactable range" cause).
+  // Missing/malformed snapshot → `undefined` → the legacy char-heuristic
+  // fallback below keeps working (degradation, never a hard failure).
+  const meter = ctx.get('tokenMeter')
+  let measurement
+  if (meter !== undefined && typeof meter.measure === 'function') {
+    try {
+      const measured = meter.measure(session)
+      if (measured !== undefined && measured !== null) measurement = measured
+    } catch {
+      measurement = undefined
+    }
+  }
+
+  const region = selectHeadAnchoredRegion(settings, session, measurement)
   if (region === null) {
     // Diagnose WHY: report the surface-node count and how much of it is already
     // checkpoint material. The typical "nothing worth compacting" case is a
@@ -360,6 +388,42 @@ async function runTransaction(ctx, agent, session, region, signal, settings) {
     return null
   }
   shadowedTokenCount = estimateTokens(messages)
+
+  // ---- Threshold-aware SHADOW-SPAN FLOOR ----------------------------------
+  // Mirror of `guard.js`'s threshold-aware shrink gate, applied to the
+  // SELF-SELECTING path (`compactNow` — idle turn-end hook, `/force-compact`
+  // when idle) which otherwise has no equivalent pre-LLM viability check.
+  //
+  // PREDICATE: when a reliable meter-priced total is known (same condition
+  // `guard.js` uses) AND the selected head span is TOO SMALL to drag the total
+  // below `autoThresholdTokens` even when removed wholesale
+  // (`total − span ≥ threshold`), the compaction CANNOT achieve its purpose.
+  // Paying for a summarization call to learn that just re-arms the identical
+  // doomed attempt on the next tick (the idle-path twin of the "threshold-
+  // aware gate — cannot pull total below threshold; SKIPPING" storm the
+  // auto path already suppresses). Skipping here costs nothing — the head
+  // grows naturally and becomes compactable on its own once large enough.
+  //
+  // CALIBER NOTE: the span figure is char-heuristic (`estimateTokens`,
+  // ceil(chars/4)); `guard.js` prices its identical predicate from a
+  // `tokenMeter.measure` snapshot instead. Heuristic-vs-meter skew is small
+  // relative to the hundreds-of-hundreds-of-tokens margin these decisions
+  // hinge on (a ~16K-char-estimated span vs. a ~59K meter-priced total
+  // leaves ~43K of slack — a realistic ±2K estimation error cannot flip the
+  // verdict). The auto path retains its strict meter pricing unchanged; this
+  // floor merely PREVENTS the idle path from re-entering the same doom.
+  if (currentTotalTokens !== undefined && Number.isFinite(currentTotalTokens)
+      && currentTotalTokens >= settings.autoThresholdTokens
+      && (currentTotalTokens - shadowedTokenCount) >= settings.autoThresholdTokens) {
+    info(ctx,
+      `${session.id}: builtin compaction — threshold-aware floor: shadowed span (~${shadowedTokenCount} est-tokens, char heuristic) `
+      + `cannot pull the total (~${currentTotalTokens} meter-priced) below ${settings.autoThresholdTokens} `
+      + `(removing it wholesale would still leave ~${currentTotalTokens - shadowedTokenCount}). `
+      + `Skipping (no lock opened, no LLM call made) — the head will qualify naturally as it grows. `
+      + `Raise \`retainLatestTokens\` so less of the tail is retained and more of the head becomes compactable.`,
+    )
+    return null
+  }
 
   // ---- Small-span SKIP (above) now applied to the measured span ------------
   if (shadowedTokenCount < MIN_USEFUL_SPAN_TOKENS) {
@@ -646,30 +710,49 @@ function estimateSurfaceTokens(session) {
  * (idle turn-end hook, `/force-compact`-when-idle). PRECEDENCE RULE: this is
  * the SELF-SELECTING fallback only — every region-CARRYING caller routes its
  * own span through `compactRegion` (see its doc) and this helper is NOT
- * consulted. Using the coarser char heuristic here is acceptable because the
- * manual path has no `tokenMeter` snapshot at hand and merely needs SOME safe
- * balanced span; the precision-sensitive auto-guard keeps using
- * `selectRetainingLatestTokens` directly.
+ * consulted.
  *
- * Semantics: keep the latest `settings.retainLatestTokens` tokens of the
- * surface VERBATIM; everything before that cutoff forms the head-anchored
- * region compacted into a single summary node. The head-side token budget is
- * (surfaceSum − retain), so we estimate the surface token sum with the char
- * heuristic and subtract the retention budget — passing the resulting
- * absolute head budget to the legacy selector (which walks from the head
- * accumulating until it reaches the budget). Snaps the end to a
- * `user/message` boundary for tool-pairing safety.
+ * Semantics (identical to the auto path in `hooks/guard.js`): retain the
+ * latest `settings.retainLatestTokens` of the surface VERBATIM; everything
+ * before that cutoff forms the head-anchored region compacted into a single
+ * summary node.
  *
- * Edge cases: if the estimated surface sum is smaller than the retention
- * budget (very short sessions), the head budget goes negative — we clamp to
- * zero and the selector trivially produces no region (returns null).
+ * CALIBER — MIRROR OF THE AUTO PATH: the primary source is a `tokenMeter
+ * .measure` snapshot passed in by the caller (obtained the same way
+ * `guards.js` obtains it, see `hooks/guard.js`). When available, the region
+ * comes from `selectRetainingLatestTokens` priced from that very snapshot —
+ * the meter's own per-node prices — so the retention budget is expressed in
+ * the SAME token caliber the threshold gate measures (not a divergent char/4
+ * estimate of flat text, which systematically UNDERCOUNTS nested tool blocks
+ * and JSON framing; subtracting a fixed 8000-token retention from an
+ * undercounted surface sum starved the head budget until fewer than two head
+ * nodes remained — the observed "/force-compact → no compactable range").
+ *
+ * LEGACY FALLBACK (snapshot `undefined` — tokenMeter absent or `measure`
+ * threw): the OLD char-heuristic path, preserved for degraded compositions —
+ * keep the latest `settings.retainLatestTokens` via the char estimate of the
+ * surface sum and route the residual head budget through
+ * `selectEarliestByTokens`.
+ *
+ * Edge cases: with a meter snapshot, `selectRetainingLatestTokens` itself
+ * reports `null` when the retained tail consumes the whole window (single
+ * huge trailing node) or fewer than 2 nodes exist; with the legacy fallback,
+ * if the char-estimated surface sum is smaller than the retention budget
+ * (very short session), the head budget clamps to zero and no region results.
  */
-function selectHeadAnchoredRegion(settings, session) {
-  const surfaceSum = estimateSurfaceTokensLocal(session)
-  const retainBudget = Number.isFinite(settings.retainLatestTokens)
+function selectHeadAnchoredRegion(settings, session, measurement) {
+  const retain = Number.isFinite(settings.retainLatestTokens)
     ? Math.max(0, Math.round(settings.retainLatestTokens))
     : 0
-  const headBudget = Math.max(0, surfaceSum - retainBudget)
+  // PRIMARY (mirror of the auto path): price from the meter's own per-node
+  // snapshot — the same caliber as the threshold gate's `surfaceTokens`.
+  if (measurement !== undefined && Array.isArray(measurement.nodes) && measurement.nodes.length > 1) {
+    return selectRetainingLatestTokens(session, retain, measurement)
+  }
+  // LEGACY FALLBACK: no meter snapshot — char-estimate the surface sum and
+  // route the residual head budget through the legacy selector.
+  const surfaceSum = estimateSurfaceTokensLocal(session)
+  const headBudget = Math.max(0, surfaceSum - retain)
   if (headBudget <= 0) return null
   return selectEarliestByTokens(session, headBudget, undefined)
 }

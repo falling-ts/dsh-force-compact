@@ -269,9 +269,21 @@ async function __summarizeBody(ctx, config, agent, input, signal, extra) {
   // facts and give up — never assume success.
   if (finish === undefined) {
     const n = (typeof collected._chunkCount === 'number') ? collected._chunkCount : '?'
+    // DISAMBIGUATE the two sub-classes of a missing terminator: a stream that
+    // observed a trailing `usage` chunk reached a NORMAL end (and would have
+    // been synthesized into a `stop` by `collectChunks` — so landing here
+    // MEANS it died mid-way before any usage), versus a silent/hung stream
+    // that yielded chunks but never signalled completion at all. The two point
+    // at entirely different upstream causes.
+    const explicit = collected._explicitFinish
+    const suffix = explicit === undefined
+      ? ''
+      : (explicit
+        ? `; an explicit finish WAS observed earlier but a later phase lost it — investigate the composed stream chain`
+        : `; no usage chunk preceded the end either — the stream simply went silent`)
     return {
       status: 'no-finish',
-      reason: `stream ended without a terminal finish chunk (collected ${n} chunks; stream was ${describeStream(stream)})`,
+      reason: `stream ended without a terminal finish chunk (collected ${n} chunks; stream was ${describeStream(stream)}${suffix})`,
     }
   }
   if (!finishIsObject || finishKind === undefined) {
@@ -584,6 +596,12 @@ async function collectChunks(stream, signal, opts) {
   let probeBuf = []
   const recording = Boolean(opts && opts.recordOnEmpty)
   let chunkCount = 0
+  // Tracks whether a REAL terminal `finish` chunk was observed (vs. the
+  // end-of-stream synthesis below). Consumed by the caller to keep its
+  // diagnostics honest: "clean natural termination with no explicit finish
+  // marker" vs. "explicit finish marker present" is a materially different
+  // failure class for debugging.
+  let sawExplicitFinish = false
 
   for await (const rawChunk of stream) {
     if (signal !== undefined && signal.aborted) break
@@ -637,7 +655,31 @@ async function collectChunks(stream, signal, opts) {
         break
       }
       case 'usage':
+        // THE STREAM CHARTER IS THE SOURCE OF TRUTH FOR TERMINATION (the
+        // protocol's invariant spec tests pin chunk-order violations like
+        // "usage after terminal finish", implying a well-formed stream always
+        // ends with a `finish` chunk). BUT `collectChunks` ALSO accepts streams
+        // that terminate WITHOUT one (its `no-finish` branch), so treat the
+        // END-OF-STREAM AS A TERMINAL FACT too: if the provider (typically a
+        // proxy that relays the upstream's `finish_reason`/`usage` verbatim)
+        // delivers a `usage` chunk and then simply CLOSES — the exact
+        // observed live symptom of an all-reasoning summary arriving as
+        // `reasoning-delta`s followed by `usage` and then silence — record it
+        // as a NORMAL completion rather than a protocol violation. This
+        // converts what used to be classified `no-finish` (→ arming the
+        // failure cooldown and burning the locked bracket) into a chance for
+        // the TEXT-EXTRACTION layer to salvage whatever usable output the
+        // stream DID produce. A genuine hung stream (never reaching the end,
+        // hence never seeing a `usage` chunk either) still surfaces as
+        // `no-finish`.
         usage = chunk.usage
+        break
+      // `response-metadata`: OPENAI-compatible adapters emit this near the end
+      // of a response to carry provider-level facts (request id, completion
+      // details, …). It is neither block nor terminal information — count and
+      // ignore it explicitly so the default branch never masks a future
+      // chunk-kind addition that we silently drop.
+      case 'response-metadata':
         break
       case 'finish':
         // The RAW `finish` chunk carries `reason` — a `FinishReason`
@@ -648,6 +690,7 @@ async function collectChunks(stream, signal, opts) {
         // `{kind, reason, failure}` shape, losing the discriminator and making
         // every terminal finish classify as SUCCESS → spurious "no usable text".
         finish = chunk.reason
+        sawExplicitFinish = true
         break
       case 'reasoning-chunks':
         // Legacy/aggregate reasoning variant (not in the core protocol but seen
@@ -664,6 +707,20 @@ async function collectChunks(stream, signal, opts) {
     }
   }
   flushOpenSlots()
+  // SYNTHESIZED TERMINATION (see the `usage` case): a stream that ran to the
+  // very end — evidenced by an OBSERVED trailing `usage` chunk — yet never
+  // delivered an explicit `finish` chunk terminated NORMALLY (a provider or
+  // relay chose to close without the marker, typically right after handing
+  // over usage). Record it as a clean `stop` so the text-extraction layer
+  // gets a chance to salvage real output, instead of the caller classifying
+  // the run as a protocol-violating `no-finish` and arming the failure
+  // cooldown on top. The explicit `note` marks the distinction for
+  // diagnostics without lying about where the terminator came from. A truly
+  // HUNG stream (never reaching the end, hence never observing a `usage`
+  // chunk either) still falls through as a bona-fide `no-finish`.
+  if (finish === undefined && usage !== undefined) {
+    finish = { kind: 'stop', note: 'synthesized: stream closed after a usage chunk without an explicit finish chunk' }
+  }
   // CHUNK-SHAPE PROBE emission: only when the caller asked to record AND this
   // run yielded zero text blocks — i.e. the exact failure signature ("produced
   // no usable text"). Fully self-contained and guarded: NOTHING in this block
@@ -679,8 +736,11 @@ async function collectChunks(stream, signal, opts) {
   // detail instead.
   // `_chunkCount` is exposed (underscore-prefixed, internal) purely so a
   // missing-finish diagnostic can distinguish "consumed N chunks but never a
-  // terminal finish" from "consumed ZERO chunks (silent/lazy/no-op stream)".
-  return { blocks, text, hasImage, finish, usage, _chunkCount: chunkCount }
+  // terminal finish" from "consumed ZERO chunks (silent/lazy/no-op stream)";
+  // `_explicitFinish` additionally lets the caller tell a SYNTHESIZED
+  // terminator apart from a real terminal finish chunk when rendering its
+  // diagnostics.
+  return { blocks, text, hasImage, finish, usage, _chunkCount: chunkCount, _explicitFinish: sawExplicitFinish }
 }
 
 /**
