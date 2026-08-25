@@ -60,32 +60,32 @@ export const PINNED_COLORS = Object.freeze({
 })
 
 /**
- * The 20 WORKING-phase texts. These are the "working-state" labels the badge
- * cycles through while a model request is in flight; every one carries the
- * trailing `...` (working implies ongoing, not finished).
+ * The 20 WORKING-phase texts. Four-character, plainly-worded verbs describing
+ * what the agent is doing right now ("思考中" / "整理中" / …). Colors are
+ * unchanged and remain randomly paired with these labels.
  * @readonly
  */
 export const WORKING_TEXTS = Object.freeze([
-  '深度思考中...',
-  '梳理上下文...',
-  '组织思路...',
-  '推敲措辞...',
-  '检索记忆...',
-  '构建论证...',
-  '校验细节...',
-  '展开推理...',
-  '权衡方案...',
-  '聚焦重点...',
-  '精炼表达...',
-  '串联线索...',
-  '交叉验证...',
-  '收敛结论...',
-  '打磨结构...',
-  '审视前提...',
-  '延展视角...',
-  '填补空白...',
-  '统合碎片...',
-  '落笔成文...',
+  '正在思考',
+  '正在整理',
+  '正在规划',
+  '正在分析',
+  '正在检索',
+  '正在推理',
+  '正在校验',
+  '正在比对',
+  '正在权衡',
+  '正在归纳',
+  '正在总结',
+  '正在撰写',
+  '正在执行',
+  '正在运行',
+  '正在处理',
+  '正在计算',
+  '正在核实',
+  '正在生成',
+  '正在准备',
+  '正在继续',
 ])
 
 /**
