@@ -36,7 +36,6 @@ import { resolveCompaction } from '../engine/backend.js'
 export async function handleAgentStatus(ctx, payload, mode) {
   const { agent, status } = payload
   if (status !== 'idle') return
-
   const settings = (await readSettings(ctx)) ?? DEFAULTS
   if (settings.turnEndForceCompactionEnabled !== true) {
     // Visible so a tester who flipped the setting OFF can confirm the guard is

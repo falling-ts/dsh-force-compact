@@ -137,10 +137,10 @@ async function runTransaction(ctx, agent, session, region, signal, settings) {
   const compactionId = mintCompactionId()
   let startEvent
   try {
-    startEvent = session.append('fc-compact/start', {
+    startEvent = markIgnorable(session.append('fc-compact/start', {
       compactionId,
       turn: currentOpenTurn(session),
-    })
+    }))
   } catch (error) {
     warn(ctx, `${session.id}: builtin fc-compact — failed to append fc-compact/start: ${messageOf(error)}`)
     return null
@@ -200,7 +200,7 @@ async function runTransaction(ctx, agent, session, region, signal, settings) {
   if (target.model) summaryData.model = target.model
 
   try {
-    summaryEvent = session.append('fc-compact/summary', summaryData)
+    summaryEvent = markIgnorable(session.append('fc-compact/summary', summaryData))
   } catch (error) {
     closeWithError(session, startEvent, compactionId, error, ctx)
     return null
@@ -226,10 +226,10 @@ async function runTransaction(ctx, agent, session, region, signal, settings) {
   // ---- Close the lock ----------------------------------------------------
   let endSeq
   try {
-    const endEvent = session.append('fc-compact/end', {
+    const endEvent = markIgnorable(session.append('fc-compact/end', {
       compactionId,
       turn: currentOpenTurn(session),
-    })
+    }))
     endSeq = endEvent.seq
   } catch {
     // Non-fatal: the summary already landed durably; the missing end marker is
@@ -254,7 +254,7 @@ async function runTransaction(ctx, agent, session, region, signal, settings) {
 /** Append `fc-compact/end` carrying the error so the lock is released explicitly. */
 function closeWithError(session, startEvent, compactionId, error, ctx) {
   try {
-    session.append('fc-compact/end', { compactionId, turn: currentOpenTurn(session), error: messageOf(error) })
+    markIgnorable(session.append('fc-compact/end', { compactionId, turn: currentOpenTurn(session), error: messageOf(error) }))
   } catch { /* best effort */ }
   warn(ctx, `builtin fc-compact transaction ended in error: ${messageOf(error)}`)
 }
@@ -432,3 +432,28 @@ function messageOf(error) {
 /** Info/warn shims routed through the logger (never throws). */
 function info(ctx, msg) { try { ctx.logger.debug('[force-compact] ' + msg) } catch {} }
 function warn(ctx, msg) { try { ctx.logger.warn('[force-compact] ' + msg) } catch {} }
+
+/**
+ * Mark every `fc-compact/*` bracket event as envelope-ignorable BEFORE it lands
+ * in the log. These transaction markers are pure bookkeeping: the durable
+ * effect lives entirely in the separate `user/message` replace node (which
+ * stays required and surfaces normally), so dropping an unrecognized marker can
+ * never change how the rest of the log is reconstructed. Without the marker,
+ * a session log carrying our custom event types REFUSES TO LOAD on any
+ * harness build whose generated `KNOWN_SESSION_EVENT_TYPES` catalog predates
+ * this plugin ("event type … unknown to this harness and not marked
+ * ignorable") — permanently bricking those logs across version upgrades and
+ * making them unreadable even by `session.history` after a process restart.
+ * `ignorable` is part of the event ENVELOPE (not `data`), and
+ * `Session.append` only accepts `surfaceOp`/`sourceEventSeqs` there, so the
+ * flag is attached on the returned deep-freeze-bound copy before it publishes.
+ */
+function markIgnorable(event) {
+  if (event === undefined) return undefined
+  if (Object.isFrozen(event)) {
+    Object.defineProperty(event, 'ignorable', { value: true, enumerable: true, writable: false, configurable: false })
+  } else {
+    event.ignorable = true
+  }
+  return event
+}
