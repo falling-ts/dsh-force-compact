@@ -297,6 +297,15 @@ export async function buildSchema() {
       // strictly smaller than the span it replaces) this keeps transactions
       // bounded while ensuring compression is always net-negative.
       maxSummaryTokens: z.number().step(1).min(256).max(200000).default(DEFAULTS.maxSummaryTokens),
+       // TRANSIENT UI MESSENGER (see core/ui-signal.js): the host writes
+       // "{ phase, text, color }" here; the client half's existing
+       // settingsScope.bind mirror reflects it live so the browser can
+       // repaint the conversation area 'TurnStatus' node. Optional on
+       // purpose: the field is ABSENT until the first LLM call publishes
+       // a working pair, and readSettings deliberately ignores it (it is
+       // not a user-facing preference, so it stays OUT of the DEFAULTS
+       // nine-field shape and the settings panel renders nothing).
+       liveUi: z.record(z.unknown()).optional()
     })
     return schema
   } catch {
@@ -325,11 +334,11 @@ export async function registerNamespace(ctx) {
   // carry the same `base` defaults, so either way the effective values resolve
   // identically.
   const thirdArg = { base: { ...DEFAULTS } }
-  const placeholderSchema = (() => {
-    const obj = {}
-    obj.toJSON = () => ({})
-    return obj
-  })()
+  // Placeholder MUST be callable (callable-validator contract of
+  // `settings.register`): identity passthrough that accepts any section shape
+  // so the namespace stays exposed even when schemastery is unresolvable.
+  const placeholderSchema = (section) => section
+  placeholderSchema.toJSON = () => ({})
   settings.register(NS, schema !== null ? schema : placeholderSchema, thirdArg)
   return true
 }

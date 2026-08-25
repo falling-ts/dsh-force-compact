@@ -22,6 +22,7 @@
 import { readSettings, DEFAULTS } from '../core/settings.js'
 import { dbg } from './guard.js'
 import { resolveCompaction } from '../engine/backend.js'
+import { publishCompressing, publishDone } from '../core/ui-signal.js'
 
 /**
  * Handle one `agent/status` emission: when the agent transitions to `idle` and
@@ -70,11 +71,22 @@ export async function handleAgentStatus(ctx, payload, mode) {
   // its own).
   const controller = new AbortController()
   try {
+    // LIVE UI SIGNAL — PIN RED "compressing" BEFORE requesting the model /
+    // committing anything. Both publishers are guaranteed side-effect-free
+    // (they swallow their own failures internally), so a messenger problem
+    // can never perturb the compaction transaction itself.
+    await publishCompressing(ctx)
     const result = await backend.compactNow(agent, controller.signal)
     if (result === undefined || result === null) {
       ctx.logger.debug(`[force-compact] ${session.id}: idle compaction via ${backend.kind} committed nothing`)
       return
     }
+    // COMMITTED — range shadowed + summary added. Pin GREEN "done" NOW; the
+    // next model request's `llm/stream` watermark redraws a fresh random
+    // working pair within seconds (typically < 3 s — the very next step's
+    // LLM boundary), which is the natural visual rhythm: no dedicated timer
+    // needed.
+    await publishDone(ctx)
     ctx.logger.info(
       `[force-compact] ${session.id}: idle compaction (${backend.kind}) shadowed ${result.shadowedSeqs?.length ?? '?'} nodes `
       + `(~${result.shadowedTokenCount ?? '?'} tokens)`,

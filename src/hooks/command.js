@@ -16,6 +16,7 @@
 import { queueForceCompact, dbg } from './guard.js'
 import { resolveCompaction } from '../engine/backend.js'
 import { readRawSetting } from '../core/settings.js'
+import { publishCompressing, publishDone } from '../core/ui-signal.js'
 
 /**
  * Register the global `/force-compact` command. A no-op when the `commands`
@@ -69,11 +70,20 @@ export function registerCommand(ctx) {
       // is busy it throws (ManualCompactionError) — in that case queue the force
       // flag so the pre-step hook force-compacts at the next model step.
       try {
+        // LIVE UI SIGNAL — PIN RED "compressing" BEFORE the model-request /
+        // commit happens. Both publishers swallow their own failures, so the
+        // messenger can never disturb the actual compaction outcome returned
+        // below.
+        await publishCompressing(ctx)
         const result = await backend.compactNow(agent, invocation.signal)
         if (result === undefined || result === null) {
           ctx.logger.debug(`[force-compact] ${session.id}: no safe range to compact via ${backend.kind}`)
           return { kind: 'success', text: 'no compactable range' }
         }
+        // COMMITTED (range shadowed + summary added) — pin GREEN "done"; the
+        // next model request's `llm/stream` watermark overwrites it with a
+        // fresh random working pair shortly after (natural cadence, no timer).
+        await publishDone(ctx)
         ctx.logger.info(
           `[force-compact] ${session.id}: /force-compact (${backend.kind}) shadowed ${result.shadowedSeqs?.length ?? '?'} nodes `
           + `(~${result.shadowedTokenCount ?? '?'} tokens)`,

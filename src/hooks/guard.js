@@ -29,6 +29,7 @@
 import { readSettings, DEFAULTS } from '../core/settings.js'
 import { selectEarliestByTokens } from '../engine/region.js'
 import { resolveCompaction } from '../engine/backend.js'
+import { publishCompressing, publishDone } from '../core/ui-signal.js'
 
 /**
  * The plugin's OWN debug logger — the single, consistent observability channel.
@@ -136,11 +137,22 @@ async function compactEarliestRatio(ctx, agent, signal, ratio, mode) {
   }
   await dbg(ctx, `[force-compact] ${session.id}: compacting earliest ${ratio} via ${backend.kind} backend -> span seqs ${region.start}..${region.end} (totalTokens=${totalTokens})`)
   try {
+    // LIVE UI SIGNAL — PIN RED "compressing" BEFORE the region compaction
+    // commits. This single site covers BOTH pre-step trigger paths (queued
+    // `/force-compact` flag and the auto token-threshold gate), since both
+    // funnel through `compactEarliestRatio`. Publishers swallow their own
+    // failures — the messenger can never affect whether the compaction itself
+    // commits.
+    await publishCompressing(ctx)
     const result = await backend.compactRegion(region.start, region.end, agent, signal)
     if (result === undefined || result === null) {
       ctx.logger.debug(`[force-compact] ${session.id}: earliest ${ratio} compaction committed nothing via ${backend.kind}`)
       return false
     }
+    // COMMITTED — range shadowed + summary added. Pin GREEN "done"; the next
+    // model step's `llm/stream` watermark replaces it with a fresh random
+    // working pair shortly after (typical cadence < 3 s — no timer).
+    await publishDone(ctx)
     ctx.logger.info(
       `[force-compact] ${session.id}: earliest ${ratio} compaction (${backend.kind}) shadowed ${result.shadowedSeqs?.length ?? '?'} nodes `
       + `(~${result.shadowedTokenCount ?? '?'} tokens)`,

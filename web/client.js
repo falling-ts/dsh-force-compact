@@ -554,6 +554,50 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 「Deep diving…」指示器的实时贴皮器（live UI 徽章）。
+     *
+     * 宿主半部（core/ui-signal.js）在三个时机改写本命名空间的 liveUi 字段：
+     *   • 每次出站 LLM 调用开始时——写入 20×20 随机工作态（phase/text/color）；
+     *   • 任意一次强制压缩开始前——固定红色「正在压缩…」；
+     *   • 压缩成功后——固定绿色「压缩完成!!!」。
+     * 本函数把该字段的最新值贴到对话区那个 `<div role="status" aria-live="polite">`
+     * （官方 `TurnStatus` 组件，"Deep diving…" 所在处）的**第一个文本节点**上，
+     * 并按 phase 着色。这是一次**瞬时 DOM 覆盖**：React 的下一帧重绘会自行还原
+     * （这正是文档 turn-status-deep-diving-rendering.md §四「临时改文案」描述的
+     * 机制），而下一轮 liveUi 变化又会再次贴上来——净效果就是跟随宿主相位持续
+     * 显示,无需本地 timer、也无需 MutationObserver 追帧：宿主每次改写都经由
+     * settingsScope 镜像到达这里,天然成为我们的"事件时钟"。
+     *
+     * 定位策略：全页面可能存在多个 role=status 节点（多标签/多会话并存时,每个
+     * 打开的 running 会话各有一个 TurnStatus）。我们取**全部**命中的节点逐一贴
+     * 上——装饰性的、幂等的、零侵入（不改 className/结构,只动第一个文本子节点
+     * 的 nodeValue + 父节点的 inline color）。找不到节点则静默 no-op（当前没有
+     * running 会话 → 没有指示器 → 无可贴目标,这是预期行为而非错误）。
+     *
+     * @param liveUi - 宿主写入的 { phase, text, color }；缺省/null 时 no-op。
+     */
+    function paintTurnStatus(liveUi) {
+      if (typeof document === "undefined") return;
+      if (!liveUi || typeof liveUi.text !== "string" || liveUi.text.length === 0) return;
+      const statusNodes = document.querySelectorAll('[role="status"][aria-live="polite"]');
+      if (statusNodes.length === 0) return; // 没有 running 会话 → 没有 TurnStatus
+      for (const node of statusNodes) {
+        // 第一个文本型子节点（"Deep diving..." 本体；时钟 span 是其后兄弟,不受影响）。
+        let textChild = null;
+        for (const child of node.childNodes) {
+          if (child.nodeType === Node.TEXT_NODE && child.nodeValue.trim() !== "") { textChild = child; break; }
+        }
+        if (textChild === null) continue; // 结构不符预期 → 跳过,绝不破坏官方布局
+        textChild.nodeValue = liveUi.text;
+        // phase→颜色已在宿主侧算好（working 随机色 / compressing 红 / done 绿）。
+        // 直接设 inline color 即可让 CSS 模块类的 shimmer 动画仍作用于文本填充
+        // （shimmer 用的是 gradient + background-clip:text 的透明填充,与 color 无关;
+        // 但我们仍显式设一次,以防未来 shimmer 样式调整导致底色缺失时仍可辨识相位）。
+        node.style.color = typeof liveUi.color === "string" ? liveUi.color : "";
+      }
+    }
+
+    /**
      * 注册文案字典、绑定设置命名空间、把分区挂到 settings.section。
      * @param ctx - client 根上下文。
      */
@@ -571,6 +615,14 @@ window.__ModuleLoader__.load({
           d.writable = s.writable;
         });
       };
+        // ── Live UI 徽章（详见上方 paintTurnStatus 文档）──
+        // 每次命名空间快照翻转（含宿主写入 liveUi 瞬间）,顺路把最新 liveUi
+        // 贴到对话区 TurnStatus DOM 上。这一步搭车在已有 scope.subscribe
+        // 回调上不新增任何订阅机制 / timer / 组件,符合 client 端 AGENTS.md
+        // 红线。幂等纯装饰:贴不上（无 running 会话/无 DOM 锚点）即静默跳过。
+        if (s.status === "ready" && s.value && typeof s.value.liveUi === "object") {
+         paintTurnStatus(s.value.liveUi);
+        }
       // 关键：settingsScope 的快照自带权威状态枚举 'loading'|'ready'|'unavailable'
       // （见 ui-settings 的 SettingsScopeController.derive：命名空间未出现时置
       // 'unavailable'，并非 'loading'）。derive 直接透传该枚举，绝不按 mode 二次

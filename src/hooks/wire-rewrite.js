@@ -84,12 +84,20 @@
  * double-registration across multiple `apply` invocations in tests or HMR).
  *
  * Contract guarantees:
+ * Contract guarantees:
  *   • ALWAYS calls `next()` (skipping it would stall the waterfall chain).
  *   • NEVER mutates the (deep-frozen) seed, so it cannot raise
  *     `object is not extensible`.
  *   • NEVER reshapes/spreads the (stream) return value, so it cannot break the
  *     consumer's `for await`.
- *   • Emits no observable log line (pure passthrough).
+ *   • Emits at most ONE debug line (the first-of-lifetime ui-signal marker;
+ *     silent thereafter).
+ *   • FIRES THE LIVE UI STATUS SIDE-CHANNEL (`core/ui-signal.js`) on every
+ *     invocation — the "each LLM call start = fresh random working pair"
+ *     watermark. The publication is awaited BEFORE `next()`, never touches
+ *     `payload` (the deep-frozen seed — untouched per the two-hard-walls
+ *     note above), and a failed publication is swallowed INSIDE
+ *     `publishRandomWorking`, so it can never stall or reject the stream.
  *
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @returns {boolean} whether this call actually performed the (once-only)
@@ -97,19 +105,30 @@
  *   installed) or a registration failure (not installed; a later re-entry
  *   will retry).
  */
+
+import { publishRandomWorking } from '../core/ui-signal.js'
 let installed = false
 export function registerLlmStreamHook(ctx) {
   if (installed) return false
   try {
-    ctx.on('llm/stream', (payload, next) => {
-      // Pure passthrough — deliberate. See the module header for the two hard
-      // walls (deep-frozen seed; base generator binds the seed) that make a
-      // `reasoning_effort:"none"` wire-append impossible at this seam without
-      // a vendor change or a dedicated llama.cpp adapter. Forwarding `next()`
-      // untouched is the only action that is guaranteed neither to mutate the
-      // frozen seed nor to destroy the stream value. `payload` is unused by
-      // design (kept in the signature for waterfall-contract clarity).
+    ctx.on('llm/stream', async (payload, next) => {
+      // Side channel FIRST, then forward. `payload` is the deep-frozen
+      // GenerateOptions seed — NEVER mutated (see the two-hard-walls note in
+      // the module header: in-place assignment raises `object is not
+      // extensible`, and the base generator binds the seed so a reshaped
+      // clone never reaches the serializer). The publication below touches
+      // NONE of that: it is a pure settings-write on a side channel
+      // (the `liveUi` field of the `falling-ts-force-compact` namespace),
+      // which the client half's `settingsScope.bind` mirror reflects live
+      // so the browser can repaint the conversation area's `TurnStatus`
+      // node. `void payload` documents the deliberate non-use.
       void payload
+      // Awaiting the publication BEFORE `next()` means the browser observes
+      // the fresh working pair AT the request boundary, before the first
+      // chunk flows. The underlying write is a local in-process merge
+      // (sub-millisecond typical); a rejection is swallowed inside the
+      // publisher (guaranteed side-effect-free w.r.t. the waterfall).
+      await publishRandomWorking(ctx)
       return next()
     })
     installed = true
