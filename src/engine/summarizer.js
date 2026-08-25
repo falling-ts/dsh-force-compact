@@ -216,9 +216,6 @@ export async function summarize(ctx, config, agent, input, signal, extra) {
   // plugin does not depend on `@deepseek-ai/dsh-llm` symbols (it ships as
   // plain JS outside the DSH workspace), so the assembly logic is inlined here
   // against the documented `StreamChunk` shape.
-  // TEMPORARY: pass recordOnEmpty so a zero-text run dumps its raw chunk shape
-  // (see collectChunks probe) — the only reliable way to learn what the harness
-  // actually hands us vs the expected `chunk.type` literals.
   // Bind the stream ONCE (rather than inline in the collectChunks call) so the
   // missing-finish diagnostic below can describe the ACTUAL object we were given
   // — distinguishing "not async-iterable (swapped by a waterfall listener)" from
@@ -233,7 +230,7 @@ export async function summarize(ctx, config, agent, input, signal, extra) {
   // error degrades to a labeled failure instead of escaping `summarize`.
   let collected
   try {
-    collected = await collectChunks(stream, signal, { recordOnEmpty: true })
+    collected = await collectChunks(stream, signal)
   } catch (err) {
     // `for await` threw mid-iteration (generator fault, network reset, a
     // poisoned composed stream, …). Record it and fall through to the shared
@@ -283,6 +280,37 @@ export async function summarize(ctx, config, agent, input, signal, extra) {
   // Official `FinishReason.kind` closed union (upstream types.ts):
   //   'stop' | 'tool-calls' | 'max-tokens' | 'aborted' | 'error'.
   if (finishKind === 'error') {
+    // TEMPORARY CRASH-HARNESS PROBE: the recurring terminal failure
+    // `provider failure: Cannot read properties of undefined (reading 'kind')`
+    // (code UNKNOWN) tells us SOMEWHERE inside the composed stream chain a
+    // harness/middleware reader dereferenced `undefined.kind`. To finally root-
+    // cause it, dump EVERYTHING observable about the failure fact on the single
+    // branch where such a crash lands. Self-limiting: writes at most one line
+    // per errored call, logging never propagates, removable once root-caused.
+    try {
+      const f = readProp(finish, 'failure')
+      const stackTop = (() => {
+        const st = f && typeof f.stack === 'string' ? f.stack : (new Error('probe-no-stack-on-failure')).stack
+        // Keep the frames INSIDE the harness/adapter (skip this probe's own
+        // frames): drop lines mentioning this file, keep the rest, max 6.
+        const frames = st.split('\n').filter(line => !line.includes('summarizer.js'))
+        return frames.slice(0, 6).map(line => line.trim()).join(' <- ')
+      })()
+      const causeChain = []
+      let cursor = f && f.cause
+      for (let depth = 0; depth < 4 && cursor !== undefined && cursor !== null; depth++) {
+        causeChain.push(typeof cursor === 'object'
+          ? { ctor: (cursor.constructor && cursor.constructor.name) || '?', message: cursor.message, name: cursor.name, code: cursor.code }
+          : { primitive: cursor })
+        cursor = (typeof cursor === 'object') ? cursor.cause : undefined
+      }
+      const failJson = (() => {
+        try { return JSON.stringify({ kind: finish.kind, msg: f && f.message, code: f && f.code }).slice(0, 400) } catch { return '<unserializable>' }
+      })()
+      console.log(`[force-compact] CRASH-HARNESS: failureFact=${JSON.stringify(f && typeof f === 'object' ? { ctor: f.constructor && f.constructor.name, protoKeys: Object.getOwnPropertyNames(Object.getPrototypeOf(f)).slice(0, 12), ownKeys: Object.keys(f).slice(0, 12) } : f, (k, v) => (k === 'stack' ? '<omitted>' : v)) } `
+        + `failJson=${failJson} causeChain=${JSON.stringify(causeChain).slice(0, 600)} `
+        + `stackInsideHarness=[${stackTop}] optionsShape={provider:${options.provider},model:${options.model},msgs:${options.messages.length},tools:${options.tools !== undefined ? options.tools.length : 'absent'},system:${typeof options.system},purpose:${options.purpose},effort:${options.reasoningEffort}}`)
+    } catch { /* the probe itself must never mask the original outcome */ }
     return { status: 'provider-error', reason: 'provider failure: ' + (failureText(readProp(finish, 'failure')) || 'unknown provider error') }
   }
   if (finishKind === 'aborted') {
@@ -631,20 +659,14 @@ async function collectChunks(stream, signal, opts) {
   // no usable text"). Fully self-contained and guarded: NOTHING in this block
   // may throw out of `collectChunks`, so serialization is try/catch'd and the
   // whole emission is a no-op on any anomaly.
-  if (recording && !blocks.some(b => b && b.type === 'text')) {
-    try {
-      const desc = probeBuf.map(p => `#${p.type}[${p.keys}] ${p.sample}`).join(' | ')
-      let reasonJson
-      try {
-        reasonJson = (finish && typeof finish === 'object') ? JSON.stringify(finish) : String(finish)
-      } catch {
-        reasonJson = '<unserializable finish>'
-      }
-      process.stdout.write(`[force-compact] CHUNK-SHAPE PROBE (no text blocks): finishReason=${reasonJson} count=${chunkCount} :: ${desc}\n`)
-    } catch {
-      /* a diagnostic probe must never abort the summarization itself */
-    }
-  }
+  // NOTE: the bulk CHUNK-SHAPE emission that used to live here was REMOVED —
+  // it fired on every no-text run with byte-identical payloads (the upstream
+  // error is deterministic) and flooded the dev-server log. The raw chunk
+  // shapes are STILL recorded into `probeBuf`; a targeted probe can be
+  // re-enabled via `recordOnEmpty` should a genuinely NEW failure shape ever
+  // appear. The persistent `CRASH-HARNESS` line emitted on terminal
+  // `kind:'error'` finishes (in `summarize`) now carries the discriminating
+  // detail instead.
   // `_chunkCount` is exposed (underscore-prefixed, internal) purely so a
   // missing-finish diagnostic can distinguish "consumed N chunks but never a
   // terminal finish" from "consumed ZERO chunks (silent/lazy/no-op stream)".

@@ -69,87 +69,7 @@ export function takeForceCompact(sessionId) {
   return pending === true
 }
 
-/**
- * Per-session "compaction gave up" cooldown memo.
- *
- * WHY THIS EXISTS (dead-loop prevention): the `agent/pre-step` threshold gate
- * rejects a model step and attempts a compaction when total context >=
- * `autoThresholdTokens`. When that compaction comes back UNCOMMITTED — a blank
- * / empty summary, a shrink-gate reject, a moved range — NOTHING shrank, so the
- * NEXT step measures the SAME total, hits the SAME gate, and compacts AGAIN.
- * Left alone this is an unbounded reject-retry storm that LOOKS like a hang.
- *
- * RULE: when a threshold-gate compaction yields no committed change, we record
- * the session's token count AT THAT MOMENT (plus a short diagnostic note). While
- * the session's total stays at-or-below that mark (+ a small tolerance), we STOP
- * attempting threshold-gated compaction for that session and simply let requests
- * proceed — "blank result, no further action." Once the session grows PAST the
- * mark (genuinely new content accumulates), the cooldown expires automatically,
- * so a legitimately large future context still triggers a fresh attempt. No
- * timers, no persistent state — purely process-local, mirroring `pendingForce`.
- *
- * BOUNDED: capped to at most {@link MAX_COOLDOWN_ENTRIES} sessions so a long-lived
- * process with many conversations cannot accumulate unbounded memo state. When
- * the cap is exceeded, the OLDEST inserted entry is evicted (Map preserves
- * insertion order, so `keys().next()` is deterministic). Entries self-clear on
- * expiry/success, keeping steady-state size near zero in normal use.
- * @type {Map<string, { tokens: number, note: string }>}
- */
-const compactCooldown = new Map()
-const MAX_COOLDOWN_ENTRIES = 32
 
-/**
- * How far total tokens may grow above a cooled-down mark before the cooldown
- * expires and compaction is retried. A tiny absolute floor avoids jitter on
- * noisy measurements; generous enough that ordinary inter-step noise (a few
- * hundred tokens of tool output) does not spuriously reset.
- */
-const COOLDOWN_GROWTH_TOLERANCE = 500
-
-/**
- * Remember that a threshold-gated compaction came back blank for one session,
- * capturing its current token count as the "don't retry until it grows past
- * THIS" high-water mark.
- * @param {string} sessionId
- * @param {number} totalTokens the measured total at the moment of the blank result.
- * @param {string} note why the compaction did not commit (diagnostic only).
- */
-function markCompactCooldown(sessionId, totalTokens, note) {
-  // Evict oldest-to-newest overflow BEFORE inserting so the new (most recent)
-  // session is always retained; delete-first then re-set keeps Map insertion
-  // order stable (delete + set moves the key to the tail = newest).
-  while (compactCooldown.size >= MAX_COOLDOWN_ENTRIES) {
-    const oldest = compactCooldown.keys().next().value
-    if (oldest === undefined) break
-    compactCooldown.delete(oldest)
-  }
-  compactCooldown.delete(sessionId) // move to tail if already tracked
-  compactCooldown.set(sessionId, { tokens: totalTokens, note })
-}
-
-/**
- * Check (and, on expiry, CLEAR) a session's compaction cooldown.
- * @param {string} sessionId
- * @param {number} totalTokens the current measured total.
- * @returns {string|undefined} a human-readable note explaining why compaction is
- *   being skipped, or `undefined` when no cooldown applies (proceed normally).
- *   Clears the memo once the session has grown beyond mark + tolerance.
- */
-function consultCompactCooldown(sessionId, totalTokens) {
-  const entry = compactCooldown.get(sessionId)
-  if (entry === undefined) return undefined
-  const grewPast = totalTokens > entry.tokens + COOLDOWN_GROWTH_TOLERANCE
-  if (grewPast) {
-    compactCooldown.delete(sessionId)
-    return undefined
-  }
-  return entry.note
-}
-
-/** Drop a session's cooldown memo (used when a compaction finally succeeds). */
-function clearCompactCooldown(sessionId) {
-  compactCooldown.delete(sessionId)
-}
 
 /**
  * Estimate the total token count of the messages contained in a region span,
@@ -291,11 +211,16 @@ async function __compactRetainingLatestBody(ctx, agent, signal, mode) {
     )
     return false
   }
-  // Measure the session's total context tokens (authoritative when tokenMeter is
-  // mounted; character-based fallback otherwise). Defensive: `measure` might
-  // return undefined/a non-object for a malformed session, and calling it might
-  // throw on a transient backend glitch — BOTH must degrade to `undefined`
-  // (fallback estimation) rather than propagate.
+  // Measure the session's REAL content mass (SURFACE TOKENS ONLY — no usage-
+  // baseline water). `measured.totalTokens` includes a provider-reported usage
+  // baseline that inflates with prior consumption and RESETS after each
+  // compaction, so keying any threshold arithmetic on it produces phantom
+  // "still above threshold" states that never clear; `measured.surfaceTokens`
+  // is the honest, stable mass of what the model actually sees. Defensive:
+  // `measure` might return undefined/a non-object for a malformed session, and
+  // calling it might throw on a transient backend glitch — BOTH must degrade
+  // to `undefined` (caller then falls back to the char estimator) rather than
+  // propagate.
   const meter = ctx.get('tokenMeter')
   let totalTokens
   let measurement
@@ -303,8 +228,10 @@ async function __compactRetainingLatestBody(ctx, agent, signal, mode) {
     try {
       const measured = meter.measure(session)
       if (measured !== undefined && measured !== null) {
-        totalTokens = measured.totalTokens
         measurement = measured
+        totalTokens = (Number.isFinite(measured.surfaceTokens) && measured.surfaceTokens > 0)
+          ? measured.surfaceTokens
+          : undefined
       }
     } catch {
       totalTokens = undefined
@@ -348,7 +275,7 @@ async function __compactRetainingLatestBody(ctx, agent, signal, mode) {
         return selectEarliestByTokens(session, headBudget, maxRegionNodes)
       })()
   if (region === null) {
-    ctx.logger.debug(`[force-compact] ${session.id}: no region to compact retaining ~${settings.retainLatestTokens} latest tokens (totalTokens=${totalTokens == null ? 'unknown(fallback est)' : totalTokens}${measurement !== undefined ? `, surface nodes=${measurement.nodes.length}, surfaceTokens=${measurement.surfaceTokens}` : ''})`)
+    ctx.logger.debug(`[force-compact] ${session.id}: no region to compact retaining ~${settings.retainLatestTokens} latest tokens (totalTokens=${totalTokens == null ? 'unknown(fallback est)' : totalTokens}${measurement !== undefined ? `, surface nodes=${measurement.nodes?.length}, surfaceTokens=${measurement.surfaceTokens}` : ''})`)
     return false
   }
 
@@ -395,8 +322,8 @@ async function __compactRetainingLatestBody(ctx, agent, signal, mode) {
   }
 
   ctx.logger.debug(
-    `[force-compact] ${session.id}: compacting head spanning seqs ${region.start}..${region.end} `
-    + `while retaining the latest ~${settings.retainLatestTokens} tokens, via ${backend.kind} backend (totalTokens=${totalTokens})`
+    `[force-compact] ${session.id}: compacting head spanning seqs ${region?.start}..${region?.end} `
+    + `while retaining the latest ~${settings.retainLatestTokens} tokens, via ${backend?.kind} backend (totalTokens=${totalTokens})`
   )
   try {
     // LIVE UI SIGNAL — PIN RED "compressing" BEFORE the region compaction
@@ -408,25 +335,22 @@ async function __compactRetainingLatestBody(ctx, agent, signal, mode) {
     await publishCompressing(ctx)
     const result = await backend.compactRegion(region.start, region.end, agent, signal)
     if (result === undefined || result === null) {
-      ctx.logger.debug(`[force-compact] ${session.id}: retained-tail compaction committed nothing via ${backend.kind}`)
+      ctx.logger.debug(`[force-compact] ${session.id}: retained-tail compaction committed nothing via ${backend?.kind}`)
       return false
     }
-    // COMMITTED — range shadowed + summary added. Clear any outstanding
-    // cooldown memo for this session (it demonstrably shrank this time, so a
-    // future threshold hit should attempt fresh, not inherit a stale give-up).
-    clearCompactCooldown(session.id)
+    // COMMITTED — range shadowed + summary added.
     // Pin GREEN "done"; the next model step's `llm/stream` watermark replaces
     // it with a fresh random working pair shortly after (cadence < 3 s, no timer).
     await publishDone(ctx)
     ctx.logger.info(
-      `[force-compact] ${session.id}: retained-latest-${settings.retainLatestTokens}-tokens compaction (${backend.kind}) `
+      `[force-compact] ${session.id}: retained-latest-${settings.retainLatestTokens}-tokens compaction (${backend?.kind}) `
       + `shadowed ${result.shadowedSeqs?.length ?? '?'} nodes (~${result.shadowedTokenCount ?? '?'} tokens) `
-      + `spanning seqs ${region.start}..${region.end}`,
+      + `spanning seqs ${region?.start}..${region?.end}`,
     )
     return true
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
-    ctx.logger.warn(`[force-compact] ${session.id}: retained-tail compaction via ${backend.kind} FAILED — ${message}`)
+    ctx.logger.warn(`[force-compact] ${session.id}: retained-tail compaction via ${backend?.kind} FAILED — ${message}`)
     return false
   }
 }
@@ -488,8 +412,20 @@ async function __forceCompactIfNeededBody(ctx, agent, signal, mode) {
     return false
   }
   const measurement = meter.measure(session)
-  const total = measurement && typeof measurement.totalTokens === 'number'
-    ? measurement.totalTokens
+  // AUTHORITATIVE PRESSURE BASIS — SURFACE TOKENS ONLY (no usage-baseline
+  // water). `totalTokens` mixes a provider-reported USAGE baseline (which
+  // inflates on sessions that have already consumed context and RESETS after
+  // every compaction, making any high-water mark anchored on it unreachable
+  // forever) with the live surface content. The real, stable mass of what the
+  // model actually sees is `measurement.surfaceTokens` (the sum of the meter's
+  // per-node surface prices), so ALL threshold arithmetic in this guard now
+  // keys off it exclusively — gates, shrink predictions, and logs alike.
+  // Degraded modes (missing/malformed measurement or non-number
+  // `surfaceTokens`) fall back to the char-based estimator, which approximates
+  // exactly the surface content mass as well.
+  const total = (measurement && typeof measurement.surfaceTokens === 'number' && Number.isFinite(measurement.surfaceTokens)
+    && measurement.surfaceTokens > 0)
+    ? measurement.surfaceTokens
     : estimateSessionTokens(session)
   // DIAGNOSTIC: log every measurement facet on the threshold branch so a
   // divergent total can be attributed (baseline kind/tokens vs surface sum vs
@@ -502,7 +438,7 @@ async function __forceCompactIfNeededBody(ctx, agent, signal, mode) {
     const estFallback = estimateSessionTokens(session)
     ctx.logger.debug(
       `[force-compact] ${session.id}: MEASURE-DIAG total=${total} `
-      + `baseline=${baseline ? `${baseline.kind}:${baseline.tokens}` : 'none'} `
+      + `baseline=${baseline ? `${baseline?.kind}:${baseline?.tokens}` : 'none'} `
       + `delta=${measurement && typeof measurement.surfaceDeltaTokens === 'number' ? measurement.surfaceDeltaTokens : '?'} `
       + `surfaceTokens=${measurement && typeof measurement.surfaceTokens === 'number' ? measurement.surfaceTokens : '?'} `
       + `nodes=${diagNodes.length} windowSum=${diagWindowSum} charEst4=${estFallback}`
@@ -522,14 +458,14 @@ async function __forceCompactIfNeededBody(ctx, agent, signal, mode) {
   // the compacted surface), so projecting `total − maxRemovableHead` onto the
   // CURRENT measurement is UNSOUND whenever the baseline is usage-flavored:
   // it predicts "cannot cross" precisely in the regime where compaction helps
-  // most. Instead we LOG the floor arithmetic (useful attribution data — how
-  // much of `total` is baseline vs window vs delta) and ALWAYS fall through to
-  // the attempted compaction. The threshold-aware SHRINK GATE further downstream
-  // still applies to the CHOSEN region, and the blank-result COOLDOWN below
-  // still breaks any residual livelock — together they preserve the invariant
-  // "never spam identical useless compactions" without the earlier regression
-  // of permanently arming-cooldown-free skips when the floor prediction
-  // misfires on an inflated baseline.
+   // most. Instead we LOG the floor arithmetic (useful attribution data — how
+   // much of `total` is baseline vs window vs delta) and ALWAYS fall through to
+   // the attempted compaction. Note that the guard's `total` is now
+   // SURFACE-TOKENS ONLY (no usage-baseline water), so this naive projection is
+   // meaningful again; it nonetheless stays INFORMATIONAL — the per-region
+   // SHRINK GATE downstream makes the actual decision, and no separate
+   // blank-result cooldown exists anymore ("先压缩再说": every threshold-hit
+   // step attempts a fresh compaction).
   const floorWindow = (measurement && Array.isArray(measurement.nodes) ? measurement.nodes : [])
     .filter(n => n !== null && typeof n === 'object' && Number.isFinite(Number(n.tokens)))
   const windowSumObserved = floorWindow.reduce((acc, n) => acc + Number(n.tokens), 0)
@@ -538,29 +474,15 @@ async function __forceCompactIfNeededBody(ctx, agent, signal, mode) {
   if (floorWindow.length > 0 && projectedAfterObserved >= settings.autoThresholdTokens) {
     ctx.logger.debug(
       `[force-compact] ${session.id}: PRE-FLIGHT OBSERVATION — total ${total} `
-      + `(usage-baseline ${measurement.baseline ? `${measurement.baseline.kind}:${measurement.baseline.tokens}` : 'n/a'} `
+      + `(usage-baseline ${measurement.baseline ? `${measurement.baseline?.kind}:${measurement.baseline?.tokens}` : 'n/a'} `
       + `+ surfaceDelta ${measurement.surfaceDeltaTokens != null ? measurement.surfaceDeltaTokens : '?'}); `
       + `surfaces window = ${windowSumObserved} tokens across ${floorWindow.length} nodes, `
       + `retains ~${settings.retainLatestTokens} → max removable head = ${maxRemovableObserved} tokens; `
       + `naive projected-after ${projectedAfterObserved} is >= threshold ${settings.autoThresholdTokens} `
       + `BUT the baseline is provider-reported usage (resets post-compaction), `
       + `so we PROCEED with the compaction attempt regardless. The downstream `
-      + `shrink-gate + blank-cooldown still protect against repeat no-ops.`
+      + `shrink-gate protects against repeat no-ops (no BLANK cooldown anymore).`
     )
-  }
-
-  // DEAD-LOOP GUARD — BLANK-RESULT SHORT-CIRCUIT. If a PRIOR threshold-gated
-  // compaction for this session came back blank/uncommitted and the context has
-  // NOT meaningfully grown since, we STOP attempting and let the request proceed
-  // as-is. Without this, a blank result shrinks nothing, so EVERY subsequent
-  // step re-measures the same total >= threshold, re-compacts, gets another
-  // blank, repeats forever — the "hang". Per requirement: a blank outcome means
-  // no further automatic action. (An explicit `/force-compact` command above
-  // bypasses this guard deliberately — honoring a user's direct request.)
-  const cooldownNote = consultCompactCooldown(session.id, total)
-  if (cooldownNote !== undefined) {
-    ctx.logger.debug(`[force-compact] ${session.id}: threshold reached (~${total} tokens) but AUTO compaction previously came back blank/unchanged and context has not grown past the cooldown mark — SKIPPING compaction, letting the request proceed (note: ${cooldownNote}). Will re-arm once the session grows ~${COOLDOWN_GROWTH_TOLERANCE} tokens past the last blank mark.`)
-    return false
   }
 
   // At or above the threshold: do NOT request the model. Retain the latest
@@ -573,13 +495,12 @@ async function __forceCompactIfNeededBody(ctx, agent, signal, mode) {
   )
   const committed = await compactRetainingLatest(ctx, agent, signal, mode)
   if (!committed) {
-    // BLANK OUTCOME — record a cooldown HIGH-WATER MARK at this token count so
-    // subsequent steps at (roughly) the same total stop hammering. CLEARED
-    // automatically once the session genuinely grows (see
-    // consultCompactCooldown) or a compaction finally commits (see
-    // compactRetainingLatest).
-    markCompactCooldown(session.id, total, 'blank/unchanged summary at threshold')
-    ctx.logger.debug(`[force-compact] ${session.id}: threshold-gate compaction came back BLANK — recorded a compaction cooldown at ~${total} tokens (auto-gate will pause here until context grows). Letting the request proceed.`)
+    // BLANK OUTCOME — nothing shrank, so the NEXT step re-attempts at the same
+    // total. That is intentional ("先压缩再说"): a blank result never wedges the
+    // gate behind a high-water mark; the shrink-gate inside
+    // `compactRetainingLatest` plus the engine-side replay/failure caps absorb
+    // any repeat no-ops. Letting the request proceed.
+    ctx.logger.debug(`[force-compact] ${session.id}: threshold-gate compaction came back BLANK — letting the request proceed (will re-attempt on the next step).`)
   } else {
     ctx.logger.debug(`[force-compact] ${session.id}: threshold-gate compaction COMMITTED — letting the request proceed`)
   }

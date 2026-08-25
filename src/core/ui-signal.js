@@ -168,7 +168,7 @@ export async function publishUiStatus(ctx, status) {
     if (!warnedOnce) {
       warnedOnce = true
       try {
-        ctx.logger.debug(`[force-compact] ui-signal: publishing ${status.phase} "${status.text}" (${status.color}) via ${NS}.${LIVE_UI_FIELD}`)
+        ctx.logger.debug(`[force-compact] ui-signal: publishing ${status?.phase} "${status?.text}" (${status?.color}) via ${NS}.${LIVE_UI_FIELD}`)
       } catch { /* logging must never propagate */ }
     }
   } catch (error) {

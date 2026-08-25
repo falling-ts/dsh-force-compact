@@ -38,6 +38,27 @@ import { selectEarliestByTokens } from './region.js'
 import { readSettings, DEFAULTS } from '../core/settings.js'
 
 /**
+ * ONE-SHOT LOAD MARKER — proves WHICH built engine is actually loaded on a
+ * booted instance (so a stale-process or wrong-source scenario is instantly
+ * visible in the dev-server log rather than guessed at). Emitted once per
+ * process on first `runTransaction` entry (before any other work), guarded so
+ * a console failure can never disturb a compaction. Remove freely once the
+ * `reading 'kind'` investigation closes.
+ */
+let loadMarkerEmitted = false
+function emitLoadMarker() {
+  if (loadMarkerEmitted) return
+  loadMarkerEmitted = true
+  try {
+    console.log(`[force-compact] BUILTIN ENGINE LOADED — marker v2026-08-25-crash-harness `
+      + `(diagnostics: MIN_USEFUL_SPAN floor active, tools-prefix OMITTED bisect-toggle still on, `
+      + `CRASH-HARNESS arm on kind==='error' terminal finishes)`)
+  } catch {
+    /* a load marker must never throw out of a compaction path */
+  }
+}
+
+/**
  * Per-session SUMMARIZATION FAILURE cooldown (process-local, no timers, no
  * persistence) — the storm-suppression layer for the IDLE/`compactNow` path,
  * which (unlike the `agent/pre-step` threshold gate) never consulted the
@@ -52,7 +73,7 @@ import { readSettings, DEFAULTS } from '../core/settings.js'
  * busy session) this becomes a livelock: the SAME giant span re-summarized and
  * re-failed on every tick — the concrete "stutters every request" symptom.
  *
- * Mechanism (mirrors `guard.js`'s `compactCooldown` token-high-water-mark):
+ * Mechanism (token-high-water-mark PLUS wall-clock aging):
  * when a transaction fails we remember the session's CURRENT authoritative
  * total-token count as a "do not retry until it grows past THIS" mark, plus a
  * wall-clock timestamp so a pure stall (no new tokens ever) also cools off after
@@ -93,6 +114,21 @@ const CHARS_PER_TOKEN = 4
 const MAX_REPLAY_MESSAGES = 128
 
 /**
+ * Minimum shadowed-span size (in estimated tokens) below which a summarization
+ * is skipped WITHOUT opening the lock or calling the LLM (the small-span
+ * pre-check in `runTransaction`). Rationale: for spans this small, the
+ * summarizer's verbosity floor means the output very often EXCEEDS the input
+ * (observed live 2026-08-25: a ~3175-token span produced a ~3789-token
+ * summary → the post-summary shrink gate vetoes it), so attempting such a
+ * span deterministically wastes a ~40s local round-trip and burns the
+ * transaction bracket for a guaranteed `summary-not-smaller` outcome. Spans
+ * grow naturally as head accumulates, so the FIRST worthwhile compression
+ * happens automatically once enough older content gathers. The post-summary
+ * SHRINK GATE remains authoritative for everything above this floor.
+ */
+const MIN_USEFUL_SPAN_TOKENS = 8000
+
+/**
  * Consult a session's summarization-failure cooldown. Returns a human-readable
  * SKIP NOTE (suppress this attempt) or `undefined` (proceed normally). Clears
  * the mark when EITHER condition holds, so a recovered span retries promptly:
@@ -120,7 +156,7 @@ function consultFailureCooldown(sessionId, totalTokens) {
   if (agedOut === false && (Date.now() - entry.lastReeval) >= FAILURE_REEVAL_INTERVAL_MS) {
     entry.lastReeval = Date.now()
   }
-  return `last builtin summarization failed (at ~${entry.tokens} total tokens); backing off ${Math.max(1, Math.round((FAILURE_RETRY_GRACE_MS - (Date.now() - entry.at)) / 1000))}s`
+  return `last builtin summarization failed (at ~${entry?.tokens} total tokens); backing off ${Math.max(1, Math.round((FAILURE_RETRY_GRACE_MS - (Date.now() - (entry?.at ?? Date.now()))) / 1000))}s`
 }
 
 /**
@@ -255,6 +291,7 @@ export async function compactRegionBuiltin(ctx, start, end, agent, signal) {
  * pair so the log stays interpretable on reload).
  */
 async function runTransaction(ctx, agent, session, region, signal, settings) {
+  emitLoadMarker()
   const llm = ctx.get('llm')
   if (llm === undefined || typeof llm.stream !== 'function') {
     warn(ctx, `${session.id}: builtin compaction unavailable — no LLM service`)
@@ -278,13 +315,40 @@ async function runTransaction(ctx, agent, session, region, signal, settings) {
     return null
   }
 
-  // ---- Prepare the replay input ------------------------------------------
-  const { shadowedSeqs, messages } = projectRegion(session, region)
+  // ---- Small-span PRE-CHECK (doom avoidance, mirrors official O26) --------
+  // A summarization of a TINY head span is statistically likely to produce
+  // MORE text than the span itself (an abstract cannot beat the verbosity
+  // floor of a few thousand tokens), so the shrink gate further down WOULD
+  // reject it — yet we would have burned the lock + a full LLM round-trip
+  // (≈40s on a local endpoint) to learn that. Skip such regions BEFORE the
+  // lock opens and the call fires: the caller's selection is honored on the
+  // NEXT attempt, and once enough head accumulates the span naturally grows
+  // past MIN_USEFUL_SPAN_TOKENS and proceeds. This replaces the wasteful
+  // cycle "attempt giant prompt → shrink-gate veto → blank → re-attempt the
+  // identical doomed span every step".
+  // NOTE: the post-summary SHRINK GATE still applies to everything that
+  // passes this pre-check — it remains the authoritative defense.
+  let shadowedTokenCount
+  const projected = projectRegion(session, region)
+  const messages = projected.messages
+  const shadowedSeqs = projected.shadowedSeqs
   if (messages.length === 0) {
     info(ctx, `${session.id}: builtin compaction — region has no surface messages; skipping`)
     return null
   }
-  const shadowedTokenCount = estimateTokens(messages)
+  shadowedTokenCount = estimateTokens(messages)
+
+  // ---- Small-span SKIP (above) now applied to the measured span ------------
+  if (shadowedTokenCount < MIN_USEFUL_SPAN_TOKENS) {
+    info(
+      ctx,
+      `${session.id}: builtin compaction — head span (~${shadowedTokenCount} tokens, seq ${region?.start}..${region?.end}) `
+      + `is below the ${MIN_USEFUL_SPAN_TOKENS}-token usefulness floor; a summary of this much content almost surely `
+      + `cannot shrink it, so NO lock is opened and NO LLM call is made (the next attempt will see a larger span as `
+      + `more head accumulates). Retrying on a bigger head is cheaper than burning a doomed ~40s round-trip.`
+    )
+    return null
+  }
 
   // ---- Replay-size CAP ----------------------------------------------------
   // Refuse a replay whose message count exceeds MAX_REPLAY_MESSAGES. Such a
@@ -297,7 +361,7 @@ async function runTransaction(ctx, agent, session, region, signal, settings) {
     warn(
       ctx,
       `${session.id}: builtin compaction REFUSED — region projects ${messages.length} messages `
-      + `(span seq ${region.start}..${region.end}), exceeding the ${MAX_REPLAY_MESSAGES}-message replay cap; `
+      + `(span seq ${region?.start}..${region?.end}), exceeding the ${MAX_REPLAY_MESSAGES}-message replay cap; `
       + `a summarization of that size is unserviceable on a local model endpoint. Skipping (no lock opened, `
       + `no LLM call made). Raise \`retainLatestTokens\` so less of the head is compacted, `
       + `or increase \`maxRegionNodes\` / the built-in engine's replay cap.`,
@@ -502,7 +566,7 @@ async function runTransaction(ctx, agent, session, region, signal, settings) {
   // A successful compaction clears ANY residual failure cooldown for this
   // session so the NEXT idle tick isn't suppressed by a stale mark.
   clearFailureCooldown(session.id)
-  info(ctx, `${session.id}: builtin compaction OK — replaced span seq[${targetRange.start}..${targetRange.end}] (${shadowedSeqs.length} nodes, ~${shadowedTokenCount} tokens) with a ${summaryTextLen}-char checkpoint`)
+  info(ctx, `${session.id}: builtin compaction OK — replaced span seq[${targetRange?.start}..${targetRange?.end}] (${shadowedSeqs?.length} nodes, ~${shadowedTokenCount} tokens) with a ${summaryTextLen}-char checkpoint`)
   return {
     kind: 'builtin',
     compactionId,
@@ -644,7 +708,8 @@ function projectRegion(session, region) {
     } else if (event.type === 'assistant/message') {
       shadowedSeqs.push(seq)
       const content = (data.message && data.message.content !== undefined) ? data.message.content : undefined
-      if (content) messages.push({ role: 'assistant', content })
+      const source = (data.message && typeof data.message.source === 'object' && data.message.source !== null) ? data.message.source : { kind: 'model' }
+      if (content) messages.push({ role: 'assistant', content, source })
     } else if (event.type === 'tool/result') {
       const msg = (data.message && typeof data.message === 'object') ? data.message : undefined
       if (msg && msg.content) {

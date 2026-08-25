@@ -102,7 +102,7 @@ async function __handleAgentStatusBody(ctx, payload, mode) {
     await publishCompressing(ctx)
     const result = await backend.compactNow(agent, controller.signal)
     if (result === undefined || result === null) {
-      ctx.logger.debug(`[force-compact] ${session.id}: idle compaction via ${backend.kind} committed nothing`)
+      ctx.logger.debug(`[force-compact] ${session.id}: idle compaction via ${backend?.kind} committed nothing`)
       return
     }
     // COMMITTED — range shadowed + summary added. Pin GREEN "done" NOW; the
@@ -112,11 +112,11 @@ async function __handleAgentStatusBody(ctx, payload, mode) {
     // needed.
     await publishDone(ctx)
     ctx.logger.info(
-      `[force-compact] ${session.id}: idle compaction (${backend.kind}) shadowed ${result.shadowedSeqs?.length ?? '?'} nodes `
+      `[force-compact] ${session.id}: idle compaction (${backend?.kind}) shadowed ${result.shadowedSeqs?.length ?? '?'} nodes `
       + `(~${result.shadowedTokenCount ?? '?'} tokens)`,
     )
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
-    ctx.logger.warn(`[force-compact] ${session.id}: idle compaction via ${backend.kind} FAILED — ${message}`)
+    ctx.logger.warn(`[force-compact] ${session.id}: idle compaction via ${backend?.kind} FAILED — ${message}`)
   }
 }

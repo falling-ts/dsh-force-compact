@@ -91,21 +91,21 @@ export async function compactSession(ctx, agent, controller, mode) {
     return null
   }
 
-  ctx.logger.debug(`[force-compact] ${session.id}: checkpoint compaction via ${backend.kind} over seq ${region.start}..${region.end}`)
+  ctx.logger.debug(`[force-compact] ${session.id}: checkpoint compaction via ${backend?.kind} over seq ${region?.start}..${region?.end}`)
   let result
   try {
     result = await backend.compactRegion(region.start, region.end, agent, controller.signal)
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
-    ctx.logger.warn(`[force-compact] ${session.id}: checkpoint compaction via ${backend.kind} FAILED — ${message}`)
+    ctx.logger.warn(`[force-compact] ${session.id}: checkpoint compaction via ${backend?.kind} FAILED — ${message}`)
     return null
   }
   if (result === undefined || result === null) {
-    ctx.logger.debug(`[force-compact] ${session.id}: checkpoint compaction via ${backend.kind} committed nothing`)
+    ctx.logger.debug(`[force-compact] ${session.id}: checkpoint compaction via ${backend?.kind} committed nothing`)
     return null
   }
   ctx.logger.info(
-    `[force-compact] ${session.id}: checkpoint compaction (${backend.kind}) shadowed ` +
+    `[force-compact] ${session.id}: checkpoint compaction (${backend?.kind}) shadowed ` +
     `${(result.shadowedSeqs && result.shadowedSeqs.length) ?? '?'} nodes (~${result.shadowedTokenCount ?? '?'} tokens)`,
   )
   return result

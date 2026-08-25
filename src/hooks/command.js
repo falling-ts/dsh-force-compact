@@ -100,7 +100,7 @@ async function __forceCompactCommandBody(ctx, invocation) {
         await publishCompressing(ctx)
         const result = await backend.compactNow(agent, invocation.signal)
         if (result === undefined || result === null) {
-          ctx.logger.debug(`[force-compact] ${session.id}: no safe range to compact via ${backend.kind}`)
+          ctx.logger.debug(`[force-compact] ${session.id}: no safe range to compact via ${backend?.kind}`)
           return { kind: 'success', text: 'no compactable range' }
         }
         // COMMITTED (range shadowed + summary added) — pin GREEN "done"; the
@@ -108,15 +108,15 @@ async function __forceCompactCommandBody(ctx, invocation) {
         // fresh random working pair shortly after (natural cadence, no timer).
         await publishDone(ctx)
         ctx.logger.info(
-          `[force-compact] ${session.id}: /force-compact (${backend.kind}) shadowed ${result.shadowedSeqs?.length ?? '?'} nodes `
+          `[force-compact] ${session.id}: /force-compact (${backend?.kind}) shadowed ${result.shadowedSeqs?.length ?? '?'} nodes `
           + `(~${result.shadowedTokenCount ?? '?'} tokens)`,
         )
-        return { kind: 'success', text: `compacted ~${result.shadowedTokenCount ?? '?'} tokens via ${backend.kind}` }
+        return { kind: 'success', text: `compacted ~${result.shadowedTokenCount ?? '?'} tokens via ${backend?.kind}` }
       } catch (error) {
         // Busy (or otherwise unable) — queue the force flag for the next step.
         queueForceCompact(session.id)
         const message = error instanceof Error ? error.message : String(error)
-        ctx.logger.info(`[force-compact] ${session.id}: ${backend.kind} said ${message}; queued for the next model step`)
+        ctx.logger.info(`[force-compact] ${session.id}: ${backend?.kind} said ${message}; queued for the next model step`)
         return {
           kind: 'success',
           text: `agent is busy — will force-compact at the next model step (${message})`,
