@@ -98,6 +98,28 @@
 如需在**业务对话**上也关闭思考(不仅压缩),请在**请求头层面**自行配置
 provider 的 `reasoningEffort` —— 本插件已刻意退出这一决策。
 
+#### 可观测性:每次摘要尝试的审计行
+
+每一次摘要尝试都会在插件日志(default `debug: true` 可见)打出**两行** `[force-compact]`
+诊断,让你**无需抓包**即可核实范围裁决与实际 wire 字段:
+
+```
+[force-compact] <sessionId>: compaction thinking-policy — settings.disableThinking=true → extra.reasoningEffort='off' (this summarization call carries thinking-OFF)
+[force-compact] <sessionId>: summarization wire-fields → <provider>/<model>: reasoningEffort='off' + reasoning_effort="none" (llama.cpp-native wire field)
+```
+
+- **第一行**打在 `disableThinking` 设置被读取并路由进调用 options 的位置
+  (`engine/builtin.js`);设置关闭时改为记录本次调用*沿用机器默认*。
+- **第二行**打在 llama.cpp 兼容加盖处(`engine/summarizer.js`),记录**离开
+  options 对象瞬间的两个 wire 字段**与解析到的 provider/model——"这次压缩的
+  关思考到底有没有落到 wire 上"的持久答案;未加盖的字段会显式标注 `(absent…)`。
+
+wire 结论有实证背书而非纸面规格:在本机 llama.cpp OpenAI 兼容端点
+(`Qwen3.8‑27B`)上,A/B/C 对照实测——**不带** `reasoning_effort` 的基线请求返回了
+非空的 `reasoning_content`(模型默认会思考),而带上顶层 `reasoning_effort:"none"`
+的同款请求**完全没有** `reasoning_content`——即该字段在此类端点上真实关闭思考;
+业务调用(不带该字段)则维持正常思考。
+
 ### LiveUI 状态
 
 一个极小的 host→client 信令通道(`liveUi` 设置字段,实时镜像到浏览器),在 turn 旁绘制徽标:
@@ -138,7 +160,8 @@ session/flush(session)                    # 持久化检查点
 
 支撑模块:
 
-- `src/hooks/guard.js` —— 每请求门禁:关思考 + 阈值门 + 强制标记。
+- `src/hooks/guard.js` —— 每请求门禁:`agent/request` 纯透传(不再批量盖思考章)+ `pre-step`
+  阈值门 + process-local 强制标记(`thinkingDisabled` 仅作 legacy predicate 保留,热路径不再调用)。
 - `src/hooks/command.js` —— `/force-compact` 命令。
 - `src/hooks/idle.js` —— 回合结束强制压缩。
 - `src/hooks/wire-rewrite.js` —— `llm/stream` 的 LiveUI 水印钩子(已不再做 wire 操作;
@@ -184,7 +207,12 @@ dsh web --patch dsh-force-compact/cordis.patch.yml
 ```
 idle compaction (builtin) shadowed N nodes (~M tokens)
 builtin compaction OK — replaced span seq[A..B] (N nodes, ~K tokens) with a P-char checkpoint
+compaction thinking-policy — settings.disableThinking=true → extra.reasoningEffort='off' (…)
+summarization wire-fields → <provider>/<model>: reasoningEffort='off' + reasoning_effort="none" (…)
 ```
+
+(最后两行即上文「可观测性」所述的那对每次尝试审计行——它们为该次尝试提供了
+关思考裁决与其 wire 字段的直接凭证。)
 
 ---
 

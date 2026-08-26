@@ -113,6 +113,32 @@ If you need thinking off on **business calls** too (not just compaction), config
 your provider's own `reasoningEffort` at the request-header level — the plugin
 deliberately stays out of that decision.
 
+#### Observability: per-attempt audit lines
+
+Every summarization attempt emits **two** `[force-compact]` diagnostic lines to the
+plugin log (visible at the default `debug: true`), so you can verify the scoping
+decision and the exact wire fields **without capturing network traffic**:
+
+```
+[force-compact] <sessionId>: compaction thinking-policy — settings.disableThinking=true → extra.reasoningEffort='off' (this summarization call carries thinking-OFF)
+[force-compact] <sessionId>: summarization wire-fields → <provider>/<model>: reasoningEffort='off' + reasoning_effort="none" (llama.cpp-native wire field)
+```
+
+- **Line 1** fires where the `disableThinking` setting is read and routed into the call
+  options (`engine/builtin.js`). With the setting off it instead records that the call
+  *rides the machine default*.
+- **Line 2** fires at the llama.cpp-compatibility stamp site (`engine/summarizer.js`),
+  recording **both** wire fields exactly as they leave the options object plus the
+  resolved provider/model — the durable answer to “did thinking-off actually land on
+  the wire?”. Fields that were not stamped are explicitly labeled `(absent…)`.
+
+The wire claim is empirically grounded, not just spec: probed against a local
+llama.cpp OpenAI-compatible endpoint (`Qwen3.8‑27B`), a baseline request **without**
+`reasoning_effort` returned a populated `reasoning_content` (the model thinks by
+default), while the identical request carrying top-level `reasoning_effort:"none"`
+returned **no** `reasoning_content` at all — i.e. the field genuinely disables thinking
+on such endpoints, and business calls (which omit the field) keep thinking as usual.
+
 ### Live-UI status
 
 A tiny host→client messenger (a `liveUi` settings field mirrored live to the browser) paints a
@@ -152,7 +178,9 @@ session/flush(session)                   # durability checkpoint
 
 Supporting modules:
 
-- `src/hooks/guard.js` — per-request guard: thinking-off + threshold gate + forced flag.
+- `src/hooks/guard.js` — per-request guard: `agent/request` pure pass-through (no more
+  blanket thinking stamp) + `pre-step` threshold gate + process-local force flag
+  (`thinkingDisabled` survives only as a legacy predicate, un-called on the hot path).
 - `src/hooks/command.js` — the `/force-compact` command.
 - `src/hooks/idle.js` — turn-end forced compaction.
 - `src/hooks/wire-rewrite.js` — the `llm/stream` Live-UI watermark hook (no longer performs
@@ -198,7 +226,13 @@ Verify a compaction happened:
 ```
 idle compaction (builtin) shadowed N nodes (~M tokens)
 builtin compaction OK — replaced span seq[A..B] (N nodes, ~K tokens) with a P-char checkpoint
+compaction thinking-policy — settings.disableThinking=true → extra.reasoningEffort='off' (…)
+summarization wire-fields → <provider>/<model>: reasoningEffort='off' + reasoning_effort="none" (…)
 ```
+
+(The last two lines are the per-attempt audit pair described under
+“Observability” — they prove the thinking-off decision and its wire fields for that
+exact attempt.)
 
 ---
 
