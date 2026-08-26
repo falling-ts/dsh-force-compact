@@ -1,14 +1,18 @@
 /**
  * dsh-force-compact — a DSH Cordis function plugin.
  *
- * Hooks the core model-request seam so that, on **every model request**, the
- * "强制压缩配置" (force-compact) settings are read:
+ * Hooks the core model-request seam so the "强制压缩配置" (force-compact)
+ * settings are read on **every model request**:
  *
  * - **`agent/request`** (a Waterfall around the frozen call configuration) —
- *   when the `disableThinking` setting is on, the returned `LlmCallConfig`
- *   carries `reasoningEffort: 'off'`, which the LLM adapter maps to
- *   `thinking: { type: 'disabled' }`. Every model request is therefore sent
- *   with thinking/reasoning disabled.
+ *   a deliberate **pass-through**: business model requests ride the machine's
+ *   `LlmCallConfig` unchanged. The `disableThinking` setting does NOT blanket
+ *   business calls (2026-08 semantics revision) — it scopes STRICTLY to the
+ *   plugin's own compaction summarization call (`engine/summarizer.js` reads
+ *   `settings.disableThinking` and stamps `reasoningEffort: 'off'` on its
+ *   `ctx.llm.stream` options; `engine/builtin.js` routes the flag through the
+ *   `extra` argument). Reading the settings here on every request means a
+ *   `settings.yaml` edit is picked up on the next request regardless of scope.
  * - **`agent/pre-step`** (a Waterfall before each model step) — reads the
  *   session's total context tokens; when they reach the `autoThresholdTokens`
  *   threshold the proposed step is rejected (the model request is NOT made)
@@ -29,10 +33,10 @@
  * - `core/log.js`      — the debug-log sink (routes `[force-compact]` lines to `logFile`).
  * - `engine/region.js`     — the plugin's own head-anchored region selection.
  * - `engine/summarizer.js` — the plugin's own one-shot LLM summarizer (preview + shrink gate).
- * - `engine/builtin.js`    — the self-contained compaction engine (`fc-compact/*` transactions).
+ * - `engine/builtin.js`    — the self-contained compaction engine (official-named `compaction/*` transactions).
  * - `engine/checkpoint.js` — the `session/flush` checkpoint orchestrator: region → delegate to a backend.
  * - `engine/backend.js`    — the unified backend facade (official-service-first, builtin-fallback).
- * - `hooks/guard.js`       — the per-model-request guard: threshold gate + forced compaction + thinking-off.
+ * - `hooks/guard.js`       — the per-model-request guard: threshold gate + forced compaction (+ legacy `thinkingDisabled` predicate).
  * - `hooks/command.js`     — the `/force-compact` slash command (idle → compact now; busy → queue a force flag).
  * - `hooks/idle.js`        — the turn-end (agent `idle`) forced compaction.
  * - `web/client.js`        — the browser half: the Force-Compact settings.section UI.
@@ -43,7 +47,12 @@
 import { compactSession } from './src/engine/checkpoint.js'
 import { registerNamespace, readRawSetting } from './src/core/settings.js'
 import { ensureDebugLogger } from './src/core/log.js'
+// `thinkingDisabled` is imported solely to keep the `guard.thinkingDisabled`
+// helper reachable from the plugin root for consumers who DO want the blanket
+// "off everywhere" predicate; the active `agent/request` hot path no longer
+// consumes it (see the pass-through comment on `__agentRequestListenerBody`).
 import { forceCompactIfNeeded, thinkingDisabled } from './src/hooks/guard.js'
+void thinkingDisabled
 import { registerCommand } from './src/hooks/command.js'
 import { handleAgentStatus } from './src/hooks/idle.js'
 import { registerLlmStreamHook } from './src/hooks/wire-rewrite.js'
@@ -348,15 +357,16 @@ const __applyInner = (ctx) => {
     registerLlmStreamHook(ctx)
   }
 
-  // Hook the core model request: when "disable thinking" is on, every model
-  // request carries reasoningEffort: 'off'. Reading the settings here (per
-  // request) means a settings.yaml edit is picked up on the next request.
-  // `agent/request` is a Waterfall — `await next()` yields the config the
-  // machine would use; returning a replacement switches it.
+  // Hook the core model request: a DELIBERATE PASS-THROUGH (2026-08 semantics
+  // revision) — business model requests carry the machine's own reasoning
+  // effort UNCHANGED; `disableThinking` scopes strictly to this plugin's
+  // compaction summarization call. `agent/request` is a Waterfall — `await
+  // next()` yields the config the machine would use; we forward it as-is. The
+  // listener stays registered because the seam MUST `next()` and the lazy
+  // install hooks below ride its first activation.
   guard('agent/request listener', () => ctx.on('agent/request', async (payload, next) => {
-    // SAFETY ENVELOPE: this is a PER-MODEL-REQUEST seam — an anomaly (a
-    // non-object `config` seed, a rejecting `thinkingDisabled`, a Proxy that
-    // traps on spread) must degrade to PASSING THROUGH the original config so
+    // SAFETY ENVELOPE: this is a PER-MODEL-REQUEST seam — an anomaly during
+    // the lazy installs must degrade to PASSING THROUGH the original config so
     // the request proceeds normally, never crashing the request chain.
     try {
       maybeInstallDebugSink()
@@ -374,24 +384,21 @@ const __applyInner = (ctx) => {
 /** Body of the `agent/request` listener; wrapped by its safe envelope above. */
 async function __agentRequestListenerBody(ctx, payload, next) {
   const config = await next()
-  if (!payload || config === undefined || config === null) return config
-  if (!(await thinkingDisabled(ctx))) {
-    // disableThinking=false (setting off): leave the machine's config untouched.
-    ctx.logger.debug('[force-compact] agent/request: disableThinking=false — leaving reasoning effort unchanged')
-    return config
-  }
-  // `config` may be a non-object seed; guard the property reads so a weird shape
-  // degrades to returning it untouched rather than throwing on `.reasoningEffort`.
-  const isObj = (config !== null && typeof config === 'object')
-  const currentEffort = isObj ? config.reasoningEffort : undefined
-  if (currentEffort === 'off') {
-    // Already off — nothing to switch (still proves the guard is active on this request).
-    ctx.logger.debug('[force-compact] agent/request: reasoningEffort already off — no change')
-    return config
-  }
-  if (!isObj) return config
-  ctx.logger.debug(`[force-compact] agent/request: applying reasoningEffort=off (disableThinking=true) — original=${currentEffort ?? '(unset)'}`)
-  return { ...config, reasoningEffort: 'off' }
+  void payload
+  void ctx
+  // DELIBERATE PASS-THROUGH (2026-08 semantics revision): the `disableThinking`
+  // setting now scopes STRICTLY to THIS PLUGIN'S OWN compaction summarization
+  // call (enforced at `summarizer.js`, where `extra.reasoningEffort` is sourced
+  // from `settings.disableThinking`). Business model requests ride the machine's
+  // config UNCHANGED — whatever the deployment's request header carried is
+  // honored, and a `settings.yaml` edit is picked up on the next request because
+  // this listener still runs every request. `agent/request` sits on the agent
+  // LOOP seam: business conversation steps only — the plugin's (and the
+  // official engine's) summarization calls never traverse it, so scoping the
+  // flag here would have stamped EVERY business call while reaching neither
+  // summarizer. The seam itself MUST still `await next()` (documented
+  // contract), hence this listener remains registered.
+  return config
 }
 
   // Before each model step, run a forced/threshold-triggered compaction as a

@@ -21,9 +21,11 @@ the opposite bet: **you own the weights, the endpoint, and the context budget.**
 - **Low context, high signal.** Rather than fight a small hard cap, the plugin **shrinks the
   conversation itself**, so the agent reasons over a tight, high-signal prompt while effectively
   reaching a much larger working memory.
-- **Thinking-off by default.** `disableThinking: true` turns off reasoning effort on **every**
-  outbound call, enforced at two complementary seams (real DeepSeek honors one; llama.cpp honors
-  the other — see "Backend-agnostic thinking control" below).
+- **Thinking-off for compactions, passthrough for everything else.** `disableThinking: true`
+  (default) turns off reasoning effort on **this plugin's own compaction summarization call**
+  only. All other model requests (business conversation, sub-agents, tool-driven, other
+  plugins) ride the machine's own configuration unchanged — the plugin no longer blanket-stamps
+  them (2026-08 semantics revision, see "Thinking control: scoped to compactions" below).
 - **Private & free.** No per-token billing, no egress, and the exact model/context tradeoff is
   yours to dial.
 
@@ -67,19 +69,49 @@ The builtin transaction bills `shadowedTokenCount` from the **same** `tokenMeter
 per-node prices the official engine uses, so the meter's collapse protocol settles the drop
 correctly — the bottom-right counter goes *down* after compaction instead of drifting upward.
 
-### Backend-agnostic thinking control
+### Thinking control: scoped to compactions
 
-`disableThinking` is enforced at **two complementary seams**:
+Since the 2026-08 semantics revision, `disableThinking` controls **one thing**: whether
+*this plugin's own compaction summarization call* carries `reasoningEffort:'off'`. Everything
+else is passed through untouched:
 
-1. **Request seam** — `reasoningEffort:'off'` → the DeepSeek adapter serializes
-   `thinking:{type:'disabled'}` (real DeepSeek APIs honor it).
-2. **Wire seam (`llm/stream`)** — the plugin appends top-level `reasoning_effort:"none"`
-   post-serialization, which llama.cpp's OpenAI-compatible layer parses natively
-   (`server-common.cpp` maps it to `enable_thinking=false`, independent of template capability).
-   Real DeepSeek endpoints simply ignore the unknown key.
+| Call site | Behavior with `disableThinking: true` |
+|---|---|
+| Plugin's builtin-engine summarization call (`engine/builtin.js` → `engine/summarizer.js` → `ctx.llm.stream`) | Carries `reasoningEffort:'off'` |
+| Every **other** model request — business conversation, sub-agent delegation, tool-driven calls, other plugins | Rides the machine's own `LlmCallConfig` **unchanged**; whatever `settings.yaml` / request header configured is honored |
+| Official `compaction` service summarization calls | Not routed through any plugin seam — unaffected either way |
 
-Result: thinking is genuinely off on **any** backend, with no target-sniffing heuristic to miss
-a route.
+The former `agent/request` blanket stamp (which hit **every** business call while paradoxically
+never reaching a single summarizer, because summarizers call `ctx.llm.stream` directly and
+bypass the agent-loop seam entirely) is gone. `src/hooks/wire-rewrite.js` retains only its
+LiveUI watermark role; it no longer attempts any wire manipulation at the `llm/stream`
+seam.
+
+However, when the summarizing call targets a **llama.cpp / OpenAI-compatible endpoint**
+(the `thinking: { type: 'disabled' }` field the adapter produces from
+`reasoningEffort:'off'` is silently ignored by llama.cpp's OAI parsing path), the
+summarizer ALSO stamps the llama.cpp-native top-level wire field
+`reasoning_effort: "none"` — gated on the exact same scoping rule as the
+camelCase `reasoningEffort` twin (only when `extra.reasoningEffort === 'off'`, i.e.
+when `settings.disableThinking` is on). One options object now carries BOTH wire
+fields simultaneously, covering both endpoint families:
+
+| Endpoint family | Reads | Result |
+|---|---|---|
+| Real DeepSeek API | `reasoningEffort:'off'` (camelCase) → serialized to `thinking:{type:'disabled'}` | Thinking disabled ✅ |
+| llama.cpp / OAI-compatible | `reasoning_effort:"none"` (snake_case top-level) → parsed natively | `enable_thinking=false` ✅ |
+
+Unknown top-level keys are tolerated-but-ignored by each endpoint family, so emitting
+both is harmless cross-family. The wire field is added in
+`src/engine/summarizer.js` (immediately before `llm.stream(options)` is called), NOT
+in the `llm/stream` waterfall listener — a historical draft attempted injection there
+but proved ineffective structurally (intermediate-layer waterfall returns are discarded;
+in-place seed mutation crashes the host). See the
+`src/hooks/wire-rewrite.js` module header for the full write-up.
+
+If you need thinking off on **business calls** too (not just compaction), configure
+your provider's own `reasoningEffort` at the request-header level — the plugin
+deliberately stays out of that decision.
 
 ### Live-UI status
 
@@ -99,7 +131,9 @@ Publishers are fail-safe: a messenger glitch can never disturb the actual compac
 
 ```
 agent/request(payload, next)              # every model request
-    disableThinking? -> { ...config, reasoningEffort: "off" }
+    return await next()                  # pure pass-through (2026-08 semantics
+                                         # revision: disableThinking scopes ONLY to
+                                         # the plugin's own compaction summarizer)
 
 agent/pre-step(payload, next)             # before each model step
     projectedTokens >= autoThresholdTokens?
@@ -121,7 +155,8 @@ Supporting modules:
 - `src/hooks/guard.js` — per-request guard: thinking-off + threshold gate + forced flag.
 - `src/hooks/command.js` — the `/force-compact` command.
 - `src/hooks/idle.js` — turn-end forced compaction.
-- `src/hooks/wire-rewrite.js` — the `llm/stream` wire patch appending `reasoning_effort:"none"`.
+- `src/hooks/wire-rewrite.js` — the `llm/stream` Live-UI watermark hook (no longer performs
+  wire manipulation; see module header for the historical note on why).
 - `src/engine/region.js` — head/tail-anchored region selection (with the official pairing ledger).
 - `src/engine/summarizer.js` — the one-shot LLM summarizer (fully aligned with official
   `compaction-basic`: target resolution, prefix-cache alignment, `purpose:'compaction'` tag,
@@ -173,7 +208,7 @@ builtin compaction OK — replaced span seq[A..B] (N nodes, ~K tokens) with a P-
 
 | key | type | default | meaning |
 |-----|------|---------|---------|
-| `disableThinking` | boolean | `true` | Disable reasoning effort on **every** outbound call (both seams above). |
+| `disableThinking` | boolean | `true` | When `true`, **only** the plugin's own compaction summarization call carries `reasoningEffort:'off'`. All other model requests ride the machine's config unchanged (2026-08 semantics revision — see "Thinking control: scoped to compactions" above). |
 | `autoThresholdTokens` | number ≥ 32000 | `32000` | Projected-token trigger for the per-request gate. Lower ⇒ more aggressive. **Floor 32000** (stored values clamp back up at read time). |
 | `retainLatestTokens` | positive int ≥ 8000 | `8000` | Retain the latest N tokens verbatim; send everything older to the summarizer in one batch. **Floor 8000.** Drives both the auto gate and the `/force-compact` path. |
 | `turnEndForceCompactionEnabled` | boolean | `true` | Compact on the agent's `idle` transition. |

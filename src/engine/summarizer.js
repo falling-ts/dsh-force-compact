@@ -242,6 +242,35 @@ async function __summarizeBody(ctx, config, agent, input, signal, extra) {
   // purpose-specific generation policy). The agent's free-form purpose string
   // is NOT a valid `GenerateOptions.purpose` value.
   options.purpose = 'compaction'
+  // LLAMA.CPP COMPATIBILITY WIRE FIELD (2026-08 addition): when the caller
+  // requested "thinking off" for this compaction (extra.reasoningEffort === 'off',
+  // which `engine/builtin.js` sets whenever `settings.disableThinking` is true),
+  // ALSO emit the OPENAI-COMPATIBLE top-level wire field
+  // `reasoning_effort: 'none'` alongside the camelCase `reasoningEffort`
+  // (line 225 above). The DeepSeek adapter's wire mapping translates the
+  // camelCase into `thinking: { type: 'disabled' }`, which the real DeepSeek
+  // API honors but llama.cpp's OAI parsing path (tools/server/server-common.
+  // cpp) ignores (top-level `thinking` is not in its schema — it is forwarded
+  // opaquely into `llama_params` and silently dropped). llama.cpp DOES natively
+  // parse a TOP-LEVEL `reasoning_effort: "none"` keyword into
+  // `inputs.enable_thinking = false` UNCONDITIONALLY (server-common.cpp:1295-
+  // 1304), independent of jinja-template capability. By emitting BOTH fields
+  // on the same options object we cover both endpoints simultaneously:
+  //   - Real DeepSeek endpoint: reads `reasoningEffort` → emits
+  //     `thinking: { type: 'disabled' }`; ignores the unknown
+  //     `reasoning_effort` top-level key (silent no-op, no 400).
+  //   - llama.cpp / OpenAI-compatible endpoint: reads the top-level
+  //     `reasoning_effort: "none"` → enables the native
+  //     `enable_thinking = false` path; the adapter's `thinking` field
+  //     (still present in the body) is tolerated-but-ignored there.
+  // Because `builtin.js` gates `extra.reasoningEffort` on
+  // `settings.disableThinking`, this compatibility field rides the EXACT
+  // same scoping rule as the primary one — only emitted on compaction calls
+  // where the user has turned thinking OFF; business-conversation and other
+  // LLM calls never reach this code path and are unaffected.
+  if (extra !== undefined && extra.reasoningEffort === 'off') {
+    options.reasoning_effort = 'none'
+  }
 
   // Assemble ALL chunk kinds (text + reasoning + images). Reasoning deltas are
   // dropped later by `extractTextOnly`; a terminal finish decides whether the

@@ -1,117 +1,127 @@
 /**
- * dsh-force-compact's wire-layer second safety net for disabling thinking —
- * appends the OPENAI-COMPATIBLE wire field `reasoning_effort: "none"` to
- * EVERY outgoing LLM call whenever the `disableThinking` setting is on.
+ * dsh-force-compact's Live-UI watermark side-channel on the `llm/stream`
+ * waterfall seam — KICKS OFF a fresh random "working" one-liner on every LLM
+ * call START so the Live UI (browser) repaints the `TurnStatus` node with a
+ * new `liveUi.working` pair. Purely a PRESENTATION-LAYER concern (a settings-
+ * write on the `liveUi` field, mirrored live to the browser via the existing
+ * settings-sync channel). Performs NO wire modification whatsoever.
  *
- * The dual-layer insurance rationale
- * ---------------------------------
- * The `disableThinking` setting is ALSO honored upstream at the request-seam:
- * the `agent/request` waterfall sets `LlmCallConfig.reasoningEffort = 'off'`,
- * which the DeepSeek adapter serializes to the wire field
- * `thinking: { type: 'disabled' }`. That is the RIGHT field for the real
- * DeepSeek API. But when the SAME wire shape lands on a llama.cpp
- * OpenAI-compatible endpoint (:8080, `Qwen3.8-27B-NVFP4-MTP-LOW.gguf`), the
- * top-level `thinking` key is NOT in the llama.cpp request schema — it is
- * forwarded opaquely into `llama_params` and IGNORED
- * (verified against `D:\AI\llama.cpp\tools\server`: `thinking` appears
- * nowhere in `server-schema.cpp`, and the OAI parsing path never reads a
- * top-level `thinking` key). Net effect of the request-seam path ALONE:
- * `disableThinking:true` SILENTLY FAILS to turn off thinking on llama.cpp —
- * the model thinks anyway, with no error surfacing.
+ * Why NOT at the `llm/stream` seam for wire-fields (historical note, 2026-08)
+ * ----------------------------------------------------------------------------
+ * An EARLIER draft of this module attempted to APPEND the llama.cpp-native
+ * wire field `reasoning_effort: "none"` to outgoing LLM calls at this same
+ * `llm/stream` seam. That approach is PROVABLY INEFFECTIVE HERE for two
+ * independent structural reasons (both verified empirically against the
+ * harness dispatch code and Cordis waterfall semantics):
  *
- * The llama.cpp-native (and OpenAI-generic) spelling for "disable reasoning"
- * is a TOP-LEVEL wire field `reasoning_effort: "none"`
- * (`server-common.cpp:1295-1304`), which the OAI parser special-cases into
- * `inputs.enable_thinking = false` UNCONDITIONALLY — independent of jinja
- * template capability. A weaker alternative,
- * `chat_template_kwargs: { enable_thinking: false }`
- * (`server-common.cpp:1286-1291`), depends on the template honoring the
- * `enable_thinking` placeholder; `reasoning_effort:"none"` is more robust.
+ *   1. WATERFALL IS A LINEAR CHAIN THAT DISCARDS INTERMEDIATE RETURNS.
+ *      `ctx.waterfall(...)` (vendor/cordis/src/events.ts:234-243) walks its
+ *      listener array sequentially, always passing the SAME frozen seed
+ *      `args` to each successive layer, and returns the OUTERMOST layer's
+ *      value as the final stream. Intermediate layers' return values are
+ *      DROPPED — they influence nothing downstream. Our plugin registers
+ *      LAST (lazy-install, default `push` order), so our return reaches
+ *      nobody; the innermost thunk receives the ORIGINAL seed reference
+ *      regardless of what we return.
  *
- * Current state: NEUTERED to a pure passthrough
+ *   2. IN-PLACE ASSIGNMENT TO THE FROZEN SEED CRASHES. The seed is a deep-
+ *      frozen (non-extensible) `GenerateOptions`; `seed.reasoning_effort =
+ *      'none'` throws `Cannot add property …, object is not extensible` at
+ *      the instant a real LLM call fires, propagating OUT OF the listener
+ *      into the host process and taking the entire `dsh web` instance down.
+ *
+ * Net effect: any injection-at-the-waterfall design either CRASHES (wall 1)
+ * or SILENTLY NO-OPS (wall 2). Both were observed in live testing on a
+ * running 3180 dev instance; that is the documented reason the module was
+ * reduced to a pure passthrough.
+ *
+ * Where the wire-append ACTUALLY lives now (since 2026-08)
+ * ----------------------------------------------------------------------
+ * The correct single-line fix landed in `src/engine/summarizer.js` IMMEDIATELY
+ * BEFORE the `llm.stream(options)` call (search for the comment block titled
+ * "LLAMA.CPP COMPATIBILITY WIRE FIELD"): when `extra.reasoningEffort === 'off'`
+ * (which `engine/builtin.js` stamps whenever `settings.disableThinking` is
+ * true), the summarizer sets `options.reasoning_effort = 'none'` ALONGSIDE the
+ * existing camelCase `options.reasoningEffort = 'off'` field (which the
+ * DeepSeek adapter serializes to `thinking:{type:'disabled'}`). Emitting BOTH
+ * fields covers BOTH endpoints simultaneously:
+ *
+ *   • Real DeepSeek endpoint: reads `reasoningEffort` → emits
+ *     `thinking: { type: 'disabled' }`; ignores the unknown snake_case
+ *     `reasoning_effort` top-level key (silent no-op, no 400).
+ *   • llama.cpp / OpenAI-compatible endpoint: reads the top-level
+ *     `reasoning_effort: "none"` → parses natively into
+ *     `inputs.enable_thinking = false` UNCONDITIONALLY
+ *     (`D:\AI\llama.cpp\tools\server\server-common.cpp:1295-1304`); the
+ *     adapter's `thinking` field (still present in the body) is tolerated-
+ *     but-ignored there.
+ *
+ * Because `builtin.js` gates `extra.reasoningEffort` on
+ * `settings.disableThinking`, the wire-field rides the EXACT same scoping
+ * rule as the primary one: only emitted on COMPRACTION calls where the user
+ * has turned thinking OFF. Business-conversation requests and every other LLM
+ * call never reach `summarize()` at all, so they are UNAFFECTED.
+ *
+ * What THIS FILE STILL DOES (Live-UI watermark)
  * ---------------------------------------------
- * The original intent was "Layer 2" — append a SECOND wire field
- * `reasoning_effort: "none"` at the `llm/stream` seam on top of the
- * adapter's `thinking:{type:'disabled'}` (Layer 1) so that a llama.cpp /
- * OpenAI-compatible endpoint (which ignores the top-level `thinking` key)
- * would ALSO receive a field it honors. Live testing PROVED that this cannot
- * be achieved at the `llm/stream` waterfall seam without modifying vendor
- * code, because of two hard walls discovered empirically:
+ * Independent of the wire question above, the listener KICKS OFF a fire-
+ * and-forget `publishRandomWorking(ctx)` call BEFORE the synchronization
+ * point so the Live UI paints a fresh random "working" one-liner on every LLM
+ * call start. This is purely a presentation-layer concern (a settings-write
+ * on the `liveUi` field, mirrored live to the browser so it can repaint the
+ * `TurnStatus` node) and MUST NOT BLOCK the return path. `publishRandomWorking`
+ * swallows ALL of its own rejections internally, so the fire-and-forget form
+ * leaks no unhandled rejection and never disturbs the stream.
  *
- *   1. FROZEN SEED. The waterfall passes EVERY listener the SAME deep-frozen
- *      `GenerateOptions` seed (`payload`; `ctx.waterfall` re-invokes inner
- *      layers with the identical args — see `vendor/cordis/src/events.ts#
- *      waterfall`). In-place assignment `options.reasoning_effort = …` throws
- *      `Cannot add property …, object is not extensible` at the exact moment
- *      a real LLM call fires, which PROPAGATES OUT OF the listener and TAKES
- *      DOWN THE ENTIRE `dsh web` PROCESS.
- *   2. GENERATOR BINDS THE SEED. The base `adapterStream` is an AsyncGenerator
- *      that BOUND the seed object at construction; building a fresh mutable
- *      clone and returning it (or re-dispatching `this.stream(clone)`) never
- *      reaches the serializer, and re-dispatch additionally fails because the
- *      listener's `this` is not reliably the LlmRuntime here (`Cannot read
- *      properties of undefined (reading 'stream')`).
- *
- * Therefore injecting a NEW top-level wire field at this seam requires either
- * a vendor change (out of scope) or a dedicated `registerAdapter` for
- * llama.cpp (would collide with / be shadowed by the existing DeepSeek-route
- * adapter). Rather than ship a hook that either silently no-ops or CRASHES the
- * host, this file is deliberately reduced to a GUARANTEED pure passthrough:
- * it forwards `next()`'s result (the real stream) untouched and performs NO
- * mutation — incapable of breaking any business-path model call.
- *
- * The AUTHORITATIVE disable-thinking mechanism remains Layer 1 (unchanged):
- * the `agent/request` waterfall sets `reasoningEffort:'off'`, which the
- * DeepSeek adapter serializes to the native `thinking:{type:'disabled'}` —
- * honored by the real DeepSeek API. On a llama.cpp / OpenAI-compatible
- * endpoint that top-level field is tolerated-but-ignored, so thinking stays
- * on there — IDENTICAL to having no plugin at all (a documented limitation,
- * never a crash). Restoring the wire-append requires a future dedicated
- * llama.cpp adapter or a vendor-supported options-extension seam.
+ * Contract guarantees
+ * --------------------
+ *   • ALWAYS calls `next()` (skipping it would stall the waterfall chain).
+ *   • NEVER mutates the (deep-frozen) seed, so it cannot raise
+ *     `object is not extensible`.
+ *   • NEVER reshapes / spreads the (stream) return value, so it cannot break
+ *     the consumer's `for await`.
+ *   • Is DECLARED NON-ASYNC: an `async` listener would wrap `next()`'s stream
+ *     return in a Promise, and the waterfall dispatcher's downstream
+ *     `yield* <promise>` would throw
+ *     `yield* (intermediate value)… is not async iterable` on every call.
  *
  * @module @falling-ts/dsh-force-compact/wire-rewrite
  */
 
 /**
- * Register the `llm/stream` Waterfall listener. As of the neutering described
- * in the module header, the listener is a DELIBERATE pure passthrough: it
- * forwards `next()`'s result (the async-iterable chunk stream) untouched and
- * performs NO mutation. See the module header for why the intended
- * `reasoning_effort:"none"` wire-append is NOT possible at this seam without a
- * vendor change or a dedicated llama.cpp adapter.
+ * Register the `llm/stream` Waterfall listener. As of the historical-note
+ * section above, the listener is a DELIBERATE pure passthrough w.r.t. WIRE
+ * SEMANTICS: it forwards `next()`'s result (the async-iterable chunk stream)
+ * untouched and performs NO mutation. Its sole remaining duty is the Live-UI
+ * watermark side-channel (see the module header). See
+ * `src/engine/summarizer.js` for where the actual `reasoning_effort` wire
+ * field is now injected (at the options-construction site, NOT at this
+ * waterfall seam).
  *
  * Idempotent within one plugin lifetime (a process-local latch prevents
  * double-registration across multiple `apply` invocations in tests or HMR).
  *
  * Contract guarantees:
- * Contract guarantees:
  *   • ALWAYS calls `next()` (skipping it would stall the waterfall chain).
  *   • NEVER mutates the (deep-frozen) seed, so it cannot raise
  *     `object is not extensible`.
- *   • NEVER reshapes/spreads the (stream) return value, so it cannot break the
- *     consumer's `for await`.
- *   • Emits at most ONE debug line (the first-of-lifetime ui-signal marker;
- *     silent thereafter).
+ *   • NEVER reshapes / spreads the (stream) return value, so it cannot break
+ *     the consumer's `for await`.
  *   • FIRES THE LIVE UI STATUS SIDE-CHANNEL (`core/ui-signal.js`) on every
  *     invocation — the "each LLM call start = fresh random working pair"
- *     watermark. Publication is KICKED OFF FIRE-AND-FORGET (a plain
- *     non-awaited `publishRandomWorking(ctx)` call placed BEFORE the
- *     synchronous `return next()`) so the listener itself STAYS SYNC and can
- *     directly hand back the real stream; `publishRandomWorking` swallows all
- *     of its own rejections internally, so the fire-and-forget form leaks no
- *     unhandled rejection. It never touches `payload` (the deep-frozen seed —
- *     untouched per the two-hard-walls note above), so it can never stall or
- *     corrupt the stream.
- *   • The listener is DECLARED NON-ASYNC: an `async` listener would wrap
- *     `next()`'s stream return in a Promise, and the waterfall dispatcher's
- *     downstream `yield* <promise>` would throw
- *     `yield* (intermediate value)… is not async iterable` on every call.
+ *     watermark. Publication is KICKED OFF FIRE-AND-FORGET (a plain non-
+ *     awaited `publishRandomWorking(ctx)` call placed BEFORE the synchronous
+ *     `return next()`) so the listener itself STAYS SYNC and can directly hand
+ *     back the real stream; `publishRandomWorking` swallows all of its own
+ *     rejections internally, so the fire-and-forget form leaks no unhandled
+ *     rejection. It never touches `payload` (the deep-frozen seed — left
+ *     untouched per the historical-note section above), so it can never stall
+ *     or corrupt the stream.
  *
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @returns {boolean} whether this call actually performed the (once-only)
- *   registration. `false` indicates it was a no-op re-entry (already
- *   installed) or a registration failure (not installed; a later re-entry
- *   will retry).
+ *   registration. `false` indicates it was a no-op re-entry (already installed)
+ *   or a registration failure (not installed; a later re-entry will retry).
  */
 
 import { publishRandomWorking } from '../core/ui-signal.js'
@@ -131,10 +141,10 @@ export function registerLlmStreamHook(ctx) {
     // internally (guaranteed side-effect-free w.r.t. the waterfall), so
     // kicking it off without awaiting cannot leak an unhandled rejection.
     // `payload` is the deep-frozen GenerateOptions seed — NEVER mutated (see
-    // the two-hard-walls note in the module header); the publication touches
-    // none of that (pure settings-write on the `liveUi` field, mirrored live
-    // to the browser so it can repaint the `TurnStatus` node). `void payload`
-    // documents the deliberate non-use.
+    // the historical-note section in the module header); the publication
+    // touches none of that (pure settings-write on the `liveUi` field,
+    // mirrored live to the browser so it can repaint the `TurnStatus` node).
+    // `void payload` documents the deliberate non-use.
     ctx.on('llm/stream', (payload, next) => {
       void payload
       publishRandomWorking(ctx)   // fire-and-forget: sync kick-off, async settle
@@ -142,10 +152,8 @@ export function registerLlmStreamHook(ctx) {
     })
     installed = true
     return true
-  } catch {
-    // Registration failure (rare: e.g. a context without a usable `on`) is
-    // fatal to NOTHING — the plugin simply never installs this hook. We DO
-    // NOT mark `installed`, so a later re-entry retries.
+  } catch (err) {
+    ctx.logger?.warn('[force-compact] wire-rewrite install failed:', err?.message ?? err)
     return false
   }
 }

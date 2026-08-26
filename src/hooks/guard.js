@@ -7,10 +7,11 @@
  * before a model request is made**:
  *
  * - **`agent/request`** (a Waterfall around the frozen call configuration) —
- *   when the `disableThinking` setting is on, the returned `LlmCallConfig`
- *   carries `reasoningEffort: 'off'`, which the LLM adapter maps to
- *   `thinking: { type: 'disabled' }`. Every model request in this process is
- *   therefore sent with thinking/reasoning disabled.
+ *   a deliberate **pass-through** (2026-08 semantics revision): the returned
+ *   `LlmCallConfig` rides UNCHANGED. `disableThinking` now scopes strictly to
+ *   this plugin's own compaction summarization call (enforced inside
+ *   `engine/builtin.js` → `engine/summarizer.js`); all other model requests
+ *   retain the machine's own reasoning-effort configuration.
  * - **`agent/pre-step`** (a Waterfall before each model step) — reads the
  *   session's **projected context tokens** through the official
  *   `contextPressure` projection (`projectedTokens` — the exact figure the
@@ -640,11 +641,21 @@ async function __forceCompactIfNeededBody(ctx, agent, signal, mode) {
 }
 
 /**
- * Whether a model request should be sent with thinking/reasoning disabled.
+ * Whether a model request SHOULD be sent with thinking/reasoning disabled.
  *
- * Called from the `agent/request` Waterfall. When the `disableThinking`
- * setting is on (default), the caller sets `reasoningEffort: 'off'` on the
- * returned `LlmCallConfig`.
+ * LEGACY PREDICATE (2026-08 semantics revision): the active `agent/request`
+ * hot path no longer calls this helper. `disableThinking` now scopes STRICTLY
+ * to THIS PLUGIN'S OWN compaction summarization call — enforced inside
+ * `src/engine/builtin.js` (which sources `extra.reasoningEffort` from
+ * `settings.disableThinking` and passes it to `src/engine/summarizer.js`,
+ * whose `options.reasoningEffort` stamps the `ctx.llm.stream` request). All
+ * OTHER model requests (business conversation, sub-agents, tool-driven,
+ * other plugins) ride the machine's config UNCHANGED.
+ *
+ * Kept exported so a FUTURE caller who genuinely wants the blanket
+ * "off-everywhere" semantics (or the legacy dual-layer insurance described
+ * in the stale docs) can consume the same setting through the same
+ * containment envelope without duplicating the read-settings logic.
  *
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @returns {Promise<boolean>}

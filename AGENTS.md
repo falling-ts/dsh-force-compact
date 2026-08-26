@@ -272,6 +272,40 @@ DeepSeek 适配器（无独立的 llama.cpp 适配器包），再起一份 adapt
 | **`<compacted-summary>` 标签** | 指令尾部明确要求：若输入已含 `<compacted-summary>` 块（前次 checkpoint），不得逐字复制，须保留仍然成立的、丢弃过期信息、并入更新的信息。防二次压缩整段拷贝旧摘要导致雪球膨胀。 |
 | **向后兼容** | `summarize(ctx, config, agent, messagesOrInput, signal, extra)` 第 4 参既可传裸 `messages` 数组（旧形态，自动包装为 `{messages}`），也可传 `{messages, system?, tools?}`（新形态）。现有调用方零修改即可享受新能力；`builtin.js` 已切到新形态并喂入 `headerPrefix()` 提取的前缀。 |
 
+### `disableThinking` 语义收窄（2026-08 修订）：只关压缩，业务放行
+
+**需求**："压缩按照是否关闭思考的配置来。其它不是压缩的请求，默认放行"。
+
+**改动**：`disableThinking`（默认 `true`）的作用域从"所有出站模型请求"收窄到
+"**本插件自己发出的压缩摘要调用**"：
+
+| 路径 | 改动前 | 改动后 |
+|------|--------|--------|
+| `agent/request`（业务对话 / 子代理 / 工具触发的每次模型请求） | 统一盖 `reasoningEffort:'off'` | **纯透传**——机器本来的 `LlmCallConfig` 原样放行 |
+| 本插件内置引擎的压缩摘要调用（`builtin.js` → `summarizer.js` 的 `ctx.llm.stream`） | `reasoningEffort:'off'`（经 `extra` 传入） | **保持不变**——`disableThinking=true` 时摘要调用携带 `'off'`；`=false` 时不附加、沿用机器默认 |
+| 官方 `compaction` 服务的摘要调用 | 不经过本插件的两条缝（直连 `ctx.llm.stream`），不受影响 | 同左 |
+
+**为什么这样改**：`agent/request` 缝在 **agent-loop** 内部
+（`packages/core/agent-loop/src/agent.ts:457`），只对**业务对话步骤**触发；
+插件与官方引擎的摘要调用都直连 `ctx.llm.stream`，**根本不经过这条缝**。所以
+旧实现的实际效果是"业务对话全被打成 `'off'`，而摘要调用反而是从另一处
+（`builtin.js:729`）拿的 `'off'`"——方向正好和需求相反。新实现删掉了
+`index.js` 里 `__agentRequestListenerBody` 的全局盖章逻辑（改为 `await next()`
+后原样返回），`agent/request` 监听器本身**保留**（Waterfall 必须 `next()`，
+且懒安装的 debug-sink / settings-namespace / command / wire-rewrite 钩子搭着
+它的激活时机安装）；`src/hooks/guard.js` 的 `thinkingDisabled` 助手降为
+**legacy predicate**（不再被热路径调用，但仍导出供将来需要 blanket-off
+语义的消费方复用）。
+
+**文档滞后警示**：下方"Wire 层补丁"章节描述的"双层保险"（layer 1 =
+`agent/request` 盖 `'off'`）是**改动前的行为**——layer 1 已停用；layer 2
+（`src/hooks/wire-rewrite.js` 的 `llm/stream` 透传）目前也仅是 LiveUI 水印
+钩子，不再做 wire 追加。真实有效的思考关闭只剩 `builtin.js → summarizer.js`
+一条线；对 llama.cpp/OpenAI 兼容端点的"压缩调用关闭思考"是否真的落到 wire
+字段，取决于所经 adapter 的序列化（见下方 wire 层章节的局限说明）。
+
+---
+
 ## 如何判断插件是否加载成功
 
 插件加载成功的**客观判据**是它会在日志文件 `~/.dsh/logs/dsh-force-compact.log`
@@ -309,7 +343,7 @@ DeepSeek 适配器（无独立的 llama.cpp 适配器包），再起一份 adapt
   - **内置引擎**——`src/engine/builtin.js` 自实现的完整压缩事务，只依赖 `ctx.sessions.append`、`ctx.llm.stream`、`ctx.tokenMeter.estimateMessage`（全部经 `ctx.get` 读取、可缺省、对 `undefined` 做守卫）。它追加**官方命名的 `compaction/*` 事件**（`compaction/start`、`compaction/summary`、`compaction/end`）与 `user/message`(replace)——**复用**官方词汇而非私造 `fc-compact/*`，因为官方类型天生在 `KNOWN_SESSION_EVENT_TYPES` 编目内，重载无需 `ignorable` 标记即可跨 build 持久（详见上文"为什么内置引擎改用官方 `compaction/*` 词汇"一节）。代价是须满足官方全局 `compaction/invariant` 监听器的全部不变量（共享 `compactionId`、owner/turn 一致、`shadowedSeqs` 对齐 `shadowedRange`、`provider`/`model` 必填、无错 `end` 需紧跟 `summary`）。两引擎并存时优先级：官方可达即用官方；官方不可达才落到内置（`builtinEnabled !== false` 且 `agent.session` / `llm.service/stream` 可用）。
 - `agents`、`settings`、`tokenMeter`、`commands`、`llm` 都是可选依赖（`ctx.get(...)`，对 `undefined` 做守卫）：`agents` 仅供 `session/flush` 路径（缺少 Agent 是记录日志后跳过）；缺少 `settings` 时所有参数回退到默认值；缺少 `tokenMeter` 时阈值门禁回退到粗略字符估算；缺少 `commands` 时 `/force-compact` 命令不注册（`src/hooks/command.js` 是 no-op）；缺少 `llm` 时内置引擎不可用（官方引擎不受影响）。
 - **钩住核心模型请求（`agent/request` / `agent/pre-step`）：** 插件的核心行为是钩住官方模型请求缝，**每次请求模型前**读取设置：
-  - **`agent/request`**（围绕冻结调用配置的 Waterfall）——`disableThinking` 为 `true` 时，返回的 `LlmCallConfig` 携带 `reasoningEffort: 'off'`（适配器映射为 `thinking: { type: 'disabled' }`），即**每次模型请求**都关闭思考。监听器 `await next()` 取得机器本会使用的配置，再返回替换值；**不得**在缺少 `next()` 时短路（必须调用 `next()`）。
+  - **`agent/request`**（围绕冻结调用配置的 Waterfall）——**纯透传**（2026-08 语义收窄，见上文"disableThinking 语义收窄"节）：监听器 `await next()` 取得机器本会使用的配置后**原样返回**，业务请求沿用机器默认的思考强度；`disableThinking` 只作用于本插件自己的压缩摘要调用。监听器**不得**在缺少 `next()` 时短路（必须调用 `next()`）。
   - **`agent/pre-step`**（每个模型步骤前的 Waterfall）——通过 `tokenMeter.measure(session).totalTokens` 读取会话上下文总 tokens；当其**≥ `autoThresholdTokens`** 时，返回 `{ kind: 'reject' }` **不发起模型请求**，并按 `retainLatestTokens` 语义选区：**从会话最新条目起按官方 `tokenMeter` 逐节点反向累加 token，直到 ≥ `retainLatestTokens` 停止**；截点之前的**所有条目一次性**通过 `compactRegion` 发往大模型做摘要（原条目被遮蔽/跳过），保留段逐字不变；低于阈值时调用 `next()` 让请求继续。强制压缩失败（无安全区间 / 已活跃）时降级为 `next()`，绝不阻塞请求。
   - 两个参数都**每次请求**通过同步 `settings.get('falling-ts-force-compact')` 读取，因此 `settings.yaml` 的改动在下一次请求即生效。
 - **`/force-compact` 斜杠命令（`commands` 服务，可选依赖）：** 通过 `/` 选择执行，其 handler **不发送模型请求**。Agent **空闲**时经 `compactNow`（owner `null`，空闲手动入口）立即压缩（引擎自身区间选择）；**繁忙**时 `compactNow` 被拒绝，handler 排队一个强制标记（`src/hooks/command.js`）。handler 逻辑：
@@ -317,7 +351,7 @@ DeepSeek 适配器（无独立的 llama.cpp 适配器包），再起一份 adapt
   - 若 `compactNow` 抛出（Agent 繁忙 / 无安全区间），调用 `queueForceCompact(session.id)` **插入一个 JS 内存标记**（process-local `Map`，无持久态、无 timer），返回 "将在下一个模型步骤强制压缩"。
   - 该标记由 `agent/pre-step` 钩子（`takeForceCompact`）在**下一个模型步骤**读取并**立即消费**：读到强制标记则**跳过 token 阈值门禁**、按 `retainLatestTokens` 语义选区（同上，保留最新 N tokens、头段一次性压缩）并经 `compactRegion` 执行，并返回 `{ kind: 'reject' }` **不再请求模型**——即"再请求钩子中如果读取到强制命令, 立马执行压缩, 不再请求模型"。
 - **强制压缩配置（`falling-ts-force-compact` 设置命名空间）：** 当 `settings` 服务挂载时，`apply` 注册 `falling-ts-force-compact` 命名空间（`src/core/settings.js`；`falling-ts-` 前缀防止与其他插件的配置键冲突），九个参数可从 `$DSH_HOME/settings.yaml` 配置（详见上文配置项表格）：
-  - `disableThinking`（`boolean`，默认 `true`）——为 `true` 时**每次模型请求**（以及插件自己的摘要调用）携带 `reasoningEffort: 'off'`（适配器映射为 `thinking: { type: 'disabled' }`），即关闭思考。
+  - `disableThinking`（`boolean`，默认 `true`）——**语义收窄后**（2026-08 修订）：只控制**本插件内置引擎的压缩摘要调用**是否携带 `reasoningEffort:'off'`（适配器映射为 `thinking: { type: 'disabled' }`）。**其它模型请求**（业务对话、子代理、工具触发、其它插件）一律沿用机器默认，不受此开关影响。
   - `autoThresholdTokens`（`number`，默认 `32000`，下限 `32000`）——强制压缩触发阈值；`agent/pre-step` 仅在会话总上下文 tokens ≥ 该值时强制压缩，低于则跳过。低于下限的值读取时自动抬升到 32000。
   - `retainLatestTokens`（positive int，默认 `8000`，下限 `8000`）——**保留最新的绝对 token 数**：`agent/pre-step` 阈值门禁或 `/force-compact` 强制标记触发时，从会话**最新条目**起按官方 `tokenMeter` 逐节点**反向**累加 token，直到运行和 ≥ 该值**停止**；截点之前的**所有条目一次性**通过 `compactRegion` 发往大模型做摘要（原条目被遮蔽/跳过），保留段逐字不变。低于下限的值读取时自动抬升到 8000。**该参数同时服务于自动路径与 `/force-compact` 命令路径**（后者在空闲时仍经 `compactNow` 用引擎自身区间选择，不经此参数）。
   - `turnEndForceCompactionEnabled`（`boolean`，默认 `true`）——**是否开启一轮结束强制压缩**：为 `true` 时，agent 转入 `idle`（所有轮次结束，含子代理，下一次人为对话之前）时经 `compactNow`（引擎自身区间选择）强制执行一轮结束压缩。
@@ -335,7 +369,7 @@ DeepSeek 适配器（无独立的 llama.cpp 适配器包），再起一份 adapt
   - `backend.js` —— 统一后端 facade：官方 `compaction` 服务优先、内置引擎后备（`resolveCompaction`，两条路径形状一致）。
   - `checkpoint.js` —— 检查点编排器：选区间 → 投影区间消息 → 运行预览 + 收缩门禁 → 把持久变更委托给 compaction 服务的 `compactRegion(start, end, agent, signal)`（经 `ctx.get('compaction')` 实时读取；不可用时跳过检查点）。
   - `src/hooks/` —— Cordis 触发钩子：
-    - `guard.js` —— 每次请求的门禁：`agent/request` 关闭思考（`reasoningEffort: 'off'`）+ `agent/pre-step` 阈值门禁（按 `retainLatestTokens` 保留最新 tokens、头段一次性压缩）+ `/force-compact` 的 process-local 强制标记（`queueForceCompact` / `takeForceCompact`）。
+    - `guard.js` —— 每次请求的门禁：`agent/request` 纯透传（2026-08 语义收窄后不再盖 `reasoningEffort`；`thinkingDisabled` 助手保留为 legacy predicate 但不再被热路径调用）+ `agent/pre-step` 阈值门禁（按 `retainLatestTokens` 保留最新 tokens、头段一次性压缩）+ `/force-compact` 的 process-local 强制标记（`queueForceCompact` / `takeForceCompact`）。
     - `command.js` —— `/force-compact` 斜杠命令（`commands` 服务，可选依赖）：空闲时经 `compactNow` 压缩；繁忙时插入 JS 内存标记。
     - `idle.js` —— 一轮结束强制压缩：`agent/status` 上的 `idle` 监听器，经 `compactNow`（引擎自身区间选择）压缩。
 - 每条引擎内部都会做**预提交预览 + 收缩门禁**（各自的 LLM 摘要 + 收缩判定），所以本插件不在持久路径上重复摘要。`engine/checkpoint.js` 本身只做"选区间 + 委派"，不再额外跑一次预览——这是上一版的遗留 bug（曾在此处双重摘要，现已被清理）。

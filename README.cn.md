@@ -19,8 +19,9 @@
   (GGUF / NVFP4 / MTP 变体均可走标准 DeepSeek 适配器路径,**无需单独的 llama.cpp 适配器**)。
 - **低上下文、高信号。** 不与小硬上限较劲,而是**直接收缩会话本身**——agent 永远在紧凑、
   高信号的小 prompt 上推理,却等效获得更大的工作记忆。
-- **默认关闭思考。** `disableThinking: true` 对**每一次出站调用**(业务请求 + 插件自己的摘要
-  调用)都关闭模型的内部推理努力,并在两个互补缝上双重保障(见下文「后端无关的思考控制」)。
+- **压缩关闭思考,业务放行。** `disableThinking: true`(**默认**)只对**本插件自己发出的压缩
+  摘要调用**关闭推理努力;**其它**模型请求(业务对话、子代理、工具触发、其它插件)一律沿用
+  机器自身配置,不再被插件批量盖章(2026-08 语义收窄,见下文「思考控制:仅作用于压缩」)。
 - **私有且免费。** 无按 token 计费、无数据外泄,模型与上下文的取舍完全由你调。
 
 ---
@@ -59,17 +60,43 @@
 内置事务的 `shadowedTokenCount` 取自**与官方相同的** `tokenMeter.measure` 逐节点单价,使米表
 的折叠协议正确结算下降——压缩后右下角计数是**下降**而非漂移上涨。
 
-### 后端无关的思考控制
+### 思考控制:仅作用于压缩
 
-`disableThinking` 在**两个互补的缝**上强制执行:
+2026-08 语义收窄后,`disableThinking` **只控制一件事**:本插件自己的压缩摘要调用
+(`engine/builtin.js` → `engine/summarizer.js` → `ctx.llm.stream`)是否携带
+`reasoningEffort:'off'`。其它一切请求**原样放行**:
 
-1. **请求缝** —— `reasoningEffort:'off'` → DeepSeek 适配器序列化为
-   `thinking:{type:'disabled'}`(真 DeepSeek API 认这个字段)。
-2. **wire 缝(`llm/stream`)** —— 插件在序列化后追加顶层 `reasoning_effort:"none"`,llama.cpp
-   的 OpenAI 兼容层原生解析(`server-common.cpp` 映射到 `enable_thinking=false`,与模板能力
-   无关)。真 DeepSeek 端点忽略未知键。
+| 调用点 | `disableThinking: true` 时的行为 |
+|---|---|
+| 本插件内置引擎的压缩摘要调用 | 携带 `reasoningEffort:'off'` |
+| **其它**所有模型请求——业务对话、子代理委派、工具触发、其它插件 | 沿用机器自身的 `LlmCallConfig` **原样不变**,`settings.yaml` / 请求头配了什么就用什么 |
+| 官方 `compaction` 服务的摘要调用 | 不经过本插件的任何缝,不受影响 |
 
-结果:在任何后端(包括本地 llama.cpp)上都**确实关闭了思考**,不依赖目标嗅探启发式而漏判路由。
+旧的 `agent/request` 批量盖章(打击**所有**业务请求,却讽刺性地**摸不到**任何一个摘要调用
+——摘要器直连 `ctx.llm.stream`,根本不走 agent-loop 那条缝)已经移除。
+`src/hooks/wire-rewrite.js` 只保留 LiveUI 水印职责,**不再**在 `llm/stream` 缝上做任何 wire 操作。
+
+但是当摘要调用目标是 **llama.cpp / OpenAI 兼容端点**(适配器从 `reasoningEffort:'off'`
+产出的 `thinking: { type: 'disabled' }` 字段会被 llama.cpp 的 OAI 解析路径**静默
+忽略**)时,摘要器**同时**盖上 llama.cpp 原生的顶层 wire 字段
+`reasoning_effort: "none"` —— 门控规则与 camelCase `reasoningEffort` 孪生字段
+**完全一致**(只在 `extra.reasoningEffort === 'off'` 时加盖,即
+`settings.disableThinking` 为真时)。一个 options 对象同时携带**两个** wire
+字段,同时覆盖两类端点:
+
+| 端点家族 | 读取的字段 | 结果 |
+|---|---|---|
+| 真·DeepSeek API | `reasoningEffort:'off'`(camelCase)→ 序列化为 `thinking:{type:'disabled'}` | 关闭思考 ✅ |
+| llama.cpp / OAI 兼容 | `reasoning_effort:"none"`(蛇形顶层)→ 原生解析 | `enable_thinking=false` ✅ |
+
+两类端点对未知的顶层键都是**容忍但不读**,所以同体发出两个字段跨家族无害。
+该 wire 字段在 `src/engine/summarizer.js` 的 `llm.stream(options)` 调用**之前**加盖,
+**不是**在 `llm/stream` waterfall 监听器里 —— 早期草案曾在该缝上尝试注入,实证证明
+结构性无效(waterfall 中间层返回值被丢弃;原地修改种子会炸宿主)。完整论述见
+`src/hooks/wire-rewrite.js` 模块头部。
+
+如需在**业务对话**上也关闭思考(不仅压缩),请在**请求头层面**自行配置
+provider 的 `reasoningEffort` —— 本插件已刻意退出这一决策。
 
 ### LiveUI 状态
 
@@ -91,7 +118,8 @@
 
 ```
 agent/request(payload, next)              # 每次模型请求
-    disableThinking? -> { ...config, reasoningEffort: "off" }
+    return await next()                  # 纯透传(2026-08 语义收窄:disableThinking
+                                         # 只作用于本插件自己的压缩摘要调用)
 
 agent/pre-step(payload, next)             # 每个模型步骤前
     projectedTokens >= autoThresholdTokens?
@@ -113,7 +141,8 @@ session/flush(session)                    # 持久化检查点
 - `src/hooks/guard.js` —— 每请求门禁:关思考 + 阈值门 + 强制标记。
 - `src/hooks/command.js` —— `/force-compact` 命令。
 - `src/hooks/idle.js` —— 回合结束强制压缩。
-- `src/hooks/wire-rewrite.js` —— `llm/stream` wire 补丁,追加 `reasoning_effort:"none"`。
+- `src/hooks/wire-rewrite.js` —— `llm/stream` 的 LiveUI 水印钩子(已不再做 wire 操作;
+  见模块头部历史注记了解原因)。
 - `src/engine/region.js` —— 头/尾锚定的选区(含官方工具配对账本)。
 - `src/engine/summarizer.js` —— 一次性 LLM 摘要器(与官方 `compaction-basic` 全面对齐:
   三级 target 解析、前缀缓存对齐、`purpose:'compaction'` 标签、fail-closed finish 分类、
@@ -165,7 +194,7 @@ builtin compaction OK — replaced span seq[A..B] (N nodes, ~K tokens) with a P-
 
 | 键 | 类型 | 默认 | 含义 |
 |----|------|------|------|
-| `disableThinking` | boolean | `true` | 每次出站调用关闭模型推理努力(上述两缝)。 |
+| `disableThinking` | boolean | `true` | 为 `true` 时**仅**本插件的压缩摘要调用携带 `reasoningEffort:'off'`;其它模型请求沿用机器配置原样放行(2026-08 语义收窄,见上文「思考控制:仅作用于压缩」)。 |
 | `autoThresholdTokens` | number ≥ 32000 | `32000` | 每请求门禁的投影 token 阈值。越低越激进、上下文越瘦。**下限 32000**(存储值读取时抬升)。 |
 | `retainLatestTokens` | 正整数 ≥ 8000 | `8000` | 逐字保留最新 N tokens;更早内容一次性发给摘要器。**下限 8000**。同时驱动自动门禁与 `/force-compact`。 |
 | `turnEndForceCompactionEnabled` | boolean | `true` | 在 agent `idle` 过渡时压缩。 |
