@@ -45,7 +45,8 @@
 - **回合结束 / idle(`agent/status` → `idle`)** —— agent 静止(含子代理全部结束)时,可选地
   经 `compactNow` 压缩(开关:`turnEndForceCompactionEnabled`)。
 - **手动 `/force-compact` 斜杠命令** —— 对忙/闲 agent 都能生效:空闲立即压缩;繁忙则排队一个
-  process-local 强制标记,在下一个模型步骤消费。
+  process-local 强制标记,在下一个模型步骤消费。**命令本身惰性加载**:直到第一次受守卫生命周期
+  事件(实践中即该会话的**第一次模型请求**)才完成注册,新会话在此之前看不到它(见「行为说明」)。
 - **`session/flush` 检查点** —— 等待型的持久化检查点。
 
 每条路径最终都汇入唯一的「**压缩结果落入会话**」边界——也正是**发送 liveUI 信令**的位置。
@@ -162,7 +163,7 @@ session/flush(session)                    # 持久化检查点
 
 - `src/hooks/guard.js` —— 每请求门禁:`agent/request` 纯透传(不再批量盖思考章)+ `pre-step`
   阈值门 + process-local 强制标记(`thinkingDisabled` 仅作 legacy predicate 保留,热路径不再调用)。
-- `src/hooks/command.js` —— `/force-compact` 命令。
+- `src/hooks/command.js` —— `/force-compact` 命令(惰性注册,见「行为说明」)。
 - `src/hooks/idle.js` —— 回合结束强制压缩。
 - `src/hooks/wire-rewrite.js` —— `llm/stream` 的 LiveUI 水印钩子(已不再做 wire 操作;
   见模块头部历史注记了解原因)。
@@ -259,6 +260,15 @@ falling-ts-force-compact:
   `ctx.get('compaction')` 实时读取;不可用时强制压缩路径放行、让请求继续。
 - **可选依赖:** `settings` / `tokenMeter` / `commands` / `llm` / `agents` 均经 `ctx.get(...)`
   读取并守卫;缺任一都优雅降级而非崩溃。
+- **`/force-compact` 命令惰性加载(需要先请求一次模型)。** `commands` 服务随 agent-presets
+  平面到达——**晚于**插件启动期的 `apply`——启动期注册必然落空。因此在**每个**受守卫生命周期
+  监听器(`agent/request` / `agent/pre-step` / `agent/status` / `session/flush`)顶部重试注册,
+  首次成功后闩锁永久闭合。实际效果:实例(重新)启动后,**全新会话的 `/` 命令列表在该会话
+  第一次模型请求之前不会出现 `/force-compact`**——先发任意一条消息,命令即进程级注册,
+  此后所有会话都可用。注册成功日志行
+  `[force-compact] /force-compact command registered (deferred)`;若 `commands` 服务始终
+  缺席,约 10 分钟后日志打出一条 `… still UNREGISTERED 10 min …` 警告解释空列表。注册
+  完成前插件其余功能照常——属于自愈式降级,并非安装失败。
 - **每请求读参数:** 参数每次模型请求读取,故改动下次请求即生效、无需重启。
 - **信号:** `agent/*` Waterfall 转发当前 turn 的 signal;`session/flush` 检查点与
   `agent/status` idle 监听器各自新建 `AbortController`。

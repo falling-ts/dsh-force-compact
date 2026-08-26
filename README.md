@@ -51,7 +51,9 @@ You never toggle — official wins when reachable, builtin takes over otherwise.
 - **Turn-end / idle (`agent/status` → `idle`)** — when the agent quiesces, optionally compacts
   via `compactNow` (gate: `turnEndForceCompactionEnabled`).
 - **Manual `/force-compact`** — immediate `compactNow` when idle; queues a process-local force
-  flag consumed at the next model step when busy.
+  flag consumed at the next model step when busy. **Loaded lazily:** the command is only
+  registered at the first guarded-listener activation, so a fresh session sees it in the `/`
+  picker *after its first model request* (see "Behavior notes").
 - **`session/flush`** — the awaited durability checkpoint.
 
 Every path funnels into the single *"compaction result landed in the session"* boundary — the
@@ -181,7 +183,7 @@ Supporting modules:
 - `src/hooks/guard.js` — per-request guard: `agent/request` pure pass-through (no more
   blanket thinking stamp) + `pre-step` threshold gate + process-local force flag
   (`thinkingDisabled` survives only as a legacy predicate, un-called on the hot path).
-- `src/hooks/command.js` — the `/force-compact` command.
+- `src/hooks/command.js` — the `/force-compact` command (lazily registered; see "Behavior notes").
 - `src/hooks/idle.js` — turn-end forced compaction.
 - `src/hooks/wire-rewrite.js` — the `llm/stream` Live-UI watermark hook (no longer performs
   wire manipulation; see module header for the historical note on why).
@@ -295,6 +297,18 @@ threshold maps predictably onto what the UI shows you.
   through and lets the request proceed.
 - **Optional dependencies:** `settings` / `tokenMeter` / `commands` / `llm` / `agents` are read
   via `ctx.get(...)` with guards — a missing one degrades gracefully rather than crashing.
+- **`/force-compact` is loaded lazily (one model request first).** The `commands` service
+  arrives with the agent-presets plane — **after** the plugin's boot-time `apply` — so
+  boot-time registration would always miss. Registration is therefore retried at the top of
+  every guarded listener (`agent/request` / `agent/pre-step` / `agent/status` /
+  `session/flush`) and the first success settles the latch permanently. Practical effect:
+  after (re)starting the instance, a **fresh session's `/` command picker does NOT show
+  `/force-compact` until that session makes its first model request** — send any one
+  message and the command is registered process-wide, then available in every session.
+  Success logs `[force-compact] /force-compact command registered (deferred)`; if the
+  `commands` service never materializes, a single `… still UNREGISTERED 10 min …` warn
+  explains the empty picker. Until it registers, the rest of the plugin works normally —
+  self-healing degradation, not an install failure.
 - **Per-request settings read:** parameters are read per model request, so edits take effect on
   the next request without a restart.
 - **Signals:** the `agent/*` Waterfalls forward the current turn's signal; the `session/flush`
