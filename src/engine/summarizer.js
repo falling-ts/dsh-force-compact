@@ -276,15 +276,20 @@ async function __summarizeBody(ctx, config, agent, input, signal, extra) {
   // options object and the resolved provider/model they head to — the durable
   // answer to "did this compaction's thinking-off actually land on the wire?".
   // Defensive envelope: a missing/non-function `ctx.logger.debug` degrades to
-  // silence (never escapes `summarize`); the line itself is purely
-  // observational and allocates nothing observable on the hot path.
+  // silence (never escapes `summarize`). NOTE (2026-08 guard fix): `ctx.logger`
+  // is a CALLABLE LoggerService façade (`createCallable` — `typeof 'function'`,
+  // not 'object'), so the original `typeof ctx.logger === 'object'` guard was
+  // ALWAYS false and this line never fired. The guard below mirrors
+  // engine/builtin.js's working `info()` envelope instead: presence check +
+  // duck-typed `.debug`, wrapped in try/catch.
   {
     const _auditPrimary = options.reasoningEffort === undefined ? '(absent — machine default)' : `'${options.reasoningEffort}'`
     const _auditCompat = options.reasoning_effort === undefined ? '(absent — thinking rides machine default)' : `"${options.reasoning_effort}" (llama.cpp-native wire field)`
     const _auditWho = session !== undefined && session !== null && typeof session.id === 'string' ? session.id + ': ' : ''
+    const _auditLogger = (ctx === undefined || ctx === null) ? null : ctx.logger
     try {
-      if (typeof ctx !== 'undefined' && ctx !== null && typeof ctx.logger === 'object' && ctx.logger !== null && typeof ctx.logger.debug === 'function') {
-        ctx.logger.debug('[force-compact] ' + _auditWho + 'summarization wire-fields → ' + target.provider + '/' + target.model + ': reasoningEffort=' + _auditPrimary + ' + reasoning_effort=' + _auditCompat)
+      if (_auditLogger !== null && _auditLogger !== undefined && typeof _auditLogger.debug === 'function') {
+        _auditLogger.debug('[force-compact] ' + _auditWho + 'summarization wire-fields → ' + target.provider + '/' + target.model + ': reasoningEffort=' + _auditPrimary + ' + reasoning_effort=' + _auditCompat)
       }
     } catch {}
   }
