@@ -727,6 +727,12 @@ async function runTransaction(ctx, agent, session, region, signal, settings, sou
   let summarizationMaxTokens
   try {
     const extra = { reasoningEffort: settings.disableThinking ? 'off' : undefined }
+    // AUDIT LOG (2026-08 addition): state the thinking-scoping DECISION at the
+    // moment the `disableThinking` setting is READ and routed into `extra`.
+    // One line per summarization attempt (NOT per model request — this is the
+    // compaction path only), so the log doubles as the durable answer to
+    // "did this compaction carry thinking-off?" without needing the wire trace.
+    info(ctx, `${session.id}: compaction thinking-policy — settings.disableThinking=${settings.disableThinking} → extra.reasoningEffort=${settings.disableThinking ? "'off' (this summarization call carries thinking-OFF)" : '(unset — summarization call RIDES MACHINE DEFAULT, no thinking override)'}`)
     if (Number.isFinite(settings.maxSummaryTokens) && settings.maxSummaryTokens > 0) {
       extra.maxTokens = settings.maxSummaryTokens
     }

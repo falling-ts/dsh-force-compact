@@ -271,6 +271,23 @@ async function __summarizeBody(ctx, config, agent, input, signal, extra) {
   if (extra !== undefined && extra.reasoningEffort === 'off') {
     options.reasoning_effort = 'none'
   }
+  // AUDIT LOG (2026-08 addition): the LLAMA.CPP-COMPATIBILITY stamp site. One
+  // line per summarization attempt recording BOTH wire fields that leave the
+  // options object and the resolved provider/model they head to — the durable
+  // answer to "did this compaction's thinking-off actually land on the wire?".
+  // Defensive envelope: a missing/non-function `ctx.logger.debug` degrades to
+  // silence (never escapes `summarize`); the line itself is purely
+  // observational and allocates nothing observable on the hot path.
+  {
+    const _auditPrimary = options.reasoningEffort === undefined ? '(absent — machine default)' : `'${options.reasoningEffort}'`
+    const _auditCompat = options.reasoning_effort === undefined ? '(absent — thinking rides machine default)' : `"${options.reasoning_effort}" (llama.cpp-native wire field)`
+    const _auditWho = session !== undefined && session !== null && typeof session.id === 'string' ? session.id + ': ' : ''
+    try {
+      if (typeof ctx !== 'undefined' && ctx !== null && typeof ctx.logger === 'object' && ctx.logger !== null && typeof ctx.logger.debug === 'function') {
+        ctx.logger.debug('[force-compact] ' + _auditWho + 'summarization wire-fields → ' + target.provider + '/' + target.model + ': reasoningEffort=' + _auditPrimary + ' + reasoning_effort=' + _auditCompat)
+      }
+    } catch {}
+  }
 
   // Assemble ALL chunk kinds (text + reasoning + images). Reasoning deltas are
   // dropped later by `extractTextOnly`; a terminal finish decides whether the
