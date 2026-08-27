@@ -618,15 +618,29 @@ async function __forceCompactIfNeededBody(ctx, agent, signal, mode) {
     )
   }
 
-  // At or above the threshold: do NOT request the model. Retain the latest
-  // `retainLatestTokens` of the surface VERBATIM, and send everything before
-  // that cutoff (the head) as ONE BATCH to the LLM summarizer. The loop retries
-  // the step against the shrunken context (retained tail unchanged).
-  ctx.logger.info(
-    `[force-compact] ${session.id}: context ~${total} tokens >= threshold ${settings.autoThresholdTokens}; `
-    + `rejecting the model request and compacting the head while retaining the latest ~${settings.retainLatestTokens} tokens`,
+  // SHORT-CIRCUIT: when the whole current surface window does not exceed the
+  // retention budget, there is no head to compact (the tail-retaining selector
+  // would walk the entire window and return null). The threshold was tripped
+  // by the provider-usage baseline rather than by real surface growth, so an
+  // attempted compaction is a guaranteed no-op — skip it and let the request
+  // proceed without pretending to compact.
+  if (windowSumObserved > 0 && Number.isFinite(windowSumObserved) && windowSumObserved <= settings.retainLatestTokens) {
+    ctx.logger.debug(
+      `[force-compact] ${session.id}: threshold ${settings.autoThresholdTokens} tripped on a surface window (~${Math.round(windowSumObserved)} tokens) that does not exceed retainLatestTokens (~${settings.retainLatestTokens}) — nothing above the retention floor to compact; letting the request proceed`,
+    )
+    return false
+  }
+
+  // At or above the threshold: attempt a retained-tail compaction (the request
+  // itself always proceeds; the plugin never rejects the model call).
+  ctx.logger.debug(
+    `[force-compact] ${session.id}: context ~${total} tokens >= threshold ${settings.autoThresholdTokens} — attempting a retained-tail compaction (success/failure is reported by the backend below; the request itself proceeds regardless)`,
   )
-  const committed = await compactRetainingLatest(ctx, agent, signal, mode, measurement)
+  // NOTE: threshold path has NO originating slash-command, so the 5th argument
+  // (sourceCommandId) must be omitted — passing something else here (e.g. the
+  // `measurement` snapshot, as an earlier revision did) would leak a non-string
+  // into the compaction/* events' sourceCommandId field.
+  const committed = await compactRetainingLatest(ctx, agent, signal, mode)
   if (!committed) {
     // BLANK OUTCOME — nothing shrank, so the NEXT step re-attempts at the same
     // total. That is intentional ("先压缩再说"): a blank result never wedges the
