@@ -228,6 +228,32 @@ export async function publishRandomWorking(ctx) {
 }
 
 /**
+ * The conversation-START forced override: publish a fresh random working pair
+ * with `isImportant=true`, so it UNCONDITIONALLY overwrites whatever is
+ * currently displayed — including a stale pinned bracket-form text such as
+ * `[强制压缩中>>>]` left behind by an interrupted/failed compaction (the
+ * non-important guard inside {@link publishUiStatus} refuses to overwrite a
+ * `[`-prefixed text, so such residue would otherwise stick on the badge for
+ * the whole session, forever showing a frozen compressing/done banner instead
+ * of a live working label).
+ *
+ * Call ONCE at the START of a conversation step (the `agent/request` seam —
+ * see index.js): the first model request of a new turn force-clears any
+ * bracket residue so the badge immediately returns to a normal working look.
+ * Only the START uses the forced form; the mid-stream watermark keeps
+ * publishing NON-importantly via {@link publishRandomWorking} (called from the
+ * `llm/stream` hook) so a live `[强制压缩中>>>]` during an ACTUAL compaction
+ * still survives (the guard stays effective while something is really
+ * pressing). Clean, self-healing: a stale `[` never outlives the next
+ * conversation start.
+ * @param {import('@deepseek-ai/cordis').Context} ctx
+ * @returns {Promise<void>}
+ */
+export async function publishWorkingOnStart(ctx) {
+  await publishUiStatus(ctx, randomWorkingPair(), true)
+}
+
+/**
  * Publish the pinned RED "[强制压缩中>>>]" status. Call BEFORE a `compactNow` /
  * `compactRegion` invocation. Passes `isImportant=true` so the pinned
  * bracket-form message can overwrite whatever is currently displayed (including
