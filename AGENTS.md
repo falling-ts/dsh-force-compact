@@ -14,6 +14,18 @@
 豁免。除此一处之外，本插件仍不引入任何 timer；`queueForceCompact` 的
 process-local `Map` 标记也无 timer。
 
+## 例外：摘要流的硬超时守卫（`AbortSignal.timeout`，2026-08-30 增补）
+
+`src/engine/summarizer.js` 的 `SUMMARIZATION_TIMEOUT_MS = 90_000` 是一次
+**单发超时守卫**：用 `AbortSignal.timeout` + `Promise.race` 把一次摘要
+`llm.stream` 收集钉死在硬时限内。这不是周期调度、不是延时重试，而是一次
+事务的**防泄漏护栏**——没有它，一个静默挂起的 provider 流会让
+`await summarize(...)` 永挂、`compaction/start` 锁永不闭合，后续所有压缩
+（idle 自动 + `/force-compact`）都被 `assertNoActiveCompaction` 拒绝直到进程
+重启（2026-08-30 在 opencode-go/deepseek-v4-flash 上实测复现）。守卫的性质
+与 `publishDone` 定时器同类（fire-and-forget、无内存态、无持久化），归入
+同一豁免；除这两处外仍不引入 timer。
+
 ## 双引擎架构（内置引擎 + 官方服务并列共存）
 
 本插件拥有**两条独立的压缩路径**，通过统一的 `resolveCompaction(ctx, agent, mode)` facade

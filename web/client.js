@@ -21,7 +21,10 @@ window.__ModuleLoader__.load({
     const React = require("react");
     const h = React.createElement;
     // 基线外部（web 平台预载）：把 settingsScope 镜像成 uSES 安全的 SnapshotStore。
-    const { createSnapshotStore } = require("@deepseek-ai/dsh-client-runtime/client");
+    // `createSnapshotStore` 的正确来源是 PLATFORM_MODULES seed 表内的静态包
+    // `@deepseek-ai/dsh-client-store`；`@deepseek-ai/dsh-client-runtime` 不在共享模块表
+    // 里，require 它会命中 client-modules 的 "missed the module table" 落空错误。
+    const { createSnapshotStore } = require("@deepseek-ai/dsh-client-store");
 
     /** 该分区拥有的文案命名空间。 */
     const NS = "settings.forceCompact";

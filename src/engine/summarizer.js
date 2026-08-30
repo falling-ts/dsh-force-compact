@@ -27,6 +27,26 @@ export const SUMMARY_OPEN_TAG = '<compacted-summary>'
 export const SUMMARY_CLOSE_TAG = '</compacted-summary>'
 
 /**
+ * Hard wall-clock cap for ONE summarization stream, in milliseconds.
+ *
+ * Why a timeout exists at all: `llm.stream` is a composed async iterable, and
+ * a silent provider (or a poisoned composition listener) can yield ZERO chunks
+ * and never terminate. If summarization never resolves, the caller
+ * (`runTransaction`) stays parked at its `await summarize(...)` and the
+ * `compaction/start` lock it opened is never closed by a matching
+ * `compaction/end` — every later compaction (idle auto-run, `/force-compact`)
+ * is then rejected with "a prior compaction transaction is still open" until
+ * the process restarts. Observed live 2026-08-30 on opencode-go/
+ * deepseek-v4-flash: the wire-fields audit line fired, then nothing — the
+ * stream simply hung. Fail-closed is cheaper than a permanently leaked lock:
+ * when the cap fires, the caller closes the bracket with an `error`, arming
+ * the existing failure cooldown instead of livelocking. The cap is enforced
+ * with `AbortSignal.timeout` racing the collection (`Promise.race`), because
+ * an abort alone cannot interrupt an iterator stuck inside its own `await`.
+ */
+export const SUMMARIZATION_TIMEOUT_MS = 90_000
+
+/**
  * The compaction directive, delivered as the FINAL user message after the
  * replayed conversation rather than as a distinct summarizer system prompt.
  * Keeping the conversation's own system prompt, tools, and message prefix in
@@ -155,7 +175,8 @@ export function frameSummary(textBlocks) {
  *   • `{ status: '<failure>', reason: string }` — the call was made but no
  *     usable summary resulted. Failure labels: `not-iterable`, `no-finish`,
  *     `provider-error`, `aborted`, `truncated-empty`, `image-content`,
- *     `empty-text`. Caller arms the per-session cooldown and closes the
+ *     `empty-text`, `timeout` (hard wall-clock cap hit: stream aborted,
+ *     presumed hung). Caller arms the per-session cooldown and closes the
  *     transaction with `error`.
  *   No throw path exists: a malformed chunk/finish/object degrades to a
  *   labeled failure, so a bad provider response can never surface a TypeError
@@ -180,7 +201,8 @@ async function __summarizeBody(ctx, config, agent, input, signal, extra) {
   //     'aborted' (terminal finish kind:'aborted'),
   //     'truncated-empty' (kind:'max-tokens' with no text),
   //     'image-content' (image blocks present — unsafe as a checkpoint),
-  //     'empty-text' (terminated successfully but emitted no text).
+  //     'empty-text' (terminated successfully but emitted no text),
+  //     'timeout' (hard wall-clock cap hit; stream aborted, presumed hung).
   // The caller (builtin.js runTransaction) maps 'ok' → commit; 'no-target'/
   // 'no-llm' → silent skip (nothing to cool down); any other status → arm the
   // per-session failure cooldown + close the transaction with `error`. No throw
@@ -232,7 +254,19 @@ async function __summarizeBody(ctx, config, agent, input, signal, extra) {
   if (extra !== undefined && Number.isFinite(extra.maxTokens) && extra.maxTokens > 0) {
     options.maxTokens = extra.maxTokens
   }
-  if (signal !== undefined) options.signal = signal
+  // HUNG-STREAM GUARD: pin the summarization stream to a hard wall-clock
+  // timeout ON TOP OF the caller's signal. `AbortSignal.timeout` + `AbortSignal.any`
+  // (Node >= 20.3) fire the abort on THEIR OWN schedule, so a silent provider
+  // stream (zero chunks, never a terminal finish) cannot leave the caller's
+  // `await summarize(...)` pending forever and leak the `compaction/start`
+  // lock. The caller's own signal keeps working normally (an external abort
+  // still cancels earlier); only when the TIMEOUT fires does the caller
+  // receive a labeled `timeout` failure instead of an open-ended hang.
+  const timeoutSignal = AbortSignal.timeout(SUMMARIZATION_TIMEOUT_MS)
+  const mergedSignal = (signal !== undefined && signal !== null && typeof signal.aborted === 'boolean')
+    ? AbortSignal.any([signal, timeoutSignal])
+    : timeoutSignal
+  options.signal = mergedSignal
   const session = agent.session
   if (session !== undefined && session !== null && typeof session.id === 'string') {
     options.sessionId = session.id
@@ -315,7 +349,24 @@ async function __summarizeBody(ctx, config, agent, input, signal, extra) {
   // error degrades to a labeled failure instead of escaping `summarize`.
   let collected
   try {
-    collected = await collectChunks(stream, signal)
+    // HUNG-STREAM RACE: an `AbortSignal.timeout` abort alone cannot interrupt a
+    // stream whose async iterator is stuck INSIDE an `await` (the `for await`
+    // loop only re-checks `signal.aborted` when the NEXT chunk arrives — a
+    // stream parked on `await new Promise(() => {})` never notices). So race
+    // the collection against the timeout signal's own settlement: whichever
+    // fires first wins. When the timeout wins, the labeled `timeout` failure
+    // below lets `runTransaction` close the `compaction/start` lock instead of
+    // leaking it forever; the abort is ALSO fired at the transport, so a
+    // fetch/undici-backed stream tears down instead of burning provider time.
+    // The abandoned collection loop (if any) keeps running in the background
+    // but its result is discarded — releasing the lock is the contract.
+    const hangRace = new Promise((resolve) => {
+      timeoutSignal.addEventListener('abort', () => resolve({ _hungByTimeout: true }), { once: true })
+    })
+    collected = await Promise.race([
+      collectChunks(stream, mergedSignal),
+      hangRace,
+    ])
   } catch (err) {
     // `for await` threw mid-iteration (generator fault, network reset, a
     // poisoned composed stream, …). Record it and fall through to the shared
@@ -326,8 +377,28 @@ async function __summarizeBody(ctx, config, agent, input, signal, extra) {
       _rejectReason: (err && err.message) ? err.message : String(err),
     }
   }
+  if (collected && typeof collected === 'object' && collected._hungByTimeout === true) {
+    // The hang race won: the stream never delivered a terminal fact within the
+    // cap. Labeled timeout failure — the caller closes the lock with an error.
+    return {
+      status: 'timeout',
+      reason: `summarization stream exceeded ${SUMMARIZATION_TIMEOUT_MS}ms without a terminal finish (race won; stream presumed hung: ${describeStream(stream)})`,
+    }
+  }
   if (!collected || typeof collected !== 'object') {
     collected = { blocks: [], text: '', hasImage: false, finish: undefined, usage: undefined, _chunkCount: 0, _rejected: true, _rejectReason: 'collectChunks returned a non-object' }
+  }
+  // HUNG-STREAM TERMINATION (checked BEFORE the `_rejected` branch): the hard
+  // timeout — not the caller's own signal — aborted the stream. The provider
+  // (or a composed listener) delivered no terminal chunk within the cap. Report
+  // a labeled `timeout` failure so `runTransaction` closes the `compaction/start`
+  // lock with an error instead of leaving it open forever. An external abort
+  // (caller signal) is NOT this case and keeps its existing classification.
+  if (mergedSignal.aborted && !(signal !== undefined && signal !== null && signal.aborted)) {
+    return {
+      status: 'timeout',
+      reason: `summarization stream exceeded ${SUMMARIZATION_TIMEOUT_MS}ms without a terminal finish and was aborted (${describeStream(stream)})`,
+    }
   }
   if (collected._rejected) {
     // The stream value was not a usable async iterable (see collectChunks).

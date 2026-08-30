@@ -1,6 +1,6 @@
 {
   "name": "@falling-ts/dsh-force-compact",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "description": "DSH Cordis plugin: hooks the core model-request seam (agent/pre-step + agent/request) to force-compact a session's context and disable thinking per the \"强制压缩配置\" settings namespace (disableThinking, autoThresholdTokens, retainLatestTokens, turnEndForceCompactionEnabled). When the threshold fires (or /force-compact queues while busy), the latest `retainLatestTokens` of the conversation's surface tokens are KEPT VERBATIM and everything before that cutoff is COMPACTED INTO A SINGLE SUMMARY NODE in one LLM call (original span entries become shadowed/skipped). Also compacts at each turn/end and at each session/flush durability checkpoint. Host half is a pure listener; a web client half registers a settings.section (强制压缩 / Force Compact) that reads and writes the same settings namespace.",
   "type": "module",
   "main": "./index.js",
@@ -17,6 +17,15 @@
     "cordis.patch.yml"
   ],
   "license": "MIT",
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-settings": "^0.1.0-rc.7 || ^0.1.1-rc.2"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-settings": {
+      "optional": true
+    }
+  },
   "publishConfig": {
     "access": "public"
   },
@@ -28,7 +37,8 @@
       "platform": "web",
       "inject": [
         "@deepseek-ai/dsh-client-ui-settings",
-        "@deepseek-ai/dsh-client-locale"
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-store"
       ]
     }
   },
