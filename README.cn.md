@@ -47,7 +47,15 @@
 每条路径最终都汇入唯一的「**压缩结果落入会话**」边界——也正是**发送 LiveUI 信令**的位置。
 
 判定键用 `projectedTokens`(provider 锚定,与界面角标同源),故插件永远不会偏离你所见;
-阈值感知的缩容门禁会跳过注定拉不回阈值以下的摘要调用(消灭低阈值死循环)。
+**触发后循环压缩**(2026-09 语义):自动门禁、`/force-compact`、回合结束两条路径会在同
+一次触发内**反复压缩,直到 `projectedTokens` 压回 `autoThresholdTokens` 以下**,或表面
+已无可压缩头部(整个表面都不超过 `retainLatestTokens` 保留预算)为止;单轮"压缩后仍
+≥ 阈值"不再被跳过(旧版的 threshold-aware shrink-gate 已移除,它把 provider 压力基线
+计入判定,baseline 偏高时会令可压缩会话滞留超阈值)。硬上限
+`MAX_COMPACTION_ROUNDS=8` 兜底,防止 provider 基线异常时无限烧摘要调用。真正"物理防呆"
+的拒绝保留不变:**摘要必须显著小于被遮蔽区间**(post-summary shrink gate,防膨胀)、
+小于 `MIN_USEFUL_SPAN_TOKENS` 的小头部不浪费摘要调用、replay 消息上限、失败冷却、
+busy 锁与表面一致性校验。
 
 内置事务的影子价格账单取自与官方引擎相同的 `tokenMeter.measure` 逐节点单价,故米表
 折叠协议结算正确——压缩后右下角计数器*下降*,而非漂移上升。

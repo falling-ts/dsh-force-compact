@@ -357,6 +357,19 @@ DeepSeek 适配器（无独立的 llama.cpp 适配器包），再起一份 adapt
 - **钩住核心模型请求（`agent/request` / `agent/pre-step`）：** 插件的核心行为是钩住官方模型请求缝，**每次请求模型前**读取设置：
   - **`agent/request`**（围绕冻结调用配置的 Waterfall）——**纯透传**（2026-08 语义收窄，见上文"disableThinking 语义收窄"节）：监听器 `await next()` 取得机器本会使用的配置后**原样返回**，业务请求沿用机器默认的思考强度；`disableThinking` 只作用于本插件自己的压缩摘要调用。监听器**不得**在缺少 `next()` 时短路（必须调用 `next()`）。
   - **`agent/pre-step`**（每个模型步骤前的 Waterfall）——通过 `tokenMeter.measure(session).totalTokens` 读取会话上下文总 tokens；当其**≥ `autoThresholdTokens`** 时，返回 `{ kind: 'reject' }` **不发起模型请求**，并按 `retainLatestTokens` 语义选区：**从会话最新条目起按官方 `tokenMeter` 逐节点反向累加 token，直到 ≥ `retainLatestTokens` 停止**；截点之前的**所有条目一次性**通过 `compactRegion` 发往大模型做摘要（原条目被遮蔽/跳过），保留段逐字不变；低于阈值时调用 `next()` 让请求继续。强制压缩失败（无安全区间 / 已活跃）时降级为 `next()`，绝不阻塞请求。
+  - **2026-09 语义——触发后循环压缩（不再"预测压不到阈值就跳过"）**：三处触发路径
+    （`agent/pre-step` 自动门禁、`/force-compact`（空闲与下一模型步骤）、`agent/status`
+    idle）在阈值达到后**循环压缩直到 `projectedTokens` 压回 `autoThresholdTokens` 以下**：
+    guard.js 的 `compactRetainingLatest` 每轮重新读数 + 重新选区 + `compactRegion`；内置
+    引擎删除了 `compactNow` 路径的 threshold-aware SHADOW-SPAN FLOOR（其 `total − span ≥
+    threshold → skip` 判定把 provider 压力基线计入 `total`，baseline 偏高时会令可压缩会话
+    滞留超阈值，2026-09 移除；**post-summary 摘要必须小于被遮蔽区间的 shrink gate 保留，
+    它才是防膨胀的最后防线**）。循环停止条件：(a) 第二轮起 `projectedTokens < threshold`
+    （首轮无条件执行，保住 `/force-compact` 的强制语义）；(b) 选区为 null（整个表面不超过
+    `retainLatestTokens` 保留预算，无头部可压）；(c) 一轮提交失败（重试同一形状徒劳）。
+    `MAX_COMPACTION_ROUNDS=8`（`src/core/policy.js`）为硬上限，防 provider 基线异常时无限
+    烧摘要调用。保留的物理防呆：surface 一致性交叉校验、配对边界校验、small-span
+    （< `MIN_USEFUL_SPAN_TOKENS`）跳过、replay 消息上限、失败冷却与 busy 锁。
   - 两个参数都**每次请求**通过同步 `settings.get('falling-ts-force-compact')` 读取，因此 `settings.yaml` 的改动在下一次请求即生效。
 - **`/force-compact` 斜杠命令（`commands` 服务，可选依赖）：** 通过 `/` 选择执行，其 handler **不发送模型请求**。Agent **空闲**时经 `compactNow`（owner `null`，空闲手动入口）立即压缩（引擎自身区间选择）；**繁忙**时 `compactNow` 被拒绝，handler 排队一个强制标记（`src/hooks/command.js`）。handler 逻辑：
   - 直接调用 compaction 服务的 `compactNow(agent, invocation.signal)`（事件时经 `ctx.get('compaction')` 实时读取；owner `null`，空闲手动入口）压缩会话——空闲时立即生效，使用引擎自身的区间选择。

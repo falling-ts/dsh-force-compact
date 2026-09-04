@@ -15,7 +15,9 @@
 
 import { queueForceCompact } from './guard.js'
 import { resolveCompaction } from '../engine/backend.js'
-import { readRawSetting } from '../core/settings.js'
+import { readSettings, readRawSetting, DEFAULTS } from '../core/settings.js'
+import { getProjectedTokens } from '../core/projected.js'
+import { MAX_COMPACTION_ROUNDS } from '../core/policy.js'
 import { publishCompressing, publishDone } from '../core/ui-signal.js'
 import { guardFn, renderCrash, captureThrowSite, appendCrashLine as appendDiag } from '../core/crashnet.js'
 
@@ -84,6 +86,7 @@ async function __forceCompactCommandBody(ctx, invocation) {
   // `compactionMode` setting is read once here (raw, cheap) and passed so
   // the resolver need not re-read settings.
   const mode = await readRawSetting(ctx, 'compactionMode')
+  const settings = (await readSettings(ctx)) ?? DEFAULTS
   const backend = await resolveCompaction(ctx, agent, mode)
   ctx.logger.debug(`[force-compact] ${session.id}: /force-compact handler entered (backend ${backend ? backend.kind : 'UNAVAILABLE'})`)
 
@@ -103,52 +106,86 @@ async function __forceCompactCommandBody(ctx, invocation) {
       // an idle agent and uses the engine's own range selection. When the agent
       // is busy it throws (ManualCompactionError) — in that case queue the force
       // flag so the pre-step hook force-compacts at the next model step.
+      //
+      // LOOP COMPACTION (2026-09 semantics — user requirement: never skip
+      // because a single round could not pull the context below the threshold;
+      // compact repeatedly until it is). The FIRST round always runs so an
+      // explicit command compacts even below the gate; from the SECOND round on
+      // the loop stops once the projected context is below
+      // `autoThresholdTokens`. It also stops when a round commits nothing (no
+      // compactable range / a physical cap).
       try {
-        // LIVE UI SIGNAL — PIN RED "compressing" BEFORE the model-request /
-        // commit happens. Both publishers swallow their own failures, so the
-        // messenger can never disturb the actual compaction outcome returned
-        // below.
-        await publishCompressing(ctx)
-        // P1 — thread `invocation.commandId` as the 3rd positional arg: the
-        // official `compactNow(agent, signal, commandId)` accepts it directly;
-        // the builtin `compactNow(agent, signal, sourceCommandId, opts)`
-        // absorbs it as `sourceCommandId` (positional widening verified).
-        const result = await backend.compactNow(agent, invocation.signal, invocation.commandId)
-        if (result === undefined || result === null) {
-          // Persist this diagnosis (WARN level so it survives the default INFO
-          // floor AND the `[force-compact]` marker routes it into the plugin's
-          // own durable log file — previously the reason lived ONLY in a
-          // `ctx.logger.info` line that the stock in-memory sink dropped,
-          // leaving the user with a bare "no compactable range"). Surface
-          // facets: node count (below the 6-node minimum?), head source
-          // (a previous checkpoint? re-running on an already-condensed head),
-          // and the char-estimated surface sum (vs the 8000 retention floor).
-          // The richer meter-priced detail (per-node prices, boundaryKind,
-          // crossing points) is additionally recorded by the builtin engine's
-          // own skip diagnostic (its `info`/`warn` helpers feed this same
-          // durable file).
-          const surfNodes = (session && session.surface && Array.isArray(session.surface.nodes)) ? session.surface.nodes : []
-          let headIsCheckpoint = false
-          if (surfNodes.length > 0 && Array.isArray(session.events)) {
-            const headEvent = session.events[surfNodes[0]]
-            const headSource = headEvent && headEvent.data && typeof headEvent.data === 'object' ? headEvent.data.source : undefined
-            headIsCheckpoint = !!(headSource && typeof headSource === 'object' && (headSource.plugin === 'force-compact-builtin' || headSource.plugin === 'compact'))
+        const meter = ctx.get('tokenMeter')
+        let committedAny = false
+        let lastResult = null
+        for (let round = 0; round < MAX_COMPACTION_ROUNDS; round += 1) {
+          if (round > 0) {
+            let effTotal = getProjectedTokens(ctx, session)
+            if (typeof effTotal !== 'number' || !Number.isFinite(effTotal) || effTotal < 0) {
+              try {
+                const m = (meter !== undefined && typeof meter.measure === 'function') ? meter.measure(session) : undefined
+                if (m !== undefined && Number.isFinite(m.surfaceTokens)) effTotal = m.surfaceTokens
+              } catch {
+                effTotal = undefined
+              }
+            }
+            if (typeof effTotal === 'number' && Number.isFinite(effTotal) && effTotal < settings.autoThresholdTokens) {
+              ctx.logger.info(
+                `[force-compact] ${session.id}: /force-compact loop — after ${round + 1} round(s) the projected context ~${effTotal} tokens is below threshold ${settings.autoThresholdTokens}; target reached`
+              )
+              break
+            }
           }
-          ctx.logger.warn(
-            `[force-compact] ${session.id}: no compactable range via ${backend?.kind} — `
-            + `${surfNodes.length} surface nodes (min 6 required), head=${headIsCheckpoint ? 'previous checkpoint' : 'ordinary history'}`,
+          // LIVE UI SIGNAL — PIN RED "compressing" BEFORE the round's commit.
+          // Both publishers swallow their own failures, so the messenger can
+          // never disturb the actual compaction outcome returned below.
+          await publishCompressing(ctx)
+          // P1 — thread `invocation.commandId` as the 3rd positional arg: the
+          // official `compactNow(agent, signal, commandId)` accepts it directly;
+          // the builtin `compactNow(agent, signal, sourceCommandId, opts)`
+          // absorbs it as `sourceCommandId` (positional widening verified).
+          const result = await backend.compactNow(agent, invocation.signal, invocation.commandId)
+          if (result === undefined || result === null) {
+            // Persist this diagnosis (WARN level so it survives the default INFO
+            // floor AND the `[force-compact]` marker routes it into the plugin's
+            // own durable log file). Surface facets: node count, head source
+            // (a previous checkpoint?), and the surface size.
+            const surfNodes = (session && session.surface && Array.isArray(session.surface.nodes)) ? session.surface.nodes : []
+            let headIsCheckpoint = false
+            if (surfNodes.length > 0 && Array.isArray(session.events)) {
+              const headEvent = session.events[surfNodes[0]]
+              const headSource = headEvent && headEvent.data && typeof headEvent.data === 'object' ? headEvent.data.source : undefined
+              headIsCheckpoint = !!(headSource && typeof headSource === 'object' && (headSource.plugin === 'force-compact-builtin' || headSource.plugin === 'compact'))
+            }
+            if (round === 0) {
+              ctx.logger.warn(
+                `[force-compact] ${session.id}: no compactable range via ${backend?.kind} — `
+                + `${surfNodes.length} surface nodes (min 6 required), head=${headIsCheckpoint ? 'previous checkpoint' : 'ordinary history'}`,
+              )
+              return { kind: 'success', text: `no compactable range (${surfNodes.length} surface nodes) — say something to build up more history, or raise the surface size` }
+            }
+            ctx.logger.debug(
+              `[force-compact] ${session.id}: /force-compact loop round ${round + 1}/${MAX_COMPACTION_ROUNDS} committed nothing via ${backend?.kind} — stopping the loop`
+            )
+            break
+          }
+          lastResult = result
+          committedAny = true
+          ctx.logger.info(
+            `[force-compact] ${session.id}: /force-compact loop round ${round + 1}/${MAX_COMPACTION_ROUNDS} (${backend?.kind}) shadowed `
+            + `${result.shadowedSeqs?.length ?? '?'} nodes (~${result.shadowedTokenCount ?? '?'} tokens)`,
           )
-          return { kind: 'success', text: `no compactable range (${surfNodes.length} surface nodes) — say something to build up more history, or raise the surface size` }
         }
-        // COMMITTED (range shadowed + summary added) — pin GREEN "done"; the
-        // next model request's `llm/stream` watermark overwrites it with a
-        // fresh random working pair shortly after (natural cadence, no timer).
-        await publishDone(ctx)
-        ctx.logger.info(
-          `[force-compact] ${session.id}: /force-compact (${backend?.kind}) shadowed ${result.shadowedSeqs?.length ?? '?'} nodes `
-          + `(~${result.shadowedTokenCount ?? '?'} tokens)`,
-        )
-        return { kind: 'success', text: `compacted ~${result.shadowedTokenCount ?? '?'} tokens via ${backend?.kind}` }
+        // COMMITTED at least once — pin GREEN "done"; the next model request's
+        // `llm/stream` watermark overwrites it shortly after (natural cadence,
+        // no timer). Report the LAST round's shadowed count to the user.
+        if (committedAny) {
+          await publishDone(ctx)
+          return { kind: 'success', text: `compacted ~${lastResult?.shadowedTokenCount ?? '?'} tokens via ${backend?.kind}` }
+        }
+        // Loop committed nothing on a non-first round (unreachable in practice
+        // since round 0 already returned above) — kept for safety.
+        return { kind: 'success', text: '/force-compact: nothing further to compact (context is at or below the threshold)' }
       } catch (error) {
         // Busy (or otherwise unable) — queue the force flag for the next step.
         // P1 — carry `invocation.commandId` so the pre-step consumer can echo

@@ -24,6 +24,9 @@ import { resolveCompaction } from '../engine/backend.js'
 import { publishCompressing, publishDone } from '../core/ui-signal.js'
 import { guardFn, renderCrash, captureThrowSite, appendCrashLine as appendDiag } from '../core/crashnet.js'
 
+import { getProjectedTokens } from '../core/projected.js'
+import { MAX_COMPACTION_ROUNDS } from '../core/policy.js'
+
 /**
  * Handle one `agent/status` emission: when the agent transitions to `idle` and
  * `turnEndForceCompactionEnabled` is on, compact the session's useful history
@@ -104,31 +107,60 @@ async function __handleAgentStatusBody(ctx, payload, mode) {
   // its own).
   const controller = new AbortController()
   try {
-    // LIVE UI SIGNAL — PIN RED "compressing" BEFORE requesting the model /
-    // committing anything. Both publishers are guaranteed side-effect-free
-    // (they swallow their own failures internally), so a messenger problem
-    // can never perturb the compaction transaction itself.
-    await publishCompressing(ctx)
-    // P1 — idle is an AUTO entry: pass `opts: { retainTokens }` to preserve
-    // the legacy retain-the-latest-N-tokens selection. Without this, `compactNow`
-    // defaults `retainTokens` to 0 (manual full-head behavior) which would
-    // change idle-path semantics. The 3rd arg (sourceCommandId) stays
-    // undefined — idle has no originating command id.
-    const result = await backend.compactNow(agent, controller.signal, undefined, { retainTokens: settings.retainLatestTokens })
-    if (result === undefined || result === null) {
-      ctx.logger.debug(`[force-compact] ${session.id}: idle compaction via ${backend?.kind} committed nothing`)
-      return
+    // LOOP IDLE COMPACTION (2026-09 semantics — user requirement: compact
+    // repeatedly until the projected context is below `autoThresholdTokens`,
+    // never skip because a single round could not reach it). Each round
+    // re-reads the pressure basis and re-runs `compactNow` (which selects its
+    // own region against the CURRENT surface). Loop exits when
+    //  (a) the projection is below the threshold (checked from the second
+    //      round; the FIRST round always attempts a compaction),
+    //  (b) `compactNow` commits nothing (no compactable region or a physical
+    //      cap: small-span skip, replay ceiling, failure cooldown), or
+    //  (c) the hard `MAX_COMPACTION_ROUNDS` ceiling is reached.
+    const meter = ctx.get('tokenMeter')
+    let committedAny = false
+    for (let round = 0; round < MAX_COMPACTION_ROUNDS; round += 1) {
+      if (round > 0) {
+        let effTotal = getProjectedTokens(ctx, session)
+        if (typeof effTotal !== 'number' || !Number.isFinite(effTotal) || effTotal < 0) {
+          try {
+            const m = (meter !== undefined && typeof meter.measure === 'function') ? meter.measure(session) : undefined
+            if (m !== undefined && Number.isFinite(m.surfaceTokens)) effTotal = m.surfaceTokens
+          } catch {
+            effTotal = undefined
+          }
+        }
+        if (typeof effTotal === 'number' && Number.isFinite(effTotal) && effTotal < settings.autoThresholdTokens) {
+          ctx.logger.info(
+            `[force-compact] ${session.id}: idle loop compaction — after ${round + 1} round(s) the projected context ~${effTotal} tokens is below threshold ${settings.autoThresholdTokens}; target reached`
+          )
+          break
+        }
+      }
+      // LIVE UI SIGNAL — PIN RED "compressing" BEFORE the round's compaction
+      // commits. Publishers swallow their own failures — the messenger can
+      // never perturb the compaction transaction itself.
+      await publishCompressing(ctx)
+      // P1 — idle is an AUTO entry: pass `opts: { retainTokens }` to preserve
+      // the legacy retain-the-latest-N-tokens selection (the 3rd arg,
+      // sourceCommandId, stays undefined — idle has no originating command id).
+      const result = await backend.compactNow(agent, controller.signal, undefined, { retainTokens: settings.retainLatestTokens })
+      if (result === undefined || result === null) {
+        ctx.logger.debug(
+          `[force-compact] ${session.id}: idle loop compaction round ${round + 1}/${MAX_COMPACTION_ROUNDS} committed nothing via ${backend?.kind} — stopping the loop`
+        )
+        break
+      }
+      committedAny = true
+      ctx.logger.info(
+        `[force-compact] ${session.id}: idle loop compaction round ${round + 1}/${MAX_COMPACTION_ROUNDS} (${backend?.kind}) shadowed `
+        + `${result.shadowedSeqs?.length ?? '?'} nodes (~${result.shadowedTokenCount ?? '?'} tokens)`,
+      )
     }
-    // COMMITTED — range shadowed + summary added. Pin GREEN "done" NOW; the
-    // next model request's `llm/stream` watermark redraws a fresh random
-    // working pair within seconds (typically < 3 s — the very next step's
-    // LLM boundary), which is the natural visual rhythm: no dedicated timer
-    // needed.
-    await publishDone(ctx)
-    ctx.logger.info(
-      `[force-compact] ${session.id}: idle compaction (${backend?.kind}) shadowed ${result.shadowedSeqs?.length ?? '?'} nodes `
-      + `(~${result.shadowedTokenCount ?? '?'} tokens)`,
-    )
+    // Pin GREEN "done" once at least one round committed; the next model
+    // request's `llm/stream` watermark redraws a fresh random working pair
+    // within seconds — no dedicated timer needed.
+    if (committedAny) await publishDone(ctx)
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     ctx.logger.warn(`[force-compact] ${session.id}: idle compaction via ${backend?.kind} FAILED — ${message}`)

@@ -31,6 +31,7 @@
  */
 
 import { readSettings, DEFAULTS } from '../core/settings.js'
+import { MAX_COMPACTION_ROUNDS } from '../core/policy.js'
 import {
   selectEarliestByTokens,
   selectEarliestByMeasurements,
@@ -92,78 +93,6 @@ export const peekForceCompact = guardFn('guard.peekForceCompact', (sessionId) =>
 
 
 
-/**
- * Estimate the total token count of the messages contained in a region span,
- * using the `tokenMeter.estimateMessage` service when available and falling
- * back to a 4-chars-per-token character heuristic. Mirrors the projection the
- * builtin engine performs (`projectRegion`), but only to SUM sizes for the
- * threshold-aware shrink gate — it builds no durable artifacts.
- * @param {object|undefined} meter the `tokenMeter` service (may be undefined).
- * @param {import('@deepseek-ai/dsh-session').Session} session
- * @param {{start: number, end: number}} region the head-anchored span (inclusive seqs).
- * @returns {number} the summed token estimate (0 when nothing measurable).
- */
-/**
- * Sum the meter's per-node prices for the surface nodes whose seq falls within
- * the selected region's [start..end] seq window. Reusing the measurement's own
- * node prices keeps the shrink gate's region figure on the SAME caliber as both
- * the region selector and the gate's `totalTokens` (all fed by the one
- * `measure()` snapshot). Falls back to re-pricing flat surface content via
- * `meter.estimateMessage` / char-heuristic when no measurement is supplied.
- */
-function estimateRegionTokens(meter, session, region, measurement) {
-  // PREFERRED: when a `measure()` snapshot is available, sum the node prices for
-  // the seq window directly — same pricer, same total caliber as the selector.
-  if (measurement !== undefined && Array.isArray(measurement.nodes)) {
-    const lo = Math.min(region.start, region.end)
-    const hi = Math.max(region.start, region.end)
-    let tokens = 0
-    for (const node of measurement.nodes) {
-      const n = Number(node.seq)
-      if (Number.isFinite(n) && n >= lo && n <= hi) {
-        const t = Number(node.tokens)
-        if (Number.isFinite(t) && t > 0) tokens += t
-      }
-    }
-    return tokens
-  }
-  // LEGACY: no measurement — price the region's surface seqs manually. Malformed
-  // shapes degrade to whatever IS measurable (often 0) rather than throwing —
-  // feeds a shrink gate, never a correctness path.
-  const surfaceNodes = (session && session.surface && Array.isArray(session.surface.nodes)) ? session.surface.nodes : []
-  const nodes = [...surfaceNodes]
-  const firstIdx = nodes.indexOf(region.start)
-  const lastIdx = nodes.lastIndexOf(region.end)
-  const segment = (firstIdx >= 0 && lastIdx >= firstIdx)
-    ? nodes.slice(firstIdx, lastIdx + 1)
-    : []
-  const events = (session && Array.isArray(session.events)) ? session.events : []
-  let tokens = 0
-  const useMeter = meter !== undefined && typeof meter.estimateMessage === 'function'
-  for (const seq of segment) {
-    const event = events[seq]
-    if (event === undefined || event === null || typeof event !== 'object') continue
-    const data = (event.data && typeof event.data === 'object') ? event.data : {}
-    let content
-    if (event.type === 'user/message') content = data.content
-    else if (event.type === 'assistant/message') content = (data.message && data.message.content !== undefined) ? data.message.content : undefined
-    else if (event.type === 'tool/result') content = (data.message && data.message.content !== undefined) ? data.message.content : undefined
-    if (content === undefined || content === null) continue
-    if (useMeter) {
-      try {
-        tokens += meter.estimateMessage({ role: 'user', content })
-      } catch {
-        /* estimator hiccup — ignore this block */
-      }
-    } else {
-      let chars = 0
-      const blocks = Array.isArray(content) ? content : []
-      for (const block of blocks) if (block && typeof block === 'object' && typeof block.text === 'string') chars += block.text.length
-      tokens += Math.ceil(chars / 4)
-    }
-  }
-  return tokens
-}
 
 /**
  * Compact a session's head so that the latest `retainLatestTokens` of the
@@ -242,220 +171,172 @@ async function __compactRetainingLatestBody(ctx, agent, signal, mode, sourceComm
     )
     return false
   }
-  // Pressure basis — PROJECTED TOKENS (single definition with the harness UI).
-  // Reads the SAME `projectedTokens` the harness renders in the bottom-right
-  // corner (provider-anchored sample + surface movement since the sample), so
-  // the plugin's arithmetic never drifts from what the user sees.
-  //
-  // Historical note: this path previously keyed off
-  // `tokenMeter.measure().surfaceTokens` — the UNANCHORED meter-node sum —
-  // rejecting `totalTokens` because its usage baseline inflates and resets
-  // after each compaction. `projectedTokens` keeps a provider anchor while
-  // staying responsive to surface churn (compactions drop the figure the
-  // moment a span is shadowed), so the original objection no longer applies.
-  // When the reading is unavailable (fresh session with no usage sample yet,
-  // or a trimmed composition without the projection registry) we fall back to
-  // `surfaceTokens` — the closest same-caliber substitute — before giving up
-  // to the char estimator.
-  let totalTokens = getProjectedTokens(ctx, session)
-  // Measurement snapshot used for NODE-BY-NODE region selection: prefer the
-  // same-caliber `measure()` snapshot when a projection registry is not
-  // driving the basis (or is unavailable), otherwise reuse the meter
-  // snapshot for a consistent caliber across the selection path.
   const meter = ctx.get('tokenMeter')
-  let measurement
-  if (meter !== undefined && typeof meter.measure === 'function') {
-    try {
-      const measured = meter.measure(session)
-      if (measured !== undefined && measured !== null) {
-        measurement = measured
-        if (totalTokens === undefined) {
-          totalTokens = (Number.isFinite(measured.surfaceTokens) && measured.surfaceTokens > 0)
-            ? measured.surfaceTokens
-            : undefined
-        }
-      }
-    } catch {
-      // leave `totalTokens` as-is (possibly already set from the projection)
-    }
-  }
-  // Region selection: PREFER the same-caliber meter-node selector (prices each
-  // candidate from the very `measure()` snapshot (when that snapshot backs
-  // `totalTokens`) — so the budget is always reachable and the boundary
-  // well-defined). When the basis is the projection-derived `projectedTokens`,
-  // the snapshot is used purely for node-by-node pricing, decoupled from the
-  // scalar basis. The
-  // `maxRegionNodes` cap CLAMPS an oversized 0.ratio head-span down to the
-  // largest serviceable head-aligned prefix so the builtin engine's replay cap
-  // is never tripped and a region is ALWAYS committable on a threshold trip.
-  // Fall back to the legacy char-heuristic variant only when no measurement
-  // snapshot is available (tokenMeter absent). See the selectors' docs.
   const maxRegionNodes = (settings.maxRegionNodes !== undefined && Number.isFinite(Number(settings.maxRegionNodes)))
     ? Number(settings.maxRegionNodes)
     : undefined
-  // Prefer the tail-retaining selector when a measurement snapshot exists: it
-  // walks the node prices backward from the newest entry accumulating tokens
-  // until `>= retainLatestTokens`, snapping the cutoff to a preceding
-  // `user/message` boundary. This is exactly the "keep latest N tokens
-  // verbatim, send everything older in one batch to the LLM" semantic the
-  // user-facing `retainLatestTokens` knob promises.
+
+  // LOOP COMPACTION (2026-09 semantics — user requirement: "never skip because
+  // a prediction says the span cannot pull the total below the threshold;
+  // compact repeatedly until the context is below the threshold").
   //
-  // FALLBACK (legacy `selectEarliestByTokens`): when no measurement snapshot
-  // is available (tokenMeter absent), use the char-heuristic variant — it
-  // prices from `estimateSessionTokens` and applies the same `maxRegionNodes`
-  // clamp for the same bounded-region guarantee.
-  const region = (measurement !== undefined)
-    ? selectRetainingLatestTokens(session, settings.retainLatestTokens, measurement)
-    : (() => {
-        // DEGENERATE FALLBACK (tokenMeter absent): express the retention
-        // semantic via the char-estimated total. The head to compact is at
-        // most (totalEstimated − retainLatestTokens); pass THAT absolute
-        // head-budget to the legacy selector, which walks from the head
-        // accumulating until the budget is consumed. When the retention
-        // budget exceeds the estimated total (tiny session), the head budget
-        // clamps to 0 and the selector trivially returns null — no compaction.
-        if (typeof totalTokens !== 'number' || !Number.isFinite(totalTokens) || totalTokens <= 0) return null
-        const headBudget = Math.max(0, Math.round(totalTokens - settings.retainLatestTokens))
-        if (headBudget <= 0) return null
-        return selectEarliestByTokens(session, headBudget, maxRegionNodes)
-      })()
-  if (region === null) {
-    ctx.logger.debug(`[force-compact] ${session.id}: no region to compact retaining ~${settings.retainLatestTokens} latest tokens (basis=${totalTokens == null ? 'unknown(fallback est)' : totalTokens}${measurement !== undefined ? `, surface nodes=${measurement.nodes?.length}, surfaceTokens=${typeof measurement.surfaceTokens === 'number' ? measurement.surfaceTokens : '?'}` : ''})`)
-    return false
-  }
-
-  // ---- Surface-consistency CROSS-CHECK (ported from the official
-  //  `compaction-basic` `prepareCompaction`) -------------------------------
-  // The meter's priced snapshot MUST align position-for-position with the
-  // session's current surface nodes. When a concurrent modification landed a
-  // node between the `measure()` above and selection completion, the two
-  // disagree; proceeding would price a STALE span. Refuse the compaction
-  // attempt entirely (next step retries on a fresh snapshot) rather than pay
-  // for a summarization of the wrong bytes.
-  // NOTE: `measurement.nodes` entries are OBJECTS shaped `{ seq, tokens }`
-  // (per-node pricing), whereas `session.surface.nodes` is the bare SEQUENCE
-  // of surface-node seqs. Compare BY EXTRACTED SEQ, element for element — the
-  // meter snapshot is taken microseconds earlier, so a concurrent append or
-  // replace landing in between shows up here as either a length difference or
-  // a seq divergence at some position. (A naive `element !== surfaceNodes[i]`
-  // comparison is WRONG here: it compares an object to a number and ALWAYS
-  // diverges, refusing every single compaction — the live-observed symptom
-  // "priced=49 vs current=49 nodes" yet REFUSED.)
-  const surfaceNodes = (session.surface && Array.isArray(session.surface.nodes)) ? session.surface.nodes : []
-  const pricedNodes = (measurement !== undefined && Array.isArray(measurement.nodes)) ? measurement.nodes : null
-  const misaligned = pricedNodes.length !== surfaceNodes.length
-    || pricedNodes.some((node, index) => node === null || typeof node !== 'object'
-      || typeof node.seq !== 'number' || node.seq !== surfaceNodes[index])
-  if (pricedNodes !== null && misaligned) {
-    ctx.logger.debug(
-      `[force-compact] ${session.id}: token-meter surface does not match the current session surface ` +
-      `(priced=${pricedNodes.length} vs current=${surfaceNodes.length} nodes) — REFUSING this compaction ` +
-      `attempt rather than summarize a stale span; retrying on the next step.`
-    )
-    return false
-  }
-
-  // ---- Official PAIRING BOUNDARY GATE (ported from the official
-  //  `validateSurfaceRegion`) ----------------------------------------------
-  // Before spending a summarization round-trip, verify BOTH bounds are
-  // tool-pairing balanced on the CURRENT surface (the precise per-event
-  // ledger, not an assumption about the selection having done its job). A
-  // candidate that would split a step's tool-call/result pair is refused
-  // HERE (fail-loud, logged) — the session core's own replace validation
-  // remains the last line of defense behind this gate.
-  const validated = validateSurfaceRegionSafe(session, region.start, region.end)
-  if (validated === null) {
-    ctx.logger.debug(
-      `[force-compact] ${session.id}: selected span seq ${region.start}..${region.end} FAILED the official ` +
-      `surface/balance validation (unknown bound, inverted index, or an unbalanced tool-pairing cut) — ` +
-      `REFUSING this compaction attempt; the session core's own replace validation remains the safety net.`
-    )
-    return false
-  }
-
-  // THRESHOLD-AWARE SHRINK GATE (root fix for the low-threshold dead loop).
-  // Predict whether compacting this region can ACTUALLY pull the session below
-  // `autoThresholdTokens` before paying for a summarization LLM call. When the
-  // chosen region is too small relative to the total — i.e. even removing it
-  // WHOLE would leave total >= threshold — this compaction cannot achieve the
-  // goal, so attempting it just burns an LLM call and (because total hardly
-  // drops) re-arms the same gate on the next step: the "send 3 times, third
-  // wedges" storm. Skip early and let the request proceed.
-  //
-  // Only applied when we KNOW the total (tokenMeter available). With an unknown
-  // total there is no threshold comparison to make, so we proceed normally.
-  // This gate intentionally serves BOTH the auto-threshold path AND the
-  // explicit `/force-compact` path (both funnel here), so a command that
-  // cannot shrink below the threshold is likewise deferred rather than spammed.
-  if (totalTokens !== undefined && totalTokens >= settings.autoThresholdTokens) {
-    let regionTokens
-    try {
-      regionTokens = estimateRegionTokens(meter, session, region, measurement)
-    } catch {
-      regionTokens = 0 // a measurement failure means "skip the shrink gate"; the inner try/catch handles the eventual compaction.
+  // The old threshold-aware shrink gate (skip when `total − region >=
+  // threshold`) is REMOVED: its arithmetic folded the provider-reported usage
+  // baseline into `total` while a compaction only trims the surface, so a
+  // baseline-inflated reading parked a compressible session above the
+  // threshold forever. Instead we compact REPEATEDLY: each round re-reads the
+  // pressure basis against the CURRENT surface (a committed round shrank it),
+  // re-selects a fresh region, and commits. The loop exits when
+  //   (a) the projected total drops below `autoThresholdTokens` — the target —
+  //       checked from the SECOND round on (the FIRST round always attempts a
+  //       compaction so the queued `/force-compact` path keeps its explicit
+  //       "compact even below the threshold" contract);
+  //   (b) no compactable region remains (the surface is fully under the
+  //       retention budget — nothing left to condense); or
+  //   (c) a round fails to commit (a repeat attempt would retry the same
+  //       shape and burn another summarization call for nothing).
+  // `MAX_COMPACTION_ROUNDS` is a hard belt-and-braces ceiling so a pathological
+  // provider baseline can never trigger an unbounded summarization spend.
+  let committedAny = false
+  for (let round = 0; round < MAX_COMPACTION_ROUNDS; round += 1) {
+    // Pressure basis — PROJECTED TOKENS (the SAME reading the harness renders
+    // in the bottom-right corner): provider-anchored sample + surface movement
+    // since the sample, so the loop's arithmetic never drifts from what the
+    // user sees, and compactions drop the figure the moment a span is
+    // shadowed. When the reading is unavailable we fall back to the meter's
+    // `surfaceTokens` (closest same-caliber substitute) before the char
+    // estimator takes over inside the legacy selector.
+    let totalTokens = getProjectedTokens(ctx, session)
+    // Measurement snapshot for NODE-BY-NODE region selection — re-taken every
+    // round because the previous round's commit changed the surface.
+    let measurement
+    if (meter !== undefined && typeof meter.measure === 'function') {
+      try {
+        const measured = meter.measure(session)
+        if (measured !== undefined && measured !== null) {
+          measurement = measured
+          if (totalTokens === undefined) {
+            totalTokens = (Number.isFinite(measured.surfaceTokens) && measured.surfaceTokens > 0)
+              ? measured.surfaceTokens
+              : undefined
+          }
+        }
+      } catch {
+        // leave `totalTokens` as-is (possibly already set from the projection)
+      }
     }
-    // NOTE ON CAP-CLAMPING WITH TAIL RETENTION: unlike the legacy
-    // ratio-of-total selector (where a capped head-span had to be deliberately
-    // bypassed because committing it was the ONLY way to make headway), the
-    // new tail-retention semantic ALREADY bounds the retained side. When a
-    // measurement snapshot is present, `selectRetainingLatestTokens` returns a
-    // region whose head-span is AT MOST (windowSum − retainLatestTokens)
-    // tokens wide — inherently a bounded head. If THAT bound is still too big
-    // to cross the threshold, skipping is CORRECT here: retrying the SAME
-    // region next step changes nothing (nothing shrunk), so deferring avoids
-    // burning repeated summarization calls. We therefore DO NOT special-case
-    // a "capped head-span" branch — the math is simpler and correct.
-    if (typeof regionTokens === 'number' && regionTokens > 0 && totalTokens - regionTokens >= settings.autoThresholdTokens) {
-      ctx.logger.debug(
-        `[force-compact] ${session.id}: threshold-aware gate — retained-tail region (~${regionTokens} tokens; retains ~${settings.retainLatestTokens} latest tokens) `
-        + `cannot pull total ~${totalTokens} below threshold ${settings.autoThresholdTokens} `
-        + `(would still be ~${totalTokens - regionTokens}); SKIPPING compaction, letting the request proceed`
+    // TARGET REACHED — stop looping once the projection is back below the
+    // threshold (from the SECOND round onward; the first round always tries a
+    // compaction so an explicit `/force-compact` still runs below the gate).
+    if (round > 0 && typeof totalTokens === 'number' && Number.isFinite(totalTokens) && totalTokens < settings.autoThresholdTokens) {
+      ctx.logger.info(
+        `[force-compact] ${session.id}: loop compaction — after ${round + 1} round(s) the projected context ~${totalTokens} tokens is below threshold ${settings.autoThresholdTokens}; target reached`
       )
-      return false
+      break
     }
-  }
 
-  ctx.logger.debug(
-    `[force-compact] ${session.id}: compacting head spanning seqs ${region?.start}..${region?.end} `
-    + `while retaining the latest ~${settings.retainLatestTokens} tokens, via ${backend?.kind} backend (totalTokens=${totalTokens})`
-    + ` | REGION-PICK budget=${settings.retainLatestTokens} `
-    + `crossingAccBefore=${region.crossingAccBefore} `
-    + `crossingNodeSize=${region.crossingNodeSize} `
-    + `crossingAccAfter=${region.crossingAccAfter} `
-    + `boundaryKind=${region.boundaryKind ?? 'unknown'} `
-    + `retainedTokens(after-boundary-snap)=${region.retainedTokens}`
-  )
-  try {
-    // LIVE UI SIGNAL — PIN RED "compressing" BEFORE the region compaction
-    // commits. This single site covers BOTH pre-step trigger paths (queued
-    // `/force-compact` flag and the auto token-threshold gate), since both
-    // funnel through `compactRetainingLatest`. Publishers swallow their own
-    // failures — the messenger can never affect whether the compaction itself
-    // commits.
-    await publishCompressing(ctx)
-    // P1 — forward `sourceCommandId` as the 5th positional arg (official
-    // `compactRegion(start, end, agent, signal, sourceCommandId)` and the
-    // builtin equivalent both absorb it).
-    const result = await backend.compactRegion(region.start, region.end, agent, signal, sourceCommandId)
-    if (result === undefined || result === null) {
-      ctx.logger.debug(`[force-compact] ${session.id}: retained-tail compaction committed nothing via ${backend?.kind}`)
-      return false
+    // Region selection — prefer the same-caliber meter-node selector (tail
+    // retention: walk node prices backward from the newest entry until
+    // `>= retainLatestTokens`, snap the cutoff to a preceding balanced
+    // boundary; everything before it is the head span to compact). When no
+    // measurement snapshot exists (tokenMeter absent), fall back to the legacy
+    // char-heuristic selector under the same `retainLatestTokens` budget.
+    // `maxRegionNodes` clamps an oversized head span so the builtin engine's
+    // replay cap is never tripped and a region is ALWAYS committable.
+    const region = (measurement !== undefined)
+      ? selectRetainingLatestTokens(session, settings.retainLatestTokens, measurement)
+      : (() => {
+          if (typeof totalTokens !== 'number' || !Number.isFinite(totalTokens) || totalTokens <= 0) return null
+          const headBudget = Math.max(0, Math.round(totalTokens - settings.retainLatestTokens))
+          if (headBudget <= 0) return null
+          return selectEarliestByTokens(session, headBudget, maxRegionNodes)
+        })()
+    if (region === null) {
+      if (round > 0) {
+        ctx.logger.debug(
+          `[force-compact] ${session.id}: loop compaction — no more region to compact after ${round + 1} round(s); stopping (total=${totalTokens == null ? 'unknown(fallback est)' : totalTokens})`
+        )
+      } else {
+        ctx.logger.debug(`[force-compact] ${session.id}: no region to compact retaining ~${settings.retainLatestTokens} latest tokens (basis=${totalTokens == null ? 'unknown(fallback est)' : totalTokens}${measurement !== undefined ? `, surface nodes=${measurement.nodes?.length}, surfaceTokens=${typeof measurement.surfaceTokens === 'number' ? measurement.surfaceTokens : '?'}` : ''})`)
+      }
+      break
     }
-    // COMMITTED — range shadowed + summary added.
-    // Pin GREEN "done"; the next model step's `llm/stream` watermark replaces
-    // it with a fresh random working pair shortly after (cadence < 3 s, no timer).
-    await publishDone(ctx)
-    ctx.logger.info(
-      `[force-compact] ${session.id}: retained-latest-${settings.retainLatestTokens}-tokens compaction (${backend?.kind}) `
-      + `shadowed ${result.shadowedSeqs?.length ?? '?'} nodes (~${result.shadowedTokenCount ?? '?'} tokens) `
-      + `spanning seqs ${region?.start}..${region?.end}`,
+
+    // ---- Surface-consistency CROSS-CHECK (ported from the official
+    //  `compaction-basic` `prepareCompaction`) -------------------------------
+    // The meter's priced snapshot MUST align position-for-position with the
+    // session's current surface nodes. A concurrent modification between
+    // `measure()` and selection would price a STALE span — refuse this round.
+    const surfaceNodes = (session.surface && Array.isArray(session.surface.nodes)) ? session.surface.nodes : []
+    const pricedNodes = (measurement !== undefined && Array.isArray(measurement.nodes)) ? measurement.nodes : null
+    const misaligned = (pricedNodes !== null)
+      && (pricedNodes.length !== surfaceNodes.length
+        || pricedNodes.some((node, index) => node === null || typeof node !== 'object'
+          || typeof node.seq !== 'number' || node.seq !== surfaceNodes[index]))
+    if (pricedNodes !== null && misaligned) {
+      ctx.logger.debug(
+        `[force-compact] ${session.id}: loop compaction round ${round + 1} — token-meter surface does not match the current session surface ` +
+        `(priced=${pricedNodes.length} vs current=${surfaceNodes.length} nodes) — REFUSING this attempt rather than summarize a stale span.`
+      )
+      break
+    }
+
+    // ---- Official PAIRING BOUNDARY GATE (ported from `validateSurfaceRegion`)
+    // Verify BOTH bounds are tool-pairing balanced on the CURRENT surface
+    // before spending a summarization round-trip; an unbalanced cut is refused.
+    const validated = validateSurfaceRegionSafe(session, region.start, region.end)
+    if (validated === null) {
+      ctx.logger.debug(
+        `[force-compact] ${session.id}: loop compaction round ${round + 1} — selected span seq ${region.start}..${region.end} FAILED the official ` +
+        `surface/balance validation (unknown bound, inverted index, or an unbalanced tool-pairing cut) — REFUSING this attempt.`
+      )
+      break
+    }
+
+    ctx.logger.debug(
+      `[force-compact] ${session.id}: loop compaction round ${round + 1}/${MAX_COMPACTION_ROUNDS} — compacting head spanning seqs ${region?.start}..${region?.end} `
+      + `while retaining the latest ~${settings.retainLatestTokens} tokens, via ${backend?.kind} backend (totalTokens=${totalTokens})`
+      + ` | REGION-PICK budget=${settings.retainLatestTokens} `
+      + `crossingAccBefore=${region.crossingAccBefore} `
+      + `crossingNodeSize=${region.crossingNodeSize} `
+      + `crossingAccAfter=${region.crossingAccAfter} `
+      + `boundaryKind=${region.boundaryKind ?? 'unknown'} `
+      + `retainedTokens(after-boundary-snap)=${region.retainedTokens}`
     )
-    return true
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    ctx.logger.warn(`[force-compact] ${session.id}: retained-tail compaction via ${backend?.kind} FAILED — ${message}`)
-    return false
+    try {
+      // LIVE UI SIGNAL — PIN RED "compressing" BEFORE the region compaction
+      // commits. Publishers swallow their own failures, so the messenger can
+      // never affect whether the compaction itself commits.
+      await publishCompressing(ctx)
+      // P1 — forward `sourceCommandId` as the 5th positional arg (official
+      // `compactRegion(start, end, agent, signal, sourceCommandId)` and the
+      // builtin equivalent both absorb it).
+      const result = await backend.compactRegion(region.start, region.end, agent, signal, sourceCommandId)
+      if (result === undefined || result === null) {
+        ctx.logger.debug(
+          `[force-compact] ${session.id}: loop compaction round ${round + 1} committed nothing via ${backend?.kind} — stopping the loop (the next attempt would retry the same shape)`
+        )
+        break
+      }
+      // COMMITTED — range shadowed + summary added. Pin GREEN "done" NOW; the
+      // next model request's `llm/stream` watermark replaces it with a fresh
+      // random working pair shortly after.
+      await publishDone(ctx)
+      committedAny = true
+      ctx.logger.info(
+        `[force-compact] ${session.id}: loop compaction round ${round + 1}/${MAX_COMPACTION_ROUNDS} (${backend?.kind}) `
+        + `shadowed ${result.shadowedSeqs?.length ?? '?'} nodes (~${result.shadowedTokenCount ?? '?'} tokens) `
+        + `spanning seqs ${region?.start}..${region?.end}`,
+      )
+      // Round committed — the loop continues; the next iteration re-reads the
+      // projection and either reports "below threshold" or compacts again.
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      ctx.logger.warn(`[force-compact] ${session.id}: loop compaction round ${round + 1} via ${backend?.kind} FAILED — ${message}`)
+      break
+    }
   }
+  return committedAny
 }
 
 /**

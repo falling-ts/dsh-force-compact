@@ -627,38 +627,6 @@ async function runTransaction(ctx, agent, session, region, signal, settings, sou
   }
   const shadowedTokenCount = regionPrice
 
-  // ---- Threshold-aware SHADOW-SPAN FLOOR ----------------------------------
-  // Mirror of `guard.js`'s threshold-aware shrink gate, applied to the
-  // SELF-SELECTING path (`compactNow` — idle turn-end hook, `/force-compact`
-  // when idle) which otherwise has no equivalent pre-LLM viability check.
-  //
-  // PREDICATE: when a reliable meter-priced total is known (same condition
-  // `guard.js` uses) AND the selected head span is TOO SMALL to drag the total
-  // below `autoThresholdTokens` even when removed wholesale
-  // (`total − span ≥ threshold`), the compaction CANNOT achieve its purpose.
-  // Paying for a summarization call to learn that just re-arms the identical
-  // doomed attempt on the next tick (the idle-path twin of the "threshold-
-  // aware gate — cannot pull total below threshold; SKIPPING" storm the
-  // auto path already suppresses). Skipping here costs nothing — the head
-  // grows naturally and becomes compactable on its own once large enough.
-  //
-  // CALIBER NOTE: `shadowedTokenCount` is now priced from the SAME meter
-  // caliber the fold itself uses (per-node prices from the shared snapshot);
-  // the threshold arithmetic below compares like-for-like figures.
-  // The auto path retains its strict meter pricing unchanged; this floor
-  // merely PREVENTS the idle path from re-entering the same doom.
-  if (currentTotalTokens !== undefined && Number.isFinite(currentTotalTokens)
-      && currentTotalTokens >= settings.autoThresholdTokens
-      && (currentTotalTokens - shadowedTokenCount) >= settings.autoThresholdTokens) {
-    info(ctx,
-      `${session.id}: builtin compaction — threshold-aware floor: shadowed span (~${shadowedTokenCount} est-tokens, char heuristic) `
-      + `cannot pull the total (~${currentTotalTokens} meter-priced) below ${settings.autoThresholdTokens} `
-      + `(removing it wholesale would still leave ~${currentTotalTokens - shadowedTokenCount}). `
-      + `Skipping (no lock opened, no LLM call made) — the head will qualify naturally as it grows. `
-      + `Raise \`retainLatestTokens\` so less of the tail is retained and more of the head becomes compactable.`,
-    )
-    return null
-  }
 
   // ---- Small-span SKIP (above) now applied to the measured span ------------
   if (shadowedTokenCount < MIN_USEFUL_SPAN_TOKENS) {
