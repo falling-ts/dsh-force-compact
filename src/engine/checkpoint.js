@@ -19,6 +19,7 @@ import { readSettings, DEFAULTS } from '../core/settings.js'
 import { resolveCompaction } from './backend.js'
 import { getProjectedTokens, diagnoseProjectedTokensAbsence } from '../core/projected.js'
 import { guardFn, renderCrash, captureThrowSite, appendCrashLine as appendDiag } from '../core/crashnet.js'
+import { sessionEvents } from '../core/session-events.js'
 
 /** Characters per token, mirroring the token meter's coarse estimate. */
 const CHARS_PER_TOKEN = 4
@@ -189,7 +190,7 @@ function estimateSessionTokens(session) {
   // `events`, non-object rows, missing `data`/`message`) degrades each row to
   // 0 rather than throwing. Every deep deref is individually guarded.
   let chars = 0
-  const events = (session && Array.isArray(session.events)) ? session.events : []
+  const events = sessionEvents(session)
   for (const event of events) {
     if (event === null || typeof event !== 'object') continue
     const data = (event.data && typeof event.data === 'object') ? event.data : {}

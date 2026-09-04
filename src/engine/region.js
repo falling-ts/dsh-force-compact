@@ -11,6 +11,7 @@
  */
 
 import { guardFn } from '../core/crashnet.js'
+import { sessionEvents } from '../core/session-events.js'
 import {
   toolPairingBalancedAfterSafe,
   toolPairingBalancedBeforeSafe,
@@ -349,7 +350,7 @@ function __selectRetainingLatestTokensBody(session, retainLatestTokens, measurem
   // everything STRICTLY BEFORE it (positionally) is compacted. Because a node
   // cannot be split, the retained tail may overshoot `budget` by UP TO ONE
   // node's weight — that is the closest achievable "exactly N" boundary.
-  const events = (session && Array.isArray(session.events)) ? session.events : []
+  const events = sessionEvents(session)
   let acc = 0
   let tailStartIdx = total // exclusive: index just AFTER the last retained node
   let crossingAccBefore = -1 // accumulator value JUST BEFORE the crossing node was added (-1 when the walk consumed the whole window)
@@ -523,7 +524,7 @@ function estimateEventTokens(session, seq) {
   // A missing/malformed event (non-array `session.events`, a non-object row, or
   // missing `data` / `message`) degrades to 0 tokens rather than throwing — this
   // estimator feeds a budget decision, never a correctness path.
-  const events = (session && Array.isArray(session.events)) ? session.events : []
+  const events = sessionEvents(session)
   const event = events[seq]
   if (event === undefined || event === null || typeof event !== 'object') return 0
   const data = (event.data && typeof event.data === 'object') ? event.data : {}
@@ -557,7 +558,7 @@ function estimateSurfaceTokens(session) {
   // `data`/`message`) degrades each row to 0 tokens rather than throwing — this
   // estimator feeds a budget decision, never a correctness path.
   let chars = 0
-  const events = (session && Array.isArray(session.events)) ? session.events : []
+  const events = sessionEvents(session)
   for (const event of events) {
     if (event === null || typeof event !== 'object') continue
     const data = (event.data && typeof event.data === 'object') ? event.data : {}

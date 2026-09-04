@@ -37,6 +37,8 @@
  * @module @falling-ts/dsh-force-compact/pairing
  */
 
+import { sessionEvents } from './session-events.js'
+
 /**
  * Incremental balance state for one session surface generation.
  * @typedef {Object} BalanceCache
@@ -81,7 +83,7 @@ function extendCache(session, cache, seqs) {
   const tail = seqs.slice(processed)
   // Validate the unseen tail BEFORE mutating the live cache, so a corrupt
   // append cannot leave a partially advanced state behind.
-  const events = session.events
+  const events = sessionEvents(session)
   const pendingCuts = []
   let inProgressToolCalls = cache.inProgressToolCalls
   for (const seq of tail) {

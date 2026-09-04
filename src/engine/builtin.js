@@ -38,6 +38,7 @@ import { selectEarliestByTokens, selectRetainingLatestTokens } from './region.js
 import { readSettings, DEFAULTS } from '../core/settings.js'
 import { guardFn } from '../core/crashnet.js'
 import { publishDone } from '../core/ui-signal.js'
+import { sessionEvents, sessionEventAt, hasSessionEventStore } from '../core/session-events.js'
 
 /**
  * ONE-SHOT LOAD MARKER — proves WHICH built engine is actually loaded on a
@@ -252,7 +253,7 @@ function priceSurfaceNode(event) {
  * @returns {number|null}
  */
 function priceRegionFromMeasurement(session, region, measurement) {
-  const events = (session && Array.isArray(session.events)) ? session.events : []
+  const events = sessionEvents(session)
   const surfaceNodes = (session && session.surface && Array.isArray(session.surface.nodes)) ? session.surface.nodes : []
   const firstIdx = surfaceNodes.indexOf(region.start)
   const lastIdx = surfaceNodes.lastIndexOf(region.end)
@@ -457,8 +458,8 @@ async function __compactNowBuiltinBody(ctx, agent, signal, sourceCommandId, opts
     // successful compaction is the classic trigger.
     const surfNodes = (session.surface && Array.isArray(session.surface.nodes)) ? session.surface.nodes : []
     let headIsCheckpoint = false
-    if (surfNodes.length > 0 && Array.isArray(session.events)) {
-      const headEvent = session.events[surfNodes[0]]
+    if (surfNodes.length > 0 && hasSessionEventStore(session)) {
+      const headEvent = sessionEventAt(session, surfNodes[0])
       const headSource = headEvent && headEvent.data && typeof headEvent.data === 'object' ? headEvent.data.source : undefined
       headIsCheckpoint = !!(headSource && typeof headSource === 'object' && headSource.plugin === 'force-compact-builtin')
     }
@@ -954,7 +955,7 @@ function estimateSurfaceTokens(session) {
   // or `message`) degrades to 0 instead of throwing — this feeds a
   // diagnostics/cooldown decision, never a correctness path.
   let chars = 0
-  const events = (session && Array.isArray(session.events)) ? session.events : []
+  const events = sessionEvents(session)
   for (const event of events) {
     if (event === null || typeof event !== 'object') continue
     const data = (event.data && typeof event.data === 'object') ? event.data : {}
@@ -1057,7 +1058,7 @@ function selectHeadAnchoredRegion(settings, session, measurement, retainOverride
 
 /** Local surface-sum estimator (module-private copy of the char heuristic). */
 function estimateSurfaceTokensLocal(session) {
-  const events = (session && Array.isArray(session.events)) ? session.events : []
+  const events = sessionEvents(session)
   let chars = 0
   for (const event of events) {
     if (event === null || typeof event !== 'object') continue
@@ -1106,7 +1107,7 @@ function projectRegion(session, region) {
   const segment = (firstIdx >= 0 && lastIdx >= firstIdx)
     ? nodes.slice(firstIdx, lastIdx + 1)
     : []
-  const events = (session && Array.isArray(session.events)) ? session.events : []
+  const events = sessionEvents(session)
   const messages = []
   const shadowedSeqs = []
   for (const seq of segment) {
@@ -1234,7 +1235,7 @@ function inspectCompactionEntryState(events) {
  * @returns {string|null} a human-readable BUSY NOTE when refused, `null` to proceed.
  */
 function assertNoActiveCompaction(session, stage) {
-  const state = inspectCompactionEntryState((session && Array.isArray(session.events)) ? session.events : [])
+  const state = inspectCompactionEntryState(sessionEvents(session))
   const { unmatchedCompactionStart, latestEndSeedSeq } = state
   if (unmatchedCompactionStart === undefined) return null
   if (latestEndSeedSeq !== undefined && latestEndSeedSeq > (unmatchedCompactionStart.seq ?? -1)) {
@@ -1257,7 +1258,7 @@ function currentOpenTurn(session) {
   // events' `turn` field. Must never throw (it runs on every append/close): a
   // missing/non-array `events` or a non-object row degrades to `null` (no open
   // turn), matching the standalone/idle case.
-  const events = (session && Array.isArray(session.events)) ? session.events : []
+  const events = sessionEvents(session)
   for (let i = events.length - 1; i >= 0; i--) {
     const ev = events[i]
     if (ev === null || typeof ev !== 'object') continue

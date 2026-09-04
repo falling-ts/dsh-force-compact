@@ -400,6 +400,19 @@ DeepSeek 适配器（无独立的 llama.cpp 适配器包），再起一份 adapt
 - 每条引擎内部都会做**预提交预览 + 收缩门禁**（各自的 LLM 摘要 + 收缩判定），所以本插件不在持久路径上重复摘要。`engine/checkpoint.js` 本身只做"选区间 + 委派"，不再额外跑一次预览——这是上一版的遗留 bug（曾在此处双重摘要，现已被清理）。
 - Monorepo 集成会把它包进 `src/index.ts`，并新增一个真实组合（REAL-composition）测试：启动仅测试用的 `cordis.yml` 并断言持久的摘要节点；本独立产物是 plain JS，无构建步骤。
 
+## 会话事件读取适配（harness Session 重构兼容，2026-09 增补）
+
+harness 在 0.1.2-rc.1 时代重构了 `Session` 类：**不再暴露公开的 `events` 数组**——
+事件读取走 `session.eventAt(seq)`、全量日志走 `session.snapshotEvents()`（`seq ==
+数组下标` 的连续契约）、消息派生走 `deriveMessages()`。插件此前到处按旧假设
+`session.events` 数组读取，升级后**静默退化为空**：`estimateSessionTokens` 恒 0
+（`rawSweep=0`）、builtin `projectRegion` 恒"no surface messages"、配对账本的
+`eventForSeq` 抛异常（被 SAFE 变体吞成"假定平衡"）。**统一改经
+`src/core/session-events.js`** 提供的 `sessionEvents(session)`（新
+`snapshotEvents()` / 旧 `events` 数组双兼容，永不抛）与 `sessionEventAt(session, seq)`；
+`hasSessionEventStore(session)` 供诊断读取做闸门。**新增任何读会话事件的代码一律
+用这两个 helper，禁止直接访问 `session.events`。**
+
 ## 会话数据模型——本插件往什么里追加
 
 会话是 `SessionEvent` 的**事件溯源、仅追加日志**，是唯一事实来源。LLM 历史从不存储；它**派生**自该日志（`deriveMessages()`）。没有独立的"conversation"对象——轮次、步骤、消息、工具调用、压缩、todo、钩子都是同一日志里的行。（完整词汇与 payload 声明：上游 `docs/persistence-catalog` + `docs/subsystems/persistence`；本仓 `docs/context-management-analysis.md` 有浓缩分析。）

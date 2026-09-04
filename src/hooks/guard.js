@@ -42,6 +42,7 @@ import { resolveCompaction } from '../engine/backend.js'
 import { publishCompressing, publishDone } from '../core/ui-signal.js'
 import { guardFn, renderCrash, captureThrowSite, appendCrashLine as appendDiag } from '../core/crashnet.js'
 import { getProjectedTokens } from '../core/projected.js'
+import { sessionEvents } from '../core/session-events.js'
 
 /**
  * Process-local "force compact now" records, one per session (keyed by
@@ -591,7 +592,7 @@ function estimateSessionTokens(session) {
   // correctness path.
   const CHARS_PER_TOKEN = 4
   let chars = 0
-  const events = (session && Array.isArray(session.events)) ? session.events : []
+  const events = sessionEvents(session)
   for (const event of events) {
     if (event === null || typeof event !== 'object') continue
     let content

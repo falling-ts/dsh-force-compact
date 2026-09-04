@@ -20,6 +20,7 @@ import { getProjectedTokens } from '../core/projected.js'
 import { MAX_COMPACTION_ROUNDS } from '../core/policy.js'
 import { publishCompressing, publishDone } from '../core/ui-signal.js'
 import { guardFn, renderCrash, captureThrowSite, appendCrashLine as appendDiag } from '../core/crashnet.js'
+import { sessionEventAt, hasSessionEventStore } from '../core/session-events.js'
 
 /**
  * Register the global `/force-compact` command. A no-op when the `commands`
@@ -152,8 +153,8 @@ async function __forceCompactCommandBody(ctx, invocation) {
             // (a previous checkpoint?), and the surface size.
             const surfNodes = (session && session.surface && Array.isArray(session.surface.nodes)) ? session.surface.nodes : []
             let headIsCheckpoint = false
-            if (surfNodes.length > 0 && Array.isArray(session.events)) {
-              const headEvent = session.events[surfNodes[0]]
+            if (surfNodes.length > 0 && hasSessionEventStore(session)) {
+              const headEvent = sessionEventAt(session, surfNodes[0])
               const headSource = headEvent && headEvent.data && typeof headEvent.data === 'object' ? headEvent.data.source : undefined
               headIsCheckpoint = !!(headSource && typeof headSource === 'object' && (headSource.plugin === 'force-compact-builtin' || headSource.plugin === 'compact'))
             }
