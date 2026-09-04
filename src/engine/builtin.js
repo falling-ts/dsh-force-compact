@@ -572,8 +572,14 @@ async function runTransaction(ctx, agent, session, region, signal, settings, sou
   }
   const cooledNote = consultFailureCooldown(session.id, currentTotalTokens)
   if (cooledNote !== undefined) {
-    info(ctx, `${session.id}: builtin compaction SKIPPED (cooldown) — ${cooledNote}`)
-    return null
+    // NO REJECTION (2026-09 spec: "never reject after trigger; compact directly
+    // and keep compacting until below the threshold"). The cooldown note is
+    // surfaced for OBSERVABILITY ONLY — it explains WHY recent summarizations on
+    // this session have failed (e.g. a hung 90s stream on a slow local endpoint)
+    // but it no longer suppresses this attempt. The guard loop (hooks/guard.js)
+    // now `continue`s past a failed/empty round and retries, so a failing span
+    // no longer parks the session above the threshold for up to 180s.
+    info(ctx, `${session.id}: builtin compaction — note: ${cooledNote} (NOT skipping — retrying per the no-rejection policy)`)
   }
 
   // ---- Small-span PRE-CHECK (doom avoidance, mirrors official O26) --------

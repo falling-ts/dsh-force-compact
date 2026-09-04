@@ -366,10 +366,19 @@ DeepSeek 适配器（无独立的 llama.cpp 适配器包），再起一份 adapt
     滞留超阈值，2026-09 移除；**post-summary 摘要必须小于被遮蔽区间的 shrink gate 保留，
     它才是防膨胀的最后防线**）。循环停止条件：(a) 第二轮起 `projectedTokens < threshold`
     （首轮无条件执行，保住 `/force-compact` 的强制语义）；(b) 选区为 null（整个表面不超过
-    `retainLatestTokens` 保留预算，无头部可压）；(c) 一轮提交失败（重试同一形状徒劳）。
-    `MAX_COMPACTION_ROUNDS=8`（`src/core/policy.js`）为硬上限，防 provider 基线异常时无限
-    烧摘要调用。保留的物理防呆：surface 一致性交叉校验、配对边界校验、small-span
-    （< `MIN_USEFUL_SPAN_TOKENS`）跳过、replay 消息上限、失败冷却与 busy 锁。
+    `retainLatestTokens` 保留预算，真没有可压的头部——这不是"拒绝"，是无可压对象，保持 `break`）。
+    **2026-09 无拒绝语义（用户规格："触发压缩后不要有任何拒绝，直接执行压缩，如果压缩后还是
+    超过阈值就继续压缩，一直压缩到阈值以下"）**：(c) 一轮提交失败 / 空提交（`compactRegion` 返回
+    null）/ 表面一致性失配 / 配对边界校验失败，全部 **`continue` 重试**（下一轮重新读数 + 重新
+    选区），**不再 `break` 中止**——失败不中止压缩，循环继续直到 `projectedTokens` 压回阈值以下。
+    内置引擎的**失败冷却（`failureCooldown`）已降级为"仅诊断、不拒绝"**：`consultFailureCooldown`
+    只输出一条 note（解释为何近期摘要失败，如本地端点 90s 摘要流挂起），**不再 `return null`
+    跳过本次**——避免一次失败把会话在阈值之上搁置长达 180s。`MAX_COMPACTION_ROUNDS=8`
+    （`src/core/policy.js`）仍是硬上限，防 provider 基线异常 / 摘要持续挂起时无限烧摘要调用
+    （最坏 8 轮 × 90s 摘要超时）。仍 `continue` 重试（而非拒绝）的物理防呆：surface 一致性
+    交叉校验、配对边界校验；仍 `return null` 的资源护栏（非阈值预测，防不可服务的巨型摘要调用，
+    经无拒绝循环重试 8 轮后自然止步）：small-span（< `MIN_USEFUL_SPAN_TOKENS`）跳过、replay
+    消息上限（`MAX_REPLAY_MESSAGES`）；以及 busy 锁（`assertNoActiveCompaction`，防嵌套括号）。
   - 两个参数都**每次请求**通过同步 `settings.get('falling-ts-force-compact')` 读取，因此 `settings.yaml` 的改动在下一次请求即生效。
 - **`/force-compact` 斜杠命令（`commands` 服务，可选依赖）：** 通过 `/` 选择执行，其 handler **不发送模型请求**。Agent **空闲**时经 `compactNow`（owner `null`，空闲手动入口）立即压缩（引擎自身区间选择）；**繁忙**时 `compactNow` 被拒绝，handler 排队一个强制标记（`src/hooks/command.js`）。handler 逻辑：
   - 直接调用 compaction 服务的 `compactNow(agent, invocation.signal)`（事件时经 `ctx.get('compaction')` 实时读取；owner `null`，空闲手动入口）压缩会话——空闲时立即生效，使用引擎自身的区间选择。

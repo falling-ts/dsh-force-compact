@@ -275,11 +275,15 @@ async function __compactRetainingLatestBody(ctx, agent, signal, mode, sourceComm
         || pricedNodes.some((node, index) => node === null || typeof node !== 'object'
           || typeof node.seq !== 'number' || node.seq !== surfaceNodes[index]))
     if (pricedNodes !== null && misaligned) {
+      // NO REJECTION — a stale snapshot means a concurrent modification landed
+      // between `measure()` and selection. The NEXT round re-takes a fresh
+      // snapshot and re-selects, so `continue` (retry) is the correct recovery
+      // rather than abandoning the whole compaction for one stale read.
       ctx.logger.debug(
         `[force-compact] ${session.id}: loop compaction round ${round + 1} — token-meter surface does not match the current session surface ` +
-        `(priced=${pricedNodes.length} vs current=${surfaceNodes.length} nodes) — REFUSING this attempt rather than summarize a stale span.`
+        `(priced=${pricedNodes.length} vs current=${surfaceNodes.length} nodes) — retrying next round with a fresh snapshot rather than summarize a stale span.`
       )
-      break
+      continue
     }
 
     // ---- Official PAIRING BOUNDARY GATE (ported from `validateSurfaceRegion`)
@@ -287,11 +291,15 @@ async function __compactRetainingLatestBody(ctx, agent, signal, mode, sourceComm
     // before spending a summarization round-trip; an unbalanced cut is refused.
     const validated = validateSurfaceRegionSafe(session, region.start, region.end)
     if (validated === null) {
+      // NO REJECTION — an unbalanced cut this round means the selection landed
+      // on a tool-pair boundary that is not balanced at this surface state; the
+      // next round re-selects from the (possibly advanced) surface and may find
+      // a balanced cut. Retry rather than give up on the whole compaction.
       ctx.logger.debug(
         `[force-compact] ${session.id}: loop compaction round ${round + 1} — selected span seq ${region.start}..${region.end} FAILED the official ` +
-        `surface/balance validation (unknown bound, inverted index, or an unbalanced tool-pairing cut) — REFUSING this attempt.`
+        `surface/balance validation (unknown bound, inverted index, or an unbalanced tool-pairing cut) — retrying next round.`
       )
-      break
+      continue
     }
 
     ctx.logger.debug(
@@ -314,10 +322,15 @@ async function __compactRetainingLatestBody(ctx, agent, signal, mode, sourceComm
       // builtin equivalent both absorb it).
       const result = await backend.compactRegion(region.start, region.end, agent, signal, sourceCommandId)
       if (result === undefined || result === null) {
+        // NO REJECTION — a round that committed nothing (skipped / failed) does
+        // not end the compaction. Keep looping: the next round re-reads the
+        // projection and re-selects, so a transient failure (e.g. a hung
+        // summarization stream) is retried until the context is below the
+        // threshold or MAX_COMPACTION_ROUNDS is hit.
         ctx.logger.debug(
-          `[force-compact] ${session.id}: loop compaction round ${round + 1} committed nothing via ${backend?.kind} — stopping the loop (the next attempt would retry the same shape)`
+          `[force-compact] ${session.id}: loop compaction round ${round + 1} committed nothing via ${backend?.kind} — retrying next round (no-rejection policy: keep compacting until below threshold)`
         )
-        break
+        continue
       }
       // COMMITTED — range shadowed + summary added. Pin GREEN "done" NOW; the
       // next model request's `llm/stream` watermark replaces it with a fresh
@@ -333,8 +346,10 @@ async function __compactRetainingLatestBody(ctx, agent, signal, mode, sourceComm
       // projection and either reports "below threshold" or compacts again.
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-      ctx.logger.warn(`[force-compact] ${session.id}: loop compaction round ${round + 1} via ${backend?.kind} FAILED — ${message}`)
-      break
+      ctx.logger.warn(`[force-compact] ${session.id}: loop compaction round ${round + 1} via ${backend?.kind} FAILED — ${message} (retrying next round per the no-rejection policy)`)
+      // NO REJECTION — a thrown round does not end the compaction; the loop
+      // retries (bounded by MAX_COMPACTION_ROUNDS) until below the threshold.
+      continue
     }
   }
   return committedAny
