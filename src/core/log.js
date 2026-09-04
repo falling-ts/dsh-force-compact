@@ -138,15 +138,11 @@ export async function ensureDebugLogger(ctx) {
 
 async function __ensureDebugLoggerBody(ctx) {
   const resolved = (await readSettings(ctx)) ?? { ...DEFAULTS }
-  // Centralize the `debug` gate at the EXPORT boundary: the exporter decides,
-  // per line, whether to persist — reading the live `debug` setting at install
-  // time (and, on the fast path, trusting the cached flag). A `debug === false`
-  // deployment therefore installs nothing and writes nothing: no self-noticing
-  // line, no settings round-trip per emitted line.
-  if (resolved.debug !== true) {
-    debugState.installed = true
-    return
-  }
+  // The `debug` gate lives at the EXPORT boundary and is re-read on EVERY line
+  // (2026-09: no cache — a settings.yaml flip applies to the very next line,
+  // even when the exporter was installed under the opposite value). Only the
+  // `logFile` PATH is fixed at install time (the exporter is a singleton);
+  // changing the path takes effect on the next process start.
   if (!resolved.logFile) {
     ctx.logger.warn('[force-compact] debug logging enabled but no log file path configured — nothing will be written')
     debugState.installed = true
@@ -160,23 +156,21 @@ async function __ensureDebugLoggerBody(ctx) {
     return
   }
 
-  // Take a SINGLE synchronous snapshot of the `debug` setting on the very first
-  // exported line (cheap `getSync`/`get`, cached forever-after). This makes the
-  // export-boundary gate race-free: `debug === false` deployments persist
-  // NOTHING even for the first line, because the snapshot resolves synchronously
-  // rather than deferring to a background read. Thereafter the cached boolean
-  // drives the gate at zero per-line cost; a mid-process `debug` flip takes
-  // effect on the next exporter reinstall.
-  let debugGate
+  // The exporter re-checks the LIVE `debug` setting on EVERY line (2026-09: no
+  // mid-process cache — "以设置里的为准/严禁中间有缓存"). The gate resolves
+  // synchronously through `getSync` (or the sync-backed `get`) so a `debug
+  // === false` deployment persists NOTHING, and flipping `debug` in
+  // settings.yaml takes effect on the very next line — no restart, no
+  // reinstall. The cost is one in-memory settings read per persisted line.
   const exporter = {
     colors: false,
     levels: { default: 3 },
     export: (message) => {
       // Final persistence gate lives HERE (the export boundary): a line is
-      // written iff it carries the plugin marker AND the `debug` setting is on.
+      // written iff it carries the plugin marker AND the LIVE `debug` setting
+      // is on.
       if (!shouldInclude(message)) return
-      if (debugGate === undefined) debugGate = syncDebugSettingSnapshot(ctx)
-      if (!debugGate) return
+      if (!liveDebugSetting(ctx)) return
       void writeLine(filePath, renderLine(message))
     },
   }
@@ -199,17 +193,14 @@ async function __ensureDebugLoggerBody(ctx) {
 const debugState = { attempted: false, installed: false }
 
 /**
- * Synchronously snapshot the live `debug` setting exactly once (module-level
- * cache), resolving either through the `settings` service's synchronous read
- * (`getSync`) or its ordinary read (returned synchronously when backed by a
- * local store). Returns a settled boolean (never throws): missing values fall
- * back to the composition default. Settling here at the FIRST exported line
- * keeps the steady-state `export()` path free of any settings round-trip; a
- * mid-process `debug` flip takes effect on the next exporter reinstall.
+ * Read the LIVE `debug` setting synchronously on every call (2026-09: no
+ * module-level cache — settings.yaml is the single source of truth and a flip
+ * must take effect on the very next exported line). Resolves through the
+ * `settings` service's synchronous read (`getSync`), or its ordinary read when
+ * backed by a local store. Returns a settled boolean (never throws): missing
+ * values fall back to the composition default.
  */
-let cachedDebug
-function syncDebugSettingSnapshot(ctx) {
-  if (cachedDebug !== undefined) return cachedDebug
+function liveDebugSetting(ctx) {
   try {
     const raw = ctx.get?.('settings')
     let v
