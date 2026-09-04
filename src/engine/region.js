@@ -49,41 +49,31 @@ function __selectRegionBody(session, config) {
   const compactableCount = keepFromIdx - 1
   if (compactableCount < config.minCompactableNodes) return null
 
-  // The compactable PREFIX is indices [0 .. keepFromIdx-2]. Emit its bounds as
-  // the MIN and MAX SEQ BY VALUE (not by array position). After a prior
-  // checkpoint REPLACES earlier nodes but APPENDS the new checkpoint node at a
-  // later log position, the surviving early nodes keep their ORIGINAL (higher)
-  // seqs at HIGHER array indices than the checkpoint — so `surface.nodes` is
-  // NOT necessarily in ascending-seq order. Reading `nodes[0]` / `nodes[i]`
-  // directly could therefore yield `start > end` (an INVERTED span), which
-  // downstream `compactRegion` rejects or mishandles. Taking the value-extremes
-  // guarantees `start <= end`, and the region still denotes the same leading
-  // segment of the projection (bounds are inclusive index segments interpreted
-  // by the session core, so the seq ORDERING within the segment is irrelevant).
-  // Snap the OUTWARD bounds to TOOL-PAIRING BALANCED positions so the
-  // replacement stays balanced: the LEADING position's cut-before must be
-  // balanced (trivially satisfied at position 0) and the TRAILING position's
-  // cut-after must be balanced (zero tool calls left dangling). Widen `start`
-  // downward / shrink `end` upward within the prefix to the nearest balanced
-  // positions; when neither bound can be made balanced (degenerate prefix),
-  // fall back to the raw value extremes so a valid span is preserved.
+  // The compactable PREFIX is indices [0 .. keepFromIdx-2]. Snap the two bounds
+  // to TOOL-PAIRING BALANCED positions so the replacement stays balanced: the
+  // LEADING position's cut-before must be balanced (trivially satisfied at
+  // position 0) and the TRAILING position's cut-after must be balanced (zero
+  // tool calls left dangling). The bounds are returned as POSITIONAL nodes
+  // (`prefix[startIdx]` / `prefix[endIdx]`), NOT as seq-VALUE extremes or a
+  // value comparison: the recorded surface NODE ORDER follows replacement
+  // chronology rather than seq — a committed compaction APPENDS its checkpoint
+  // at a HIGHER seq but EARLIER array position, so a checkpoint seq can EXCEED
+  // a surviving early node's seq (`60698@idx12 .. 60702@idx0` observed live
+  // after a successful compaction). Every downstream consumer
+  // (`validateSurfaceRegion`, `validateReplacementBounds`, the official fold)
+  // resolves both bounds by INDEX (indexOf/lastIndexOf), so a value-normalized
+  // `{min, max}` pair can still resolve to an INVERTED span ("start is after
+  // end") — and the old `snappedStart > snappedEnd` value test was ALWAYS true
+  // once the leading node carried the newer (larger) seq, silently starving the
+  // `session/flush` checkpoint path into `null` forever.
   const prefix = nodes.slice(0, keepFromIdx - 1)
-  let start = Infinity
-  let end = -Infinity
-  for (const seq of prefix) {
-    if (seq < start) start = seq
-    if (seq > end) end = seq
-  }
-  if (!Number.isFinite(start) || !Number.isFinite(end)) return null
-  let snappedStart = start
-  let snappedEnd = end
-  // Leading bound: shrink the leading segment until its first node's cut-BEFORE
-  // is balanced (at position 0 this is trivially true).
+  // Leading bound: position 0's cut-before is trivially balanced (the very
+  // first node can straddle no earlier tool call), so this walk normally stops
+  // immediately; it is kept as a defensive guard for degenerate surfaces.
   let startIdx = 0
   while (startIdx < prefix.length && !toolPairingBalancedBeforeSafe(session, prefix[startIdx])) {
     startIdx += 1
   }
-  if (startIdx < prefix.length) snappedStart = prefix[startIdx]
   // Trailing bound: pull the tail inward until the last node's cut-AFTER is
   // balanced (any `user/message` position qualifies; so do tool-boundary-closed
   // positions such as a finished step's last node).
@@ -91,8 +81,15 @@ function __selectRegionBody(session, config) {
   while (endIdx > startIdx && !toolPairingBalancedAfterSafe(session, prefix[endIdx])) {
     endIdx -= 1
   }
-  snappedEnd = prefix[endIdx]
-  if (snappedStart > snappedEnd) return null
+  const snappedStart = prefix[startIdx]
+  const snappedEnd = prefix[endIdx]
+  // Guard against a degenerate prefix: missing nodes, or a collapsed single-node
+  // span (nothing to compact — the session core rejects `start === end`). The
+  // backward walk can never move `endIdx` below `startIdx` (the loop guard
+  // `endIdx > startIdx`), so a `startIdx > endIdx` check is purely defensive.
+  if (snappedStart === undefined || snappedEnd === undefined) return null
+  if (startIdx > endIdx) return null
+  if (snappedStart === snappedEnd) return null
   return { start: snappedStart, end: snappedEnd }
 }
 
@@ -281,7 +278,17 @@ function __selectEarliestByMeasurementsBody(session, ratio, measurement, maxRegi
   const end = endNode.seq
   if (!Number.isInteger(start) || !Number.isInteger(end)) return null
   if (start === end) return null
-  return { start: Math.min(start, end), end: Math.max(start, end) }
+  // Return POSITIONAL order (start = the surface's leading node, end = the
+  // settled crossing node), NOT seq-value order: `session.surface.nodes` is
+  // NOT guaranteed ascending by seq (a committed compaction splices its
+  // checkpoint user/message onto the leading positions, so a checkpoint seq
+  // can exceed a surviving early node's seq while sitting EARLIER in the
+  // array). Every downstream consumer — `validateSurfaceRegion`,
+  // `validateReplacementBounds`, the official fold — resolves both bounds by
+  // INDEX (indexOf/lastIndexOf), so normalizing by seq VALUE here would emit
+  // an inverted span (observed live: `60698@idx12 .. 60702@idx0` rejected as
+  // "start is after end"). Positional order keeps `startIdx(0) <= endIdx`.
+  return { start, end }
 }
 
 /**
@@ -426,9 +433,22 @@ function __selectRetainingLatestTokensBody(session, retainLatestTokens, measurem
       ? 'user-message'
       : 'pairing'
   }
+  // Return POSITIONAL order (start = the surface's leading node at index 0,
+  // end = the settled crossing node at index `endIdx`), NOT seq-value order:
+  // `session.surface.nodes` is NOT guaranteed ascending by seq (a committed
+  // compaction splices its checkpoint user/message onto the leading positions,
+  // so a checkpoint seq can EXCEED a surviving early node's seq while sitting
+  // EARLIER in the array — observed live: `60698@idx12 .. 60702@idx0` after a
+  // successful compaction). Every downstream consumer — `validateSurfaceRegion`,
+  // `validateReplacementBounds`, the official fold — resolves both bounds by
+  // INDEX (indexOf/lastIndexOf), so normalizing by seq VALUE here would emit an
+  // inverted span rejected as "start is after end". Positional order keeps
+  // `startIdx(0) <= endIdx`. The values as-is still identify the same nodes,
+  // because `start = nodes[0].seq` and `end = nodes[endIdx].seq` keep their
+  // positional identity.
   return {
-    start: Math.min(start, end),
-    end: Math.max(start, end),
+    start,
+    end,
     retainedTokens,
     crossingAccBefore,
     crossingNodeSize,
