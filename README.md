@@ -119,7 +119,11 @@ badge beside the turn:
 - **Red "compressing"** — just before a compaction commits (screen text is Chinese);
 - **Green "done"** — the instant a compaction lands; 3 s later a fresh random working line
   takes over;
-- **Blue "working"** — otherwise a rotating playful one-liner.
+- **Blue "working"** — otherwise a rotating playful one-liner;
+- **Cleared at conversation end** — when the agent goes `idle` (the turn is fully
+  done), an empty text (isImportant) is pushed: the badge text is wiped and the
+  phase color removed, restoring the official look. Replaces the former
+  conversation-START forced working-pair override (removed 2026-09).
 
 Publishers are fail-safe: a messenger glitch can never disturb the actual compaction.
 
@@ -286,7 +290,8 @@ without a restart.*
 ![Conversation page — red "compressing" badge pinned beside an in-flight turn](assets/live-conversation.png)
 
 *Conversation page — the LiveUI signal paints three states (red: compressing / green: done /
-blue: working); the green banner fades after about 3 s back to a random working line.*
+blue: working); the green banner fades after about 3 s back to a random working line; at
+conversation end the badge is cleared (empty text) back to the official look.*
 
 ---
 

@@ -377,6 +377,28 @@ function mintCompactionId() {
 }
 
 /**
+ * Mint a stable message identity for the checkpoint `user/message` payload.
+ *
+ * The `user/message` shape REQUIRES a non-empty `id` (and `role: 'user'`):
+ * the load path (`adoptSessionEvent` → `assertMessageEventShape`) rejects an
+ * entire log whose `user/message` lacks an identified message, while the
+ * append path does NOT validate message shape (it only checks the surface
+ * contract) — so a checkpoint written without an `id` commits fine but turns
+ * the whole log corrupt on reload ("lacks an identified message"). The
+ * official engine gets this for free from `createUserMessage(...)`; this
+ * plain-JS engine cannot import that symbol, so it mints an equivalent bare
+ * UUID. Deliberately no `fc-` prefix: `MessageId` is a plain string in the
+ * core shape.
+ */
+function mintMessageId() {
+  try {
+    const crypto = globalThis.crypto
+    if (crypto && typeof crypto.randomUUID === 'function') return crypto.randomUUID()
+  } catch { /* fall through */ }
+  return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10)
+}
+
+/**
  * Run a standalone manual compaction over the agent's session (the `compactNow`
  * analogue): select a compactable region with the plugin's own policy, then run
  * the full transaction. Safe to call only when the agent is idle; a busy agent
@@ -865,6 +887,11 @@ async function runTransaction(ctx, agent, session, region, signal, settings, sou
   let replaceEvent
   try {
     replaceEvent = session.append('user/message', {
+      // `id` + `role` are MANDATORY on the `user/message` payload — see
+      // `mintMessageId` for why the checkpoint must carry an identified
+      // message even though the append path does not enforce it.
+      id: mintMessageId(),
+      role: 'user',
       content: checkpointContent,
       source: Object.freeze(checkpointSourceData),
     }, {

@@ -29,7 +29,12 @@
  *   • DONE        — pinned green `[压缩完成!]`, fired right AFTER the call
  *     commits; then after `DONE_FALLBACK_MS` (3 s) a forced
  *     `isImportant=true` push redraws a fresh random Deep working pair
- *     (single-purpose timer — the only one in this module).
+ *     (single-purpose timer — the only one in this module);
+ *   • END         — pinned EMPTY text `""`, fired at the END of a
+ *     conversation (the `agent/status` idle transition — hooks/idle.js): a
+ *     CLEAR push that empties the badge (the client strips the painted text
+ *     and phase class, restoring the official appearance). Replaces the
+ *     former conversation-START forced working-pair override (removed 2026-09).
  *
  * All writers are GUARANTEED never to throw (they wrap the settings-service
  * write in try/catch): a messenger failure must NEVER disrupt the model
@@ -45,17 +50,20 @@ export const LIVE_UI_FIELD = 'liveUi'
 export const PHASE_WORKING = 'working'
 export const PHASE_COMPRESSING = 'compressing'
 export const PHASE_DONE = 'done'
+export const PHASE_END = 'end'
 
-/** Pinned (never randomized) payloads for the deterministic phases. */
+/** Pinned (never randomized) payloads for the deterministic phases. `end` is the EMPTY clear — see {@link publishEnd}. */
 export const PINNED_TEXTS = Object.freeze({
   [PHASE_COMPRESSING]: '[强制压缩中>>>]',
   [PHASE_DONE]: '[压缩完成!]',
+  [PHASE_END]: '',
 })
 
-/** Pinned colors matching {@link PINNED_TEXTS} — extra-dark tuned: deep burgundy-red while compacting, muted pine-green on completion. */
+/** Pinned colors matching {@link PINNED_TEXTS} — extra-dark tuned: deep burgundy-red while compacting, muted pine-green on completion; `end` carries no color (the badge returns to its official look). */
 export const PINNED_COLORS = Object.freeze({
   [PHASE_COMPRESSING]: '#9b1c2b',
   [PHASE_DONE]: '#2f6f52',
+  [PHASE_END]: '',
 })
 
 /**
@@ -146,8 +154,9 @@ export function randomWorkingPair() {
 }
 
 /**
- * Build the pinned payload for a deterministic phase.
- * @param {'compressing'|'done'} phase
+ * Build the pinned payload for a deterministic phase (`end` is the empty
+ * conversation-END clear).
+ * @param {'compressing'|'done'|'end'} phase
  * @returns {{phase: string, text: string, color: string}}
  */
 export function pinnedPayload(phase) {
@@ -228,29 +237,30 @@ export async function publishRandomWorking(ctx) {
 }
 
 /**
- * The conversation-START forced override: publish a fresh random working pair
- * with `isImportant=true`, so it UNCONDITIONALLY overwrites whatever is
- * currently displayed — including a stale pinned bracket-form text such as
- * `[强制压缩中>>>]` left behind by an interrupted/failed compaction (the
- * non-important guard inside {@link publishUiStatus} refuses to overwrite a
- * `[`-prefixed text, so such residue would otherwise stick on the badge for
- * the whole session, forever showing a frozen compressing/done banner instead
- * of a live working label).
+ * The conversation-END clear: publish the pinned EMPTY text `""` with
+ * `isImportant=true`, so it UNCONDITIONALLY overwrites whatever is currently
+ * displayed — including a stale pinned bracket-form text such as
+ * `[强制压缩中>>>]` left behind by an interrupted/failed compaction, or a
+ * lingering random working pair (the non-important guard inside
+ * {@link publishUiStatus} refuses to overwrite a `[`-prefixed text, so such
+ * residue would otherwise stick on the badge).
  *
- * Call ONCE at the START of a conversation step (the `agent/request` seam —
- * see index.js): the first model request of a new turn force-clears any
- * bracket residue so the badge immediately returns to a normal working look.
- * Only the START uses the forced form; the mid-stream watermark keeps
- * publishing NON-importantly via {@link publishRandomWorking} (called from the
- * `llm/stream` hook) so a live `[强制压缩中>>>]` during an ACTUAL compaction
- * still survives (the guard stays effective while something is really
- * pressing). Clean, self-healing: a stale `[` never outlives the next
+ * The client's `paintTurnStatus` treats the empty text as a CLEAR: it empties
+ * the painted TurnStatus text node and strips the swish phase class, so the
+ * badge returns to its official appearance until the next liveUi push.
+ *
+ * Call ONCE at the END of a conversation (the `agent/status` idle transition —
+ * see hooks/idle.js, where it runs on EVERY idle exit path: turn-end
+ * compaction committed, nothing committed, compaction disabled, no backend).
+ * This REPLACES the former conversation-START forced override
+ * (`publishWorkingOnStart`, removed 2026-09): the badge is now cleared at
+ * conversation end rather than re-primed with a fresh working pair at
  * conversation start.
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @returns {Promise<void>}
  */
-export async function publishWorkingOnStart(ctx) {
-  await publishUiStatus(ctx, randomWorkingPair(), true)
+export async function publishEnd(ctx) {
+  await publishUiStatus(ctx, pinnedPayload(PHASE_END), true)
 }
 
 /**

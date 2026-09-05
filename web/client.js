@@ -606,10 +606,13 @@ window.__ModuleLoader__.load({
     /**
      * 「Deep diving…」指示器的实时贴皮器（live UI 徽章）。
      *
-     * 宿主半部（core/ui-signal.js）在三个时机改写本命名空间的 liveUi 字段：
+     * 宿主半部（core/ui-signal.js）在四个时机改写本命名空间的 liveUi 字段：
      *   • 每次出站 LLM 调用开始时——写入 20×20 随机工作态（phase/text/color）；
      *   • 任意一次强制压缩开始前——固定红色「[强制压缩中>>>]」；
-     *   • 压缩成功后——固定绿色「[压缩完成!]」。
+     *   • 压缩成功后——固定绿色「[压缩完成!]」；
+     *   • 会话结束时（agent 转入 idle，hooks/idle.js）——空字符串 text
+     *     （isImportant）：语义是"清空"——抹掉徽章文字、撤掉相位 class，
+     *     徽章回到官方外观（取代 2026-09 前"会话开始时强制重绘随机工作态"）。
      * 本函数把该字段的最新值贴到对话区那个 `<div role="status" aria-live="polite">`
      * （官方 `TurnStatus` 组件，"Deep diving…" 所在处）的**第一个文本节点**上，
      * 并按 phase 着色。这是一次**瞬时 DOM 覆盖**：React 的下一帧重绘会自行还原
@@ -639,7 +642,8 @@ window.__ModuleLoader__.load({
      * 的规则、互不干扰；phase 消失（React 重建节点、新 TurnStatus 挂载）后
      * 属性不复存在 → 规则不再命中 → 官方 shimmer 自然恢复。
      *
-     * @param liveUi - 宿主写入的 { phase, text, color }；缺省/null 时 no-op。
+     * @param liveUi - 宿主写入的 { phase, text, color }；缺省/null 时 no-op；
+     *   `text` 为空字符串时执行"清空"（抹掉所贴文本 + 撤相位 class/属性）。
      */
     // ── 扫光配色表：20 个工作态颜色 + 2 个钉住颜色（compressing 红 / done 绿）──
     // 每条对应 web/swish.css 里的 .falling-ts-swish-NN（@keyframes falling-ts-swish-NN），
@@ -663,20 +667,34 @@ window.__ModuleLoader__.load({
       const slot = idx >= 0 ? idx : 0;
       return SWISH_CLASS_PREFIX + String(slot).padStart(2, "0");
     }
+    // 每个 status 节点上次被贴过的文本子节点（node → textChild）。清空
+    // （text → ""）之后该子节点变空，"第一个非空文本子节点"搜索再也找不到
+    // 它——WeakMap 让锚点在清空后依然存活：下一轮推送直接命中被清空的旧节点
+    // 重新贴字；React 重建节点（新 element → Map 未命中）时回落到搜索、重新
+    // 捕获 React 的新文本节点。
+    const paintedTextChild = new WeakMap();
     function paintTurnStatus(liveUi) {
       if (typeof document === "undefined") return;
-      if (!liveUi || typeof liveUi.text !== "string" || liveUi.text.length === 0) return;
-      const color = typeof liveUi.color === "string" && liveUi.color !== "" ? liveUi.color : null;
+      if (!liveUi || typeof liveUi.text !== "string") return;
+      // 空 text = "清空"（会话结束推送，hooks/idle.js → ui-signal publishEnd）：
+      // 抹掉徽章文字并撤掉相位 class/属性，徽章回到官方外观。
+      const color = liveUi.text.length === 0 ? null : (typeof liveUi.color === "string" && liveUi.color !== "" ? liveUi.color : null);
       const nodes = document.querySelectorAll('[role="status"][aria-live="polite"]');
       if (nodes.length === 0) return; // 没有 running 会话 → 没有 TurnStatus
       const targetCls = color !== null ? swishClassForColor(color) : null;
       for (const node of nodes) {
-        let textChild = null;
-        for (const child of node.childNodes) {
-          if (child.nodeType === Node.TEXT_NODE && child.nodeValue.trim() !== "") { textChild = child; break; }
+        let textChild = paintedTextChild.get(node) || null;
+        // 校验记忆的锚点仍是本节点下存活的文本子节点（React 重渲染后可能已
+        // 被换掉/摘下），失配则回落到"第一个非空文本子节点"搜索。
+        if (textChild !== null && (textChild.nodeType !== Node.TEXT_NODE || textChild.parentNode !== node)) textChild = null;
+        if (textChild === null) {
+          for (const child of node.childNodes) {
+            if (child.nodeType === Node.TEXT_NODE && child.nodeValue.trim() !== "") { textChild = child; break; }
+          }
+          if (textChild === null) continue;
         }
-        if (textChild === null) continue;
-        textChild.nodeValue = liveUi.text;
+        textChild.nodeValue = liveUi.text; // "" → 清空徽章文字
+        paintedTextChild.set(node, textChild);
         // class 化：先清掉所有上一轮的 swish class，再贴本次（target 为空时只清不加）。
         for (const cls of [...node.classList]) {
           if (cls.startsWith(SWISH_CLASS_PREFIX)) node.classList.remove(cls);

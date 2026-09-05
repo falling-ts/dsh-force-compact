@@ -21,7 +21,7 @@
 
 import { readSettings, DEFAULTS } from '../core/settings.js'
 import { resolveCompaction } from '../engine/backend.js'
-import { publishCompressing, publishDone } from '../core/ui-signal.js'
+import { publishCompressing, publishDone, publishEnd } from '../core/ui-signal.js'
 import { guardFn, renderCrash, captureThrowSite, appendCrashLine as appendDiag } from '../core/crashnet.js'
 
 import { getProjectedTokens } from '../core/projected.js'
@@ -76,11 +76,18 @@ async function __handleAgentStatusBody(ctx, payload, mode) {
     // Visible so a tester who flipped the setting OFF can confirm the guard is
     // what suppressed the idle compaction (not a missing listener).
     ctx.logger.debug(`[force-compact] ${sid}: turn-end compaction disabled by settings — idle transition ignored`)
+    // CONVERSATION-END CLEAR (2026-09): every idle path ends with the badge
+    // cleared — an empty `""` text (isImportant) restores the official look.
+    // `publishEnd` swallows its own failures; it never throws into the
+    // `agent/status` dispatch.
+    await publishEnd(ctx)
     return
   }
 
   if (session === undefined || session === null || typeof session.id !== 'string') {
     ctx.logger.debug(`[force-compact] ${sid}: idle transition observed but agent.session is unusable — skipping turn-end compaction`)
+    // CONVERSATION-END CLEAR (2026-09) — same as the other idle exits.
+    await publishEnd(ctx)
     return
   }
   // Locate a usable compaction backend: the OFFICIAL `compaction` service
@@ -98,6 +105,8 @@ async function __handleAgentStatusBody(ctx, payload, mode) {
       `(needs \`agent.session\` and the \`llm\` service). Enable \`builtinEnabled=true\` in the ` +
       `\`falling-ts-force-compact\` namespace to restore the fallback.`
     )
+    // CONVERSATION-END CLEAR (2026-09) — same as the other idle exits.
+    await publishEnd(ctx)
     return
   }
 
@@ -165,4 +174,15 @@ async function __handleAgentStatusBody(ctx, payload, mode) {
     const message = error instanceof Error ? error.message : String(error)
     ctx.logger.warn(`[force-compact] ${session.id}: idle compaction via ${backend?.kind} FAILED — ${message}`)
   }
+  // ── CONVERSATION-END CLEAR (2026-09) — the badge is cleared at conversation
+  // END (replacing the former conversation-START forced working-pair override
+  // that lived in index.js): an empty `""` text with isImportant=true wipes
+  // whatever the compaction left on the badge — a stale red `[强制压缩中>>>]`
+  // when nothing committed (the self-healing case this clear now covers), or
+  // the green `[压缩完成!]` when a round did. The publisher swallows its own
+  // failures; it never throws into the `agent/status` dispatch.
+  // NOTE: when a round DID commit, the DONE banner's 3-second fallback timer
+  // (`publishDone` in ui-signal.js) may repaint a fresh working pair ~3 s
+  // AFTER this clear — pre-existing behavior, intentionally left untouched.
+  await publishEnd(ctx)
 }

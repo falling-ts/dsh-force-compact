@@ -56,7 +56,6 @@ void thinkingDisabled
 import { registerCommand } from './src/hooks/command.js'
 import { handleAgentStatus } from './src/hooks/idle.js'
 import { registerLlmStreamHook } from './src/hooks/wire-rewrite.js'
-import { publishWorkingOnStart } from './src/core/ui-signal.js'
 import { guardFn, installCrashNet } from './src/core/crashnet.js'
 
 /** @type {string} the function plugin's display name. */
@@ -374,19 +373,12 @@ const __applyInner = (ctx) => {
       maybeRegisterSettingsNamespace()
       maybeRegisterCommand()
       maybeInstallWireRewrite()
-      // CONVERSATION-START Live-UI FORCED OVERRIDE (self-healing): this seam is
-      // the FIRST model request of a conversation step, so force-clear any stale
-      // pinned bracket-form text ([强制压缩中>>>] / [压缩完成!] residue left by an
-      // interrupted or failed compaction) with a fresh random working pair
-      // (isImportant=true). Without this the non-important guard inside
-      // publishUiStatus would refuse to overwrite a `[`-prefixed text and the
-      // badge could stay frozen on a stale banner for the whole session. Fire-
-      // and-forget, like the llm/stream watermark: publishWorkingOnStart swallows
-      // its own rejections internally and must never block the request chain.
-      // Mid-request watermarking stays NON-important (publishRandomWorking at the
-      // llm/stream hook) so a live compressing/done banner during an ACTUAL
-      // compaction still survives; only the START of a conversation clears it.
-      void publishWorkingOnStart(ctx)
+      // NOTE (2026-09): the former CONVERSATION-START Live-UI forced override
+      // (publishWorkingOnStart, a fresh random working pair per conversation
+      // start) is REMOVED. The badge is now cleared at conversation END
+      // instead: hooks/idle.js publishes an empty `""` text (isImportant=true)
+      // on every idle transition (ui-signal `publishEnd`), wiping stale
+      // bracket-form residue and any lingering working pair in one push.
       return await __agentRequestListenerBody(ctx, payload, next)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
