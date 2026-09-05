@@ -51,7 +51,7 @@ import { ensureDebugLogger } from './src/core/log.js'
 // helper reachable from the plugin root for consumers who DO want the blanket
 // "off everywhere" predicate; the active `agent/request` hot path no longer
 // consumes it (see the pass-through comment on `__agentRequestListenerBody`).
-import { forceCompactIfNeeded, thinkingDisabled } from './src/hooks/guard.js'
+import { forceCompactIfNeeded, thinkingDisabled, clearStuckCompressingBanner } from './src/hooks/guard.js'
 void thinkingDisabled
 import { registerCommand } from './src/hooks/command.js'
 import { handleAgentStatus } from './src/hooks/idle.js'
@@ -425,6 +425,13 @@ async function __agentRequestListenerBody(ctx, payload, next) {
     try { maybeInstallWireRewrite() } catch { /* non-fatal */ }
     const agent = payload && payload.agent
     const signal = payload && payload.signal
+    // (2026-09) Model-request hook: clear a STALE pinned "[强制压缩中>>]" banner on the live-UI
+    // badge when NO compaction is genuinely in flight (the "总是卡住" fix). Runs on EVERY model
+    // step — awaited, before the compaction attempt below — so a working-pair write lands FIRST
+    // and a fresh COMPRESSING banner (if this very step ends up compacting) still wins over it
+    // (no important-write race). The helper self-swallows all errors, so this await can never
+    // throw into the Waterfall `next()` hop.
+    await clearStuckCompressingBanner(ctx, agent && agent.session)
     if (agent !== undefined && agent !== null && (signal === undefined || !signal.aborted)) {
       try {
         // The resolver locates the per-realm compaction backend through

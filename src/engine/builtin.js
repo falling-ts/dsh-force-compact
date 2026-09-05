@@ -1285,6 +1285,26 @@ function hasOpenFctLock(session) {
   return assertNoActiveCompaction(session, 'lockCheck') !== null
 }
 
+/**
+ * Whether the given session currently has an ACTIVE (in-flight) compaction —
+ * an unmatched `compaction/start` bracket that no later `session/end-seed` has
+ * cleared. Exported for the per-model-request guard, which uses it to tell a
+ * GENUINE in-progress `[强制压缩中>>>]` banner (leave it alone) apart from
+ * STALE residue left behind by a compaction that never committed (safe to
+ * override with a fresh working pair). Backed by the same official entry-state
+ * inspection as {@link hasOpenFctLock}. Never throws (a malformed session
+ * degrades to `false`, so the guard's UI clear is never blocked).
+ * @param {import('@deepseek-ai/dsh-session').Session} session
+ * @returns {boolean}
+ */
+export function isCompactionActive(session) {
+  try {
+    return hasOpenFctLock(session)
+  } catch {
+    return false
+  }
+}
+
 /** The turn number of the currently-open turn, or `null` (standalone/idle). */
 function currentOpenTurn(session) {
   // Reads the latest turn bracket from the durable log to stamp `compaction/*`

@@ -30,7 +30,7 @@
  * @module @falling-ts/dsh-force-compact/request-guard
  */
 
-import { readSettings, DEFAULTS } from '../core/settings.js'
+import { readSettings, DEFAULTS, NS } from '../core/settings.js'
 import { MAX_COMPACTION_ROUNDS } from '../core/policy.js'
 import {
   selectEarliestByTokens,
@@ -39,7 +39,8 @@ import {
   validateSurfaceRegionSafe,
 } from '../engine/region.js'
 import { resolveCompaction } from '../engine/backend.js'
-import { publishCompressing, publishDone } from '../core/ui-signal.js'
+import { publishCompressing, publishDone, publishUiStatus, randomWorkingPair, PHASE_COMPRESSING, LIVE_UI_FIELD } from '../core/ui-signal.js'
+import { isCompactionActive } from '../engine/builtin.js'
 import { guardFn, renderCrash, captureThrowSite, appendCrashLine as appendDiag } from '../core/crashnet.js'
 import { getProjectedTokens } from '../core/projected.js'
 import { sessionEvents } from '../core/session-events.js'
@@ -353,6 +354,55 @@ async function __compactRetainingLatestBody(ctx, agent, signal, mode, sourceComm
     }
   }
   return committedAny
+}
+
+/**
+ * (2026-09) Clear a STALE pinned "[强制压缩中>>]" banner on the live-UI badge —
+ * but ONLY when no compaction is actually in flight for the session right now.
+ *
+ * WHY THIS EXISTS: a compaction that never commits (every round fails, or a
+ * summarization stream hangs past its 90 s hard timeout) leaves the pinned red
+ * COMPRESSING banner on the badge. The per-call `llm/stream` watermark pushes
+ * working pairs NON-importantly, and the guard inside `publishUiStatus` REFUSES
+ * to overwrite a `[`-prefixed bracket text — so that residue sticks (the "总是
+ * 卡住" symptom). On every model step, when the session has NO open
+ * `compaction/start` bracket (nothing genuinely in flight) AND the badge currently
+ * shows a COMPRESSING bracket (phase === 'compressing'), force a fresh random
+ * working pair with isImportant=true to override it (including residue that
+ * persisted to `settings.yaml` across a restart). A DONE banner (phase 'done') is
+ * left to its own 3 s fallback timer, and a working / end badge needs no override.
+ * When a compaction IS in flight, the banner is a genuine in-progress indicator and
+ * is left untouched.
+ *
+ * Awaited (NOT fire-and-forget) and fully contained: the caller awaits this so the
+ * working-pair write LANDS before any COMPRESSING banner a compaction in the SAME
+ * step would publish — otherwise the two important writes race and a working pair
+ * could transiently mask a genuine in-progress compaction. `publishUiStatus`
+ * swallows all of its own rejections, and this body is additionally try/caught, so
+ * a UI clear can NEVER throw into (or disturb) the model-request path.
+ * @param {import('@deepseek-ai/cordis').Context} ctx
+ * @param {import('@deepseek-ai/dsh-session').Session} session
+ * @returns {Promise<void>}
+ */
+export async function clearStuckCompressingBanner(ctx, session) {
+  try {
+    if (session === undefined || session === null) return
+    if (isCompactionActive(session)) return // genuinely compacting — preserve the banner
+    // Only override a STALE COMPRESSING bracket — the "[强制压缩中>>>" residue a
+    // failed/hung compaction leaves behind when `publishDone` never fires. A DONE
+    // banner (phase 'done') is left to its own 3 s fallback timer, and a working /
+    // end badge needs no override. This is the SAME sync cached `settings.get` the
+    // non-important guard inside `publishUiStatus` uses — a cosmetic read, so a
+    // miss simply means "nothing stuck to clear" (no push, no churn).
+    const settings = ctx.get('settings')
+    if (settings === undefined || typeof settings.get !== 'function') return
+    const nsValue = settings.get(NS)
+    const phase = (nsValue != null && typeof nsValue === 'object' && nsValue[LIVE_UI_FIELD] != null && typeof nsValue[LIVE_UI_FIELD] === 'object')
+      ? nsValue[LIVE_UI_FIELD].phase
+      : undefined
+    if (phase !== PHASE_COMPRESSING) return // nothing stuck to clear
+    await publishUiStatus(ctx, randomWorkingPair(), true) // override the stale bracket
+  } catch { /* a UI clear must never disturb the request path */ }
 }
 
 /**
