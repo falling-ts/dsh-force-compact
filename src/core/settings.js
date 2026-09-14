@@ -429,7 +429,7 @@ export async function buildSchema() {
       // strictly smaller than the span it replaces) this keeps transactions
       // bounded while ensuring compression is always net-negative.
       maxSummaryTokens: z.number().default(DEFAULTS.maxSummaryTokens),
-        liveUi: z.any(), // TRANSIENT UI MESSENGER (core/ui-signal.js): host-written { phase,text,color }. z.any() used because the vendored schemastery exposes object/any/string/number/boolean/array only (no record/unknown/chained .optional()); z.record(z.unknown()).optional() throws there and aborts the whole z.object(...), stranding the settings panel on "loading". Absence-by-default is inherent (no .default). readSettings ignores it — not a user preference.
+        liveUi: z.any(), // TRANSIENT UI MESSENGER (core/ui-signal.js): host-written { phase,text,textId,color }, textId = locale-independent discriminator the client half localizes via ctx.locale. z.any() used because the vendored schemastery exposes object/any/string/number/boolean/array only (no record/unknown/chained .optional()); z.record(z.unknown()).optional() throws there and aborts the whole z.object(...), stranding the settings panel on "loading". Absence-by-default is inherent (no .default). readSettings ignores it — not a user preference.
     })
     return schema
   } catch {
