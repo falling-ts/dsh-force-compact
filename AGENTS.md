@@ -16,7 +16,7 @@ process-local `Map` 标记也无 timer。
 
 ## 例外：摘要流的硬超时守卫（`AbortSignal.timeout`，2026-08-30 增补）
 
-`src/engine/summarizer.js` 的 `SUMMARIZATION_TIMEOUT_MS = 90_000` 是一次
+`src/engine/summarizer.js` 的 `SUMMARIZATION_TIMEOUT_MS = 90_000`（默认值）是一次
 **单发超时守卫**：用 `AbortSignal.timeout` + `Promise.race` 把一次摘要
 `llm.stream` 收集钉死在硬时限内。这不是周期调度、不是延时重试，而是一次
 事务的**防泄漏护栏**——没有它，一个静默挂起的 provider 流会让
@@ -25,6 +25,12 @@ process-local `Map` 标记也无 timer。
 重启（2026-08-30 在 opencode-go/deepseek-v4-flash 上实测复现）。守卫的性质
 与 `publishDone` 定时器同类（fire-and-forget、无内存态、无持久化），归入
 同一豁免；除这两处外仍不引入 timer。
+
+**超时值可配置（2026-09）**：实际生效的时限优先取 `settings.summarizationTimeoutMs`
+（GUI 设置项「摘要超时上限（ms）」，默认 `90000`，下限 `5000`，无上限），
+`SUMMARIZATION_TIMEOUT_MS` 常量降级为调用方未提供该字段时的回退默认。读取时低于
+下限的值自动抬升至 5000——过小的上限会让慢速本地端点（如 llama.cpp，摘要常需
+~40s）被误判挂起而频繁失败，故不设下限之下再放行。
 
 ## 双引擎架构（内置引擎 + 官方服务并列共存）
 
@@ -187,6 +193,7 @@ preset 把 `compaction-basic` 挂在了 `- isolate:{compaction:true,…}` 组里
 | `compactionMode` | `'realm'\|'global'` | `'realm'` | 官方服务解析策略（仅影响 priority-1 路径） |
 | `builtinEnabled` | boolean | `true` | **内置引擎闸门**。`false` 时严格只走官方；缺省视为 `true`（兼容旧 yaml） |
 | `maxSummaryTokens` | integer (1024–200000) | `1024` | 摘要 LLM 调用的 `maxTokens` 上限；防超长摘要。**下限 1024**（低于 1024 的值读取时自动抬升至 1024） |
+| `summarizationTimeoutMs` | integer (≥ 5000, ms) | `90000` | 一次摘要流的硬墙钟超时上限（`summarizer.js` 挂起守卫；见上文硬超时守卫例外节）。**下限 5000**（低于 5000 的值读取时自动抬升至 5000）；**无上限**——填很大的值相当于禁用该守卫 |
 
 ### 如何验证内置引擎工作
 

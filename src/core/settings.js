@@ -60,6 +60,12 @@
  *   be strictly smaller than the span it replaces), this prevents runaway
  *   summarizer outputs from ballooning past the region being condensed.
  *   Stored values below the floor are coerced up to it at read time.
+ * - `summarizationTimeoutMs` (positive integer, default `90000`, floor `5000`):
+ *   the hard wall-clock cap for ONE summarization stream in milliseconds
+ *   (plugs into `summarizer.js`'s hung-stream guard — see
+ *   `SUMMARIZATION_TIMEOUT_MS`). Below-floor values are coerced UP to the floor
+ *   at read time (a sub-5s cap would false-positive abort slow local endpoints);
+ *   there is NO ceiling — a large value effectively disables the guard.
  *
  * The namespace is registered against the `settings` service when one is
  * mounted. The schema is BUILT BEST-EFFORT through `@deepseek-ai/schemastery`:
@@ -122,6 +128,7 @@ export const COMPACT_MODES = [COMPACT_MODE_REALM, COMPACT_MODE_GLOBAL]
  *   compactionMode: string,
  *   builtinEnabled: boolean,
  *   maxSummaryTokens: number,
+ *   summarizationTimeoutMs: number,
  * }>}
  */
 /** Default debug-log destination: the shared user `$DSH_HOME/logs/` dir. */
@@ -145,6 +152,12 @@ export const MIN_TOKEN_SCALES = Object.freeze({
   retainLatestTokens: 8000,
   maxSummaryTokens: 1024,
 })
+
+/** Floor applied to the summarization hang-guard timeout on EVERY read
+ *  (milliseconds). Below-floor values are coerced UP to it — a sub-5s cap would
+ *  false-positive abort slow local endpoints (llama.cpp summarizations routinely
+ *  run ~40s). There is NO ceiling: a large value effectively disables the guard. */
+export const MIN_TIMEOUT_MS = 5000
 
 export const DEFAULTS = Object.freeze({
   disableThinking: true,
@@ -173,6 +186,10 @@ export const DEFAULTS = Object.freeze({
   // the shadowed span is large; the shrink gate independently ensures the
   // committed summary is smaller than the span it replaces.
   maxSummaryTokens: 1024,
+  // Hard wall-clock cap for ONE summarization stream, in milliseconds (the
+  // hung-stream guard — see `engine/summarizer.js` `SUMMARIZATION_TIMEOUT_MS`).
+  // Floored at `MIN_TIMEOUT_MS` on read; no ceiling.
+  summarizationTimeoutMs: 90_000,
    // Ceiling on the NUMBER OF SURFACE NODES one compaction region may span
    // (positional, counted from the head of the ordered surface). When the
    // token-budget-driven cutoff point lands beyond this many nodes —
@@ -202,6 +219,7 @@ export const DEFAULTS = Object.freeze({
  *   compactionMode: string,
  *   builtinEnabled: boolean,
  *   maxSummaryTokens: number,
+ *   summarizationTimeoutMs: number,
  * } | null>}
  *   the resolved settings, or `null` when the `settings` service is not mounted
  *   (callers should fall back to their composition entry).
@@ -254,6 +272,7 @@ async function __readSettingsBody(ctx) {
     ? section.builtinEnabled
     : DEFAULTS.builtinEnabled)
   const maxSummaryTokens = asScaled('maxSummaryTokens', MIN_TOKEN_SCALES.maxSummaryTokens)
+  const summarizationTimeoutMs = asScaled('summarizationTimeoutMs', MIN_TIMEOUT_MS)
   return {
     disableThinking,
     autoThresholdTokens,
@@ -264,6 +283,7 @@ async function __readSettingsBody(ctx) {
     compactionMode,
     builtinEnabled,
     maxSummaryTokens,
+    summarizationTimeoutMs,
   }
 }
 
@@ -429,6 +449,11 @@ export async function buildSchema() {
       // strictly smaller than the span it replaces) this keeps transactions
       // bounded while ensuring compression is always net-negative.
       maxSummaryTokens: z.number().default(DEFAULTS.maxSummaryTokens),
+      // Hard wall-clock cap for ONE summarization stream (ms). Floored at
+      // read-time by `MIN_TIMEOUT_MS` (the schema is descriptive here, the
+      // floor is behavioral — same documented trade-off as the token scales);
+      // no ceiling.
+      summarizationTimeoutMs: z.number().default(DEFAULTS.summarizationTimeoutMs),
         liveUi: z.any(), // TRANSIENT UI MESSENGER (core/ui-signal.js): host-written { phase,text,color }. z.any() used because the vendored schemastery exposes object/any/string/number/boolean/array only (no record/unknown/chained .optional()); z.record(z.unknown()).optional() throws there and aborts the whole z.object(...), stranding the settings panel on "loading". Absence-by-default is inherent (no .default). readSettings ignores it — not a user preference.
     })
     return schema

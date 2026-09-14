@@ -44,6 +44,11 @@ export const SUMMARY_CLOSE_TAG = '</compacted-summary>'
  * the existing failure cooldown instead of livelocking. The cap is enforced
  * with `AbortSignal.timeout` racing the collection (`Promise.race`), because
  * an abort alone cannot interrupt an iterator stuck inside its own `await`.
+ *
+ * This is the DEFAULT cap. The effective timeout is resolved per-call from the
+ * caller's `config.summarizationTimeoutMs` (the `falling-ts-force-compact`
+ * `settings.summarizationTimeoutMs` GUI knob, floored at 5000ms on read);
+ * this constant is the fallback when the callers passes no such field.
  */
 export const SUMMARIZATION_TIMEOUT_MS = 90_000
 
@@ -156,8 +161,9 @@ export function frameSummary(textBlocks) {
  *  5. Usage is surfaced when the provider reports it.
  *
  * @param {import('@deepseek-ai/cordis').Context} ctx
- * @param {Readonly<object>} config backend config (may carry `maxSummaryTokens`
- *   and the optional `summarizationProvider` / `summarizationModel` override pair)
+ * @param {Readonly<object>} config backend config (may carry `maxSummaryTokens`,
+ *   `summarizationTimeoutMs`, and the optional `summarizationProvider` /
+ *   `summarizationModel` override pair)
  * @param {import('@deepseek-ai/dsh-agent').Agent} agent provides the session
  *   (routed-header lookup) and fallback target.
  * @param {SummarizationInput} input replayed prefix + region messages.
@@ -263,7 +269,15 @@ async function __summarizeBody(ctx, config, agent, input, signal, extra) {
   // lock. The caller's own signal keeps working normally (an external abort
   // still cancels earlier); only when the TIMEOUT fires does the caller
   // receive a labeled `timeout` failure instead of an open-ended hang.
-  const timeoutSignal = AbortSignal.timeout(SUMMARIZATION_TIMEOUT_MS)
+  // The cap is CONFIGURABLE via `config.summarizationTimeoutMs` (the settings
+  // `summarizationTimeoutMs` GUI knob); this constant is the default. Values
+  // below the MIN_TIMEOUT_MS floor are already clamped up by `readSettings`;
+  // a direct caller passing a non-finite/absent field falls back to the default.
+  const timeoutMs = (config !== null && typeof config === 'object'
+    && Number.isFinite(config.summarizationTimeoutMs) && config.summarizationTimeoutMs > 0)
+    ? config.summarizationTimeoutMs
+    : SUMMARIZATION_TIMEOUT_MS
+  const timeoutSignal = AbortSignal.timeout(timeoutMs)
   const mergedSignal = (signal !== undefined && signal !== null && typeof signal.aborted === 'boolean')
     ? AbortSignal.any([signal, timeoutSignal])
     : timeoutSignal
@@ -383,7 +397,7 @@ async function __summarizeBody(ctx, config, agent, input, signal, extra) {
     // cap. Labeled timeout failure — the caller closes the lock with an error.
     return {
       status: 'timeout',
-      reason: `summarization stream exceeded ${SUMMARIZATION_TIMEOUT_MS}ms without a terminal finish (race won; stream presumed hung: ${describeStream(stream)})`,
+      reason: `summarization stream exceeded ${timeoutMs}ms without a terminal finish (race won; stream presumed hung: ${describeStream(stream)})`,
     }
   }
   if (!collected || typeof collected !== 'object') {
@@ -398,7 +412,7 @@ async function __summarizeBody(ctx, config, agent, input, signal, extra) {
   if (mergedSignal.aborted && !(signal !== undefined && signal !== null && signal.aborted)) {
     return {
       status: 'timeout',
-      reason: `summarization stream exceeded ${SUMMARIZATION_TIMEOUT_MS}ms without a terminal finish and was aborted (${describeStream(stream)})`,
+      reason: `summarization stream exceeded ${timeoutMs}ms without a terminal finish and was aborted (${describeStream(stream)})`,
     }
   }
   if (collected._rejected) {
