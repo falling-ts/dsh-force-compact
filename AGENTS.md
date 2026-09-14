@@ -32,6 +32,23 @@ process-local `Map` 标记也无 timer。
 下限的值自动抬升至 5000——过小的上限会让慢速本地端点（如 llama.cpp，摘要常需
 ~40s）被误判挂起而频繁失败，故不设下限之下再放行。
 
+**适配器竞态的时限诊断（2026-09 增补）：** plugin 的 `summarizationTimeoutMs` 必须
+**严格小于**目标适配器自带的 stream-idle 看门狗（`streamIdleTimeoutMs`，默认
+`300000`ms，pi-ai / deepseek adapter 各自武装、逐 `next()` 计龄）——否则适配器的
+空闲超时先到，挂起/超时的 provider 以 provider 侧 `TIMEOUT` error 呈现在
+CRASH-HARNESS，而非本插件干净的 `'timeout'` abort（2026-09-14 在 135 消息慢速
+llama.cpp 上实测）。`summarizer.js` 的 `emitTimeoutRaceDiagnostic` 在每次摘要调用
+放行前做**只读、best-effort、total** 竞态诊断：best-effort 读
+`settings.get('llm-pi-ai').providers.<provider>.streamIdleTimeoutMs`（缺省时假定平台
+默认 300000 并标注"未从配置确认"）；当 `summarizationTimeoutMs >= 该界` 时发
+WARN 携修复指引（调高 `llm-pi-ai.providers.<provider>.streamIdleTimeoutMs` 至高于
+`summarizationTimeoutMs`，或调低后者，保持 `summarizationTimeoutMs <
+streamIdleTimeoutMs`）。它不写任何配置、绝不抛出，只增加一条诊断日志。用户要"以
+`summarizationTimeoutMs` 为准"的做法：在 settings.yaml 把适配器看门狗抬高到该值
+之上（如 `llm-pi-ai.providers.llama.streamIdleTimeoutMs: 600000` 配
+`summarizationTimeoutMs: 500000`），使本插件的墙钟上限成为唯一生效的超时（超时以
+`'timeout'` 干净态在插件侧闭合）。
+
 ## 双引擎架构（内置引擎 + 官方服务并列共存）
 
 本插件拥有**两条独立的压缩路径**，通过统一的 `resolveCompaction(ctx, agent, mode)` facade
@@ -193,7 +210,7 @@ preset 把 `compaction-basic` 挂在了 `- isolate:{compaction:true,…}` 组里
 | `compactionMode` | `'realm'\|'global'` | `'realm'` | 官方服务解析策略（仅影响 priority-1 路径） |
 | `builtinEnabled` | boolean | `true` | **内置引擎闸门**。`false` 时严格只走官方；缺省视为 `true`（兼容旧 yaml） |
 | `maxSummaryTokens` | integer (1024–200000) | `1024` | 摘要 LLM 调用的 `maxTokens` 上限；防超长摘要。**下限 1024**（低于 1024 的值读取时自动抬升至 1024） |
-| `summarizationTimeoutMs` | integer (≥ 5000, ms) | `90000` | 一次摘要流的硬墙钟超时上限（`summarizer.js` 挂起守卫；见上文硬超时守卫例外节）。**下限 5000**（低于 5000 的值读取时自动抬升至 5000）；**无上限**——填很大的值相当于禁用该守卫 |
+| `summarizationTimeoutMs` | integer (≥ 5000, ms) | `90000` | 一次摘要流的硬墙钟超时上限（`summarizer.js` 挂起守卫；见上文硬超时守卫 + 适配器竞态诊断节）。**下限 5000**（低于 5000 的值读取时自动抬升至 5000）；**无上限**——填很大的值相当于禁用该守卫，但必须**严格小于**目标适配器的 `streamIdleTimeoutMs`（否则适配器空闲超时先到，表面出现 `TIMEOUT` error 而非本插件干净的 `'timeout'` abort）；`emitTimeoutRaceDiagnostic` 在调用前自动诊断并在失配时发出 WARN |
 
 ### 如何验证内置引擎工作
 

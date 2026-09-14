@@ -53,6 +53,18 @@ export const SUMMARY_CLOSE_TAG = '</compacted-summary>'
 export const SUMMARIZATION_TIMEOUT_MS = 90_000
 
 /**
+ * The harness LLM adapters' OWN stream-idle watchdog default
+ * (`DEFAULT_STREAM_IDLE_TIMEOUT_MS`, shared by `@deepseek-ai/dsh-llm-pi-ai`
+ * and the other shipping adapters). Each adapter arms a per-`next()` watchdog
+ * during stream iteration; when IT expires before our wall-clock cap, the
+ * failure surfaces as a provider-side `TIMEOUT` error (CRASH-HARNESS) instead
+ * of our clean labeled `timeout` abort. This constant is the fallback bound
+ * used by the timeout-race diagnostic when the target route's configured
+ * `streamIdleTimeoutMs` cannot be read back from settings.
+ */
+export const ADAPTER_STREAM_IDLE_TIMEOUT_MS = 300_000
+
+/**
  * The compaction directive, delivered as the FINAL user message after the
  * replayed conversation rather than as a distinct summarizer system prompt.
  * Keeping the conversation's own system prompt, tools, and message prefix in
@@ -277,6 +289,18 @@ async function __summarizeBody(ctx, config, agent, input, signal, extra) {
     && Number.isFinite(config.summarizationTimeoutMs) && config.summarizationTimeoutMs > 0)
     ? config.summarizationTimeoutMs
     : SUMMARIZATION_TIMEOUT_MS
+  // TIMEOUT-RACE DIAGNOSTIC (2026-09): warn BEFORE firing the call when this
+  // plugin's own wall-clock cap cannot win the race against the target
+  // adapter's stream-idle watchdog. The adapters arm their OWN
+  // `streamIdleTimeoutMs` watchdog (default 300000ms) during stream iteration;
+  // if our `timeoutMs` is not strictly below it (defaults compare equal → warn),
+  // the adapter's watchdog expires first and the failure surfaces as a
+  // provider-side `TIMEOUT` error (CRASH-HARNESS) rather than our clean labeled
+  // `timeout` abort. The bound is read best-effort from the target route's
+  // `llm-pi-ai.providers.<provider>.streamIdleTimeoutMs`; when it cannot be
+  // confirmed, the known platform default is assumed (marked as such in the
+  // line). Never throws and never escapes `summarize`.
+  emitTimeoutRaceDiagnostic(ctx, target.provider, timeoutMs)
   const timeoutSignal = AbortSignal.timeout(timeoutMs)
   const mergedSignal = (signal !== undefined && signal !== null && typeof signal.aborted === 'boolean')
     ? AbortSignal.any([signal, timeoutSignal])
@@ -573,6 +597,84 @@ function renderFinish(finish) {
     return `an object (${k})`
   } catch {
     return '<undescribable>'
+  }
+}
+
+/**
+ * Best-effort read of the target route's adapter-level stream-idle watchdog
+ * bound (`streamIdleTimeoutMs` under the `llm-pi-ai.providers.<provider>`
+ * settings section), used by the timeout-race diagnostic to decide whether
+ * our own wall-clock cap will win the race against the adapter's idle
+ * watchdog. Read-only and total: any missing/weird shape (settings service
+ * absent, namespace absent, route absent, field absent/non-numeric) folds to
+ * `undefined`, which the caller replaces with the platform default.
+ *
+ * @param {import('@deepseek-ai/cordis').Context} ctx
+ * @param {string} provider the resolved target provider (route key)
+ * @returns {number|undefined} positive configured `streamIdleTimeoutMs`, else `undefined`
+ */
+function adapterIdleTimeoutMs(ctx, provider) {
+  try {
+    const settings = ctx === undefined || ctx === null ? undefined : ctx.get('settings')
+    if (settings === undefined || settings === null || typeof settings.get !== 'function') return undefined
+    const ns = settings.get('llm-pi-ai')
+    const route = (ns !== undefined && ns !== null && typeof ns === 'object'
+      && ns.providers !== undefined && ns.providers !== null && typeof ns.providers === 'object')
+      ? ns.providers[provider]
+      : undefined
+    const value = (route !== undefined && route !== null && typeof route === 'object')
+      ? route.streamIdleTimeoutMs
+      : undefined
+    return (Number.isFinite(value) && value > 0) ? value : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Emit the timeout-race WARN (or a clean-race DEBUG note) BEFORE the
+ * summarization call fires. Compares our plugin wall-clock cap (`timeoutMs`)
+ * against the target route's adapter `streamIdleTimeoutMs` (defaulting to the
+ * platform-wide 300000ms when the route cannot be confirmed). When
+ * `timeoutMs >= bound`, the adapter's idle watchdog is guaranteed to win the
+ * race and the failure would surface as a provider-side `TIMEOUT` error
+ * (CRASH-HARNESS) instead of our clean labeled `timeout` abort — the WARN
+ * carries the actionable fix (raise
+ * `llm-pi-ai.providers.<provider>.streamIdleTimeoutMs`, or lower
+ * `falling-ts-force-compact.summarizationTimeoutMs`). Total: never throws,
+ * never escapes `summarize`.
+ *
+ * @param {import('@deepseek-ai/cordis').Context} ctx
+ * @param {string} provider the resolved target provider (route key)
+ * @param {number} timeoutMs the effective plugin wall-clock cap for this call
+ */
+function emitTimeoutRaceDiagnostic(ctx, provider, timeoutMs) {
+  const logger = (ctx === undefined || ctx === null) ? null : ctx.logger
+  try {
+    if (logger === null || logger === undefined || typeof logger.warn !== 'function') {
+      // No usable logger — the diagnostic is best-effort only.
+      return
+    }
+    const configured = adapterIdleTimeoutMs(ctx, provider)
+    const bound = configured !== undefined ? configured : ADAPTER_STREAM_IDLE_TIMEOUT_MS
+    const origin = configured !== undefined
+      ? `configured llm-pi-ai.providers.${provider}.streamIdleTimeoutMs`
+      : `adapter default streamIdleTimeoutMs (${ADAPTER_STREAM_IDLE_TIMEOUT_MS} — route not confirmed in config)`
+    const prefix = `[force-compact] summarization timeout-race: summarizationTimeoutMs=${timeoutMs}ms vs ${origin}=${bound}ms`
+    if (timeoutMs >= bound) {
+      logger.warn(
+        `${prefix} — plugin cap NOT below the adapter idle watchdog; the adapter's ` +
+        `stream idle expiry fires FIRST and a timed-out/hung provider surfaces as a ` +
+        `provider 'TIMEOUT' error (CRASH-HARNESS) instead of a clean labeled 'timeout' abort. ` +
+        `Fix: set llm-pi-ai.providers.${provider}.streamIdleTimeoutMs above ${timeoutMs}ms ` +
+        `(or lower falling-ts-force-compact.summarizationTimeoutMs), keeping ` +
+        `summarizationTimeoutMs < streamIdleTimeoutMs so THIS cap is the only one that counts.`,
+      )
+    } else if (logger.debug !== undefined && typeof logger.debug === 'function') {
+      logger.debug(`${prefix} — clean (plugin cap fires first; the only timeout in effect for this compaction)`)
+    }
+  } catch {
+    // Diagnostic must never disturb the summarization path.
   }
 }
 
