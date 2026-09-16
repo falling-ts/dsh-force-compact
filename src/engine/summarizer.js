@@ -194,7 +194,9 @@ export function frameSummary(textBlocks) {
  *     made; caller silently skips (nothing to cool down).
  *   • `{ status: '<failure>', reason: string }` — the call was made but no
  *     usable summary resulted. Failure labels: `not-iterable`, `no-finish`,
- *     `provider-error`, `aborted`, `truncated-empty`, `image-content`,
+ *     `provider-error`, `image-offload-required` (the route refused the replayed
+ *     images, upstream 0.1.6-alpha.1 `IMAGE_OFFLOAD_REQUIRED`), `aborted`,
+ *     `truncated-empty`, `image-content`,
  *     `empty-text`, `timeout` (hard wall-clock cap hit: stream aborted,
  *     presumed hung). Caller arms the per-session cooldown and closes the
  *     transaction with `error`.
@@ -527,6 +529,26 @@ async function __summarizeBody(ctx, config, agent, input, signal, extra) {
         + `failJson=${failJson} causeChain=${JSON.stringify(causeChain).slice(0, 600)} `
         + `stackInsideHarness=[${stackTop}] optionsShape={provider:${options.provider},model:${options.model},msgs:${options.messages.length},tools:${options.tools !== undefined ? options.tools.length : 'absent'},system:${typeof options.system},purpose:${options.purpose},effort:${options.reasoningEffort}}`)
     } catch { /* the probe itself must never mask the original outcome */ }
+    const failureCode = (() => {
+      const fact = readProp(finish, 'failure')
+      return (fact !== null && typeof fact === 'object' && typeof fact.code === 'string') ? fact.code : undefined
+    })()
+    if (failureCode === 'IMAGE_OFFLOAD_REQUIRED') {
+      // Upstream 0.1.6-alpha.1 replaced silent request-image offloading with a
+      // REFUSAL: the adapter throws this code when the replayed span carries more
+      // images than the route budget allows, and its only recovery listeners are
+      // `agent/request-error` and `compaction/summary-error` — a direct
+      // `ctx.llm.stream` call from this plugin passes through neither. Name the
+      // cause explicitly so the operator gets an actionable line instead of a
+      // generic provider error, and so the fix (a smaller span, or a durable
+      // `image/offload` decision) is obvious.
+      return {
+        status: 'image-offload-required',
+        reason: 'route image budget exceeded — the selected span carries images this route cannot send; '
+          + 'compact a smaller span, or let a durable image/offload decision drop them first ('
+          + (failureText(readProp(finish, 'failure')) || 'IMAGE_OFFLOAD_REQUIRED') + ')',
+      }
+    }
     return { status: 'provider-error', reason: 'provider failure: ' + (failureText(readProp(finish, 'failure')) || 'unknown provider error') }
   }
   if (finishKind === 'aborted') {

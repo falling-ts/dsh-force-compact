@@ -127,10 +127,15 @@ REGION-PICK 诊断行新增 `boundaryKind=` 字段；加载标记升级为
 `delta = 检查点估价 − claim.tokens` 完成真正的扣减。**范围不匹配的 replace 会 THROW**；
 无索赔的 replace 按中性 0 delta 折入。生产者因此必须做到两点：
 ① summary 与 replace **同步相邻**追加（中间不得插入任何其他事件，否则索赔作废）；
-② `shadowedTokenCount` 必须等于**被替换 surface 区间在米表估价器下的总估值**
-（官方 `compaction-basic/src/region.ts` `prepareCompaction` 的做法是
-`selectedNodes.reduce((total, node) => total + node.tokens, 0)`，逐位取自
-`tokenMeter.measure` 的 per-node 价格，与折叠器对每个 surface 节点的估价**同一个数学定义**）。
+② `shadowedTokenCount` 必须等于**被替换 surface 区间的启发价总和**——官方
+`compaction-basic/src/region.ts` `prepareCompaction` 算的是
+`selectedNodes.reduce((total, node) => total + node.heuristicTokens, 0)`。
+**关键：是 `heuristicTokens`（路由无关的固定启发价），不是 `tokens`（路由价）**，
+两者是不同的字段：折叠器 `planSurfaceTokens` 结算 replace 时用的是
+`deltaTokens = heuristicTokens(检查点) − Σ heuristicTokens(被替换节点)`，而路由价只进
+`compaction/summary` 的另一个字段 `shadowedRouteTokenCount`
+（`packages/llm/token-meter/src/types.ts` 原文："The shadow-price protocol prices
+replacements with this value"）。逐节点启发价 = `estimateMessage(deriveEventMessage(event))`。
 
 **历史缺陷**——本插件此前的账单口径是"喂给摘要 LLM 的角色化扁平文本按 chars/4"
 （`estimateTokens(projectRegion(...).messages)`）：既不含 tool-result 原始输出、也不含
@@ -141,10 +146,10 @@ schema/推理块的结构开销，系统性低估真实 surface 成本 → 折�
 **修复（本 2026-08 版）**——`src/engine/builtin.js` 顶部新增与官方
 `packages/llm/token-meter/src/estimate.ts` **逐字同形的纯 JS 移植块**（CHAR/BLOCK/ROLE
 开销常量 + `estimateContent` 递归 + `estimateHeader` 两部分 + `priceSurfaceNode`
-按官方 `foldSurface` 的逐节点规则 + `priceRegionFromMeasurement` 按官方
+按官方 `analyzeNode` 的逐节点规则 + `priceRegionFromMeasurement` 按官方
 `prepareCompaction` 的 reduce 语义），`runTransaction` 的账单计算改为：
-优先从同一份 `tokenMeter.measure` 快照的 `nodes[].tokens`（与选区截点同源，
-`compactNow` 路径传入、其余入口按需现场采样）累加覆盖区间的 per-node 价；
+优先从同一份 `tokenMeter.measure` 快照的 `nodes[]` 累加覆盖区间的 **`heuristicTokens`**
+（与选区截点同源，`compactNow` 路径传入、其余入口按需现场采样）；
 快照缺失/不全时退化到对 `session.events` 直接逐位估价（`priceSurfaceNode`）；
 两条路都无法覆盖 → **fail-loud 拒提交**（宁可放弃本次事务，也不写一条会让持久
 投影漂移到错误方向的坏索赔）。`compactNow` 路径的选区、阈值门禁、账单三处
@@ -152,6 +157,57 @@ schema/推理块的结构开销，系统性低估真实 surface 成本 → 折�
 另一个口径、账单再用第三个口径"的错位。缩容门禁（`summaryTextLen < 账单 ×
 CHARS_PER_TOKEN` 或 meter 估价版）保留不变，确保合规事务净 delta 必为负、
 计数严格下降。
+
+**口径纠偏（2026-09-17，与 harness 0.1.6-alpha.1 同步时发现）**——上面那套移植当时
+漏了两件事，探针 `exploration/fc-shadow-price-parity-probe.mjs`（与官方
+`planSurfaceTokens` / `estimateMessage` **逐例对拍**）现已锁死：
+
+1. **账单取错字段**：`priceRegionFromMeasurement` 累加的是 `node.tokens`（路由价），
+   而索赔必须用 `node.heuristicTokens`。凡路由价高于固定启发价的会话（图片、文件——
+   它们的请求价归路由所有）都会**少报账单** → `delta` 偏正 → 计数器少扣，正是"压缩后
+   不降反升"那一族症状。现取 `heuristicTokens`，仅在该字段缺失（更老的快照）时回退 `tokens`。
+2. **退化路径漏角色开销**：`priceSurfaceNode` 只给 `tool/result` 加 `ROLE_OVERHEAD`，
+   user/assistant 漏加 4 tokens/条。现改为完整镜像官方
+   `estimateMessage(deriveEventMessage(event))`：非 system 一律 `estimateContent + ROLE`；
+   system 按文本密度单次取整 + ROLE；**空内容 system/assistant 一律计 0**
+   （空 assistant 节点只承载 usage，官方 `deriveEventMessage` 对它返回 `null`——
+   注意 `if (content)` 判断对空数组 `[]` 为真，必须显式查 `length === 0`）。
+
+**投影缝（同日同步）**：`priceSurfaceNode` 与 `projectRegion` 现在都先经
+`surface.deriveEventMessage(event)` 取消息（三值：对象=采用；`null`=缝判定无消息；
+`undefined`=缝不可用 → 回退原始 payload）。原因见下节 `image/offload`。
+
+### 投影型事件与 `image/offload`（harness 0.1.6-alpha.1，2026-09-17 增补）
+
+上游新增 `packages/compaction/compaction-image-offload`：请求图像超出路由预算时，它追加一条
+**log-only 的 `@messageProjection` 事件** `image/offload`，`targets` 指名「哪个 surface 节点、
+第几个 depth-first 图像 occurrence 被丢弃」。三条关键语义：
+
+- **标记只存在于投影输出里，不在存储事件里**：`image/offload` 的 payload 只有 targets；
+  `{...block, offloaded: true}` 由**读时投影**（`offloadMessageImages`）加上，而把标记替换成
+  占位文本是**适配器在请求序列化时**做的（`projectOffloadedImages`）。所以"读原始事件"与
+  "读投影消息"看到的是不同的东西。
+- **门禁变严**：旧适配器会自行静默 offload 超预算的图像；新适配器直接抛
+  `LlmError(code='IMAGE_OFFLOAD_REQUIRED')`（文案："request images exceed the route budget;
+  N more oldest occurrence(s) must be offloaded"）。
+- **恢复缝只有两条**：`agent/request-error` 与 `compaction/summary-error`（后者为区间内新增）。
+
+**为什么这命中本插件**：本插件的摘要调用**直连 `ctx.llm.stream`**，既不在 `agent/request`
+缝上、也不在那两条恢复 waterfall 上。而 `projectRegion` 原先直接读 `event.data` 拼回放消息
+——**不带 `offloaded` 标记**——于是适配器不会替换，用户已离线的图像会被真的发出去；区间图像
+超预算时直接抛 `IMAGE_OFFLOAD_REQUIRED`，摘要以 error 关闭、永不提交（`failureCooldown` 只
+兜诊断、不拒绝，故不自愈）。旧版不存在这个失败面。
+
+**现方案**：`projectRegion` 与 `priceSurfaceNode` 都先经 `surface.deriveEventMessage(event)`
+（官方逐事件投影读取，已应用全部已提交投影）；`summarizer.js` 另把
+`IMAGE_OFFLOAD_REQUIRED` 单独识别为 `status: 'image-offload-required'`，日志给出可操作原因
+（压缩更小的区间，或先让 durable 的 `image/offload` 决策丢弃它们），而不是退化成通用
+`provider-error`。
+
+**通用教训**：任何"重建模型输入"的代码（回放、修剪、摘要输入）都必须消费**投影后消息**，
+而不是原始事件 payload —— 这是上游 2026-08-19 定的强制投影缝（
+`.agents/notes/implemented/architecture/2026-08-19-session-projection-mandatory-seam.md`）。
+`image/offload` 是第一个让违反该缝**产生运行时失败**（而非仅语义偏差）的投影事件。
 
 **折叠器侧不变量**（供日后排查）：`pressureTokens`（provider usage 锚定）在
 压缩后不会立即变化，要到**下一次请求**拿到新的 usage sample 才会反映收缩；
@@ -462,6 +518,15 @@ harness 在 0.1.2-rc.1 时代重构了 `Session` 类：**不再暴露公开的 `
 `snapshotEvents()` / 旧 `events` 数组双兼容，永不抛）与 `sessionEventAt(session, seq)`；
 `hasSessionEventStore(session)` 供诊断读取做闸门。**新增任何读会话事件的代码一律
 用这两个 helper，禁止直接访问 `session.events`。**
+
+**弃用通告（2026-09-09，上游已实现）**：`Session.eventAt()` / `snapshotEvents()` /
+`ownEvents()` 三者现带 `@deprecated`，**新调用被禁止**，理由是存储方向要停止在内存里
+保留完整事件序列（`packages/core/session/src/index.ts`；决策笔记
+`.agents/notes/implemented/architecture/2026-09-09-deprecate-synchronous-session-event-reads.md`）。
+上游明确允许既有代码延后迁移（其自身生产代码同样带 `no-deprecated` 豁免），且当前实现
+仍完整保留内存序列，故 `session-events.js` **本轮不动**。迁移方向：改用 `session.surface`
+的投影读取（`deriveEventMessage` / `surface.nodes`）与显式分页历史读，**不要**再造一个
+同步历史访问的别名/包装（上游明文禁止）。这是本插件下一次上游同步的首要技术债。
 
 ## 会话格式 V3 适配（harness 0.1.5，2026-09）
 

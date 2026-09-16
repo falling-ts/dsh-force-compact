@@ -145,18 +145,22 @@ const MAX_REPLAY_MESSAGES = 1024
 //     tool-result recurse+BLOCK; unknown block JSON-stringified);
 //   • `estimateHeaderParts` ≙ official `estimateHeader` (system ceil(len/4)+ROLE
 //     when present; tools ceil(JSON len/4)+BLOCK when non-empty);
-//   • `priceSurfaceNode` ≙ official `foldSurface` pricing
-//     (user/user-message → message content; assistant/message → its content;
-//     tool/result → content + ROLE overhead when content present; otherwise 0);
+//   • `priceSurfaceNode` ≙ the fold's per-node price (`analyzeNode`) =
+//     `estimateMessage(deriveEventMessage(event))` — the node's derived message
+//     priced as content + ROLE framing (system by text density), or 0 when the
+//     node derives none;
 //   • `priceRegionFromMeasurement` ≙ official `prepareCompaction`'s
-//     `selectedNodes.reduce((total, node) => total + node.tokens, 0)`.
+//     `selectedNodes.reduce((total, node) => total + node.heuristicTokens, 0)`
+//     — the HEURISTIC field, never the route-priced `tokens` (see its JSDoc for
+//     why picking the wrong one biases every settlement).
 // ---------------------------------------------------------------------------
 
 const ESTIMATE_BLOCK_OVERHEAD = 4
 const ESTIMATE_ROLE_OVERHEAD = 4
 
-/** Port of official `estimateContent`: recursive block pricing under the fixed density heuristic. */
-function estimateContentBlocks(blocks) {
+/** Port of official `estimateContent`: recursive block pricing under the fixed density heuristic.
+ * Exported for the estimator-parity verification probe. */
+export function estimateContentBlocks(blocks) {
   let tokens = 0
   if (!Array.isArray(blocks)) return tokens
   for (const block of blocks) {
@@ -174,6 +178,23 @@ function estimateContentBlocks(blocks) {
       case 'tool-result':
         tokens += estimateContentBlocks(Array.isArray(block.content) ? block.content : []) + ESTIMATE_BLOCK_OVERHEAD
         break
+      case 'image': {
+        // Official `estimateStructuralBlock` prices an image by its REFERENCE
+        // JSON with the `offloaded` mark stripped (2026-09, when the
+        // `compaction-image-offload` plugin started writing durable
+        // `image/offload` milestones): route pricing owns the placeholder, so
+        // the mark must not add tokens here. Mirroring the strip keeps the
+        // shadow bill equal to the fold's valuation of the same range.
+        let json
+        try {
+          const { offloaded: _offloaded, ...reference } = block
+          json = JSON.stringify(reference)
+        } catch {
+          json = ''
+        }
+        tokens += ESTIMATE_BLOCK_OVERHEAD + Math.ceil(json.length / CHARS_PER_TOKEN)
+        break
+      }
       default: {
         // Merge-extensible union: unknown block types retain a conservative
         // structural JSON price (official `default` arm).
@@ -213,46 +234,124 @@ function estimateHeaderTokens(header) {
 }
 
 /**
- * Port of the official surface-fold per-node pricing (`foldSurface`):
- *   • `user/message` / `user` → content blocks, NO role framing;
- *   • `assistant/message` → `data.message.content`, NO role framing;
- *   • `tool/result` → `data.message.content` + ROLE OVERHEAD when content present;
- *   • anything else → 0 (and it is not a priced surface node anyway).
- * All dereferences guarded so a malformed node degrades to 0 rather than throw.
+ * JSON length of one block under a guarded stringify; 0 when it cannot
+ * serialize (a cyclic or otherwise hostile value degrades instead of throwing).
  */
-function priceSurfaceNode(event) {
-  if (event === null || typeof event !== 'object') return 0
-  const data = (event.data && typeof event.data === 'object') ? event.data : {}
-  const type = event.type
-  if (type === 'user/message' || type === 'user') return estimateContentBlocks(data.content)
-  if (type === 'assistant/message') {
-    const message = (data.message && typeof data.message === 'object') ? data.message : {}
-    return estimateContentBlocks(message.content)
+function safeJsonLength(block) {
+  try {
+    const json = JSON.stringify(block)
+    return typeof json === 'string' ? json.length : 0
+  } catch {
+    return 0
   }
-  if (type === 'tool/result') {
-    const message = (data.message && typeof data.message === 'object') ? data.message : {}
-    if (message.content === undefined || message.content === null) return 0
-    return estimateContentBlocks(message.content) + ESTIMATE_ROLE_OVERHEAD
-  }
-  return 0
 }
 
 /**
- * Port of official `prepareCompaction`'s shadow bill — sum the METER-PRICED
- * nodes covering exactly the requested seq range. Prefer the live meter
- * snapshot's per-node prices (`measurement.nodes`, each `{seq, tokens}`,
- * priced by the SAME estimator family the fold uses); fall back to pricing
- * the session log directly when the snapshot is unusable or does not cover
- * the range. Returns `null` when neither source can price the range, so the
- * CALLER decides whether to degrade (pre-check only) or fail-loud
- * (transaction commit — a summary with no priced claim poisons the fold).
+ * Port of official `estimateMessage` — the fixed heuristic price of ONE derived
+ * message, which is exactly what the fold prices a surface node with
+ * (`analyzeNode` → `estimateMessage(deriveEventMessage(event))`):
+ *   • `system` → text density over the rendered prompt plus ROLE framing, in ONE
+ *     ceiling (adapters serialize the prompt as a plain string, so there is no
+ *     per-block overhead);
+ *   • anything else → `estimateContent` plus ROLE framing.
+ * Callers return 0 for a node that derives no message.
+ * Exported (with `priceSurfaceNode` / `priceRegionFromMeasurement` /
+ * `nodeHeuristicPrice`) for the shadow-price parity verification probe.
+ */
+export function estimateMessageTokens(message) {
+  const content = Array.isArray(message.content) ? message.content : []
+  if (message.role === 'system') {
+    if (content.length === 0) return 0
+    let characters = 0
+    for (const block of content) {
+      if (block !== null && typeof block === 'object' && block.type === 'text' && typeof block.text === 'string') {
+        characters += block.text.length
+      } else {
+        characters += safeJsonLength(block)
+      }
+    }
+    return Math.ceil(characters / CHARS_PER_TOKEN) + ESTIMATE_ROLE_OVERHEAD
+  }
+  return estimateContentBlocks(content) + ESTIMATE_ROLE_OVERHEAD
+}
+
+/**
+ * Port of the fold's per-node heuristic price (`analyzeNode`): the fixed
+ * heuristic price of the node's DERIVED message, 0 when the node derives none.
+ * The message is read through the same projection seam `projectRegion` uses, so
+ * a projected node is priced the way the fold prices it.
+ *
+ * The role-framing term is NOT optional per type: every non-system message adds
+ * `ROLE_OVERHEAD`, so a type-table that grants it to `tool/result` only
+ * under-declares the shadow bill by 4 tokens per user/assistant node — and the
+ * shadow bill must equal the fold's own valuation of the same range.
+ * All dereferences guarded so a malformed node degrades to 0.
+ */
+export function priceSurfaceNode(session, event) {
+  if (event === null || typeof event !== 'object') return 0
+  const projected = projectedMessageFor(session, event)
+  if (projected === null) return 0
+  const message = (projected !== undefined) ? projected : rawDerivedMessage(event)
+  if (message === null || message === undefined || typeof message !== 'object') return 0
+  return estimateMessageTokens(message)
+}
+
+/**
+ * Port of official `deriveEventMessage`'s UNPROJECTED branches — the message a
+ * surface event derives when no committed projection overrides it:
+ *   • `user/message` → the event's own data (the payload IS the message);
+ *   • `system/message` / `assistant/message` → `data.message`, or NO message when
+ *     its content is empty (an empty assistant node hosts a step's usage and must
+ *     not become a turn; an empty system node records "no system prompt" while
+ *     keeping its surface position);
+ *   • `tool/result` → `data.message`;
+ *   • anything else → no message (0 price on the fold's side too).
+ * Returns `null` for "the seam says no message" and `undefined` for "not a
+ * message-producing event"; both price as 0.
+ */
+function rawDerivedMessage(event) {
+  const data = (event.data && typeof event.data === 'object') ? event.data : {}
+  const type = event.type
+  if (type === 'user/message' || type === 'user') return data
+  if (type === 'system/message' || type === 'assistant/message') {
+    const message = (data.message && typeof data.message === 'object') ? data.message : undefined
+    if (message === undefined) return undefined
+    const content = message.content
+    if (Array.isArray(content) && content.length === 0) return null
+    return message
+  }
+  if (type === 'tool/result') {
+    return (data.message && typeof data.message === 'object') ? data.message : undefined
+  }
+  return undefined
+}
+
+/**
+ * Port of official `prepareCompaction`'s shadow bill — sum the fold's HEURISTIC
+ * per-node prices covering exactly the requested seq range. Prefer the live
+ * meter snapshot's nodes (`measurement.nodes`, each carrying
+ * `heuristicTokens`); fall back to pricing the session log directly when the
+ * snapshot is unusable or does not cover the range. Returns `null` when neither
+ * source can price the range, so the CALLER decides whether to degrade
+ * (pre-check only) or fail-loud (transaction commit — a summary with no priced
+ * claim poisons the fold).
+ *
+ * HEURISTIC vs ROUTE price (the two are different fields, and picking the wrong
+ * one silently biases every settlement): `heuristicTokens` is the route-independent
+ * fixed-heuristic price of the node's message, and it is what `compaction/summary`
+ * must claim — official `prepareCompaction` computes
+ * `shadowedTokenCount = Σ node.heuristicTokens` while the route-priced total goes
+ * into the separate `shadowedRouteTokenCount`. The fold then settles a replace as
+ * `delta = heuristic(checkpoint) − Σ heuristic(shadowed nodes)`, so claiming the
+ * route price instead makes `delta` too positive (the counter under-subtracts)
+ * on any route that prices images or files above the fixed heuristic.
  *
  * @param {object} session the durable session (for the direct-log fallback).
  * @param {object} region `{start, end}` inclusive SURFACE-NODE seq bounds.
  * @param {object|undefined} measurement the `tokenMeter.measure` snapshot.
  * @returns {number|null}
  */
-function priceRegionFromMeasurement(session, region, measurement) {
+export function priceRegionFromMeasurement(session, region, measurement) {
   const events = sessionEvents(session)
   const surfaceNodes = (session && session.surface && Array.isArray(session.surface.nodes)) ? session.surface.nodes : []
   const firstIdx = surfaceNodes.indexOf(region.start)
@@ -265,11 +364,12 @@ function priceRegionFromMeasurement(session, region, measurement) {
     let complete = true
     for (const seq of covered) {
       const node = meterNodes.find(n => n && typeof n === 'object' && n.seq === seq)
-      if (node === undefined || node === null || typeof node.tokens !== 'number' || !Number.isFinite(node.tokens)) {
+      const price = nodeHeuristicPrice(node)
+      if (price === undefined) {
         complete = false
         break
       }
-      total += node.tokens
+      total += price
     }
     if (complete) return total
   }
@@ -277,9 +377,23 @@ function priceRegionFromMeasurement(session, region, measurement) {
   for (const seq of covered) {
     const event = events[seq]
     if (event === undefined || event === null || typeof event !== 'object') return null
-    total += priceSurfaceNode(event)
+    total += priceSurfaceNode(session, event)
   }
   return total
+}
+
+/**
+ * The node's HEURISTIC price from a meter snapshot entry, preferring
+ * `heuristicTokens` and falling back to `tokens` only when a snapshot predates
+ * that field. `undefined` when neither is a finite number (the caller then stops
+ * trusting the snapshot and re-prices from the log).
+ * Exported for the shadow-price parity verification probe.
+ */
+export function nodeHeuristicPrice(node) {
+  if (node === undefined || node === null || typeof node !== 'object') return undefined
+  if (typeof node.heuristicTokens === 'number' && Number.isFinite(node.heuristicTokens)) return node.heuristicTokens
+  if (typeof node.tokens === 'number' && Number.isFinite(node.tokens)) return node.tokens
+  return undefined
 }
 
 /**
@@ -781,12 +895,19 @@ async function runTransaction(ctx, agent, session, region, signal, settings, sou
     } else if (preview !== null && typeof preview === 'object' && (preview.status === 'no-target' || preview.status === 'no-llm')) {
       // The summarization call was NEVER made (no resolvable target, or no `llm`
       // service). There is nothing that "failed", so do NOT arm the cooldown —
-      // the next attempt should try again immediately. Close the bracket with a
-      // neutral, non-error note and stop (no doomed round-trip occurred).
+      // the next attempt should try again immediately. Close the bracket and stop
+      // (no doomed round-trip occurred).
       const why = (typeof preview.reason === 'string' && preview.reason.length > 0) ? preview.reason : preview.status
       info(ctx, `${session.id}: builtin compaction skipped (no summarization call made — ${why})`)
       try {
-        session.append('compaction/end', { compactionId, turn: currentOpenTurn(session), note: why })
+        // `error`, NOT `note`: the bracket is already open and cannot be preceded
+        // by a summary — the whole point of this branch is that no call was made —
+        // and the official invariant rejects a successful-looking
+        // `compaction/end` that has neither ("successful compaction/end requires
+        // one compaction/summary"). Swallowing that rejection left an UNCLOSED
+        // `compaction/start`, which `assertNoActiveCompaction` then used to refuse
+        // every later compaction of the same session.
+        session.append('compaction/end', { compactionId, turn: currentOpenTurn(session), error: why })
       } catch { /* best effort */ }
       return null
     } else {
@@ -1127,8 +1248,9 @@ function estimateSurfaceTokensLocal(session) {
  * segment from `start` to `end` in the live projection. Log-only events
  * contribute nothing; a projected node that yields no message still counts as
  * shadowed.
+ * Exported for the estimator/region projection verification probe.
  */
-function projectRegion(session, region) {
+export function projectRegion(session, region) {
   // Tolerate a malformed surface: a missing `session.surface` / non-array
   // `nodes` yields an EMPTY projection (zero shadowed, zero messages) rather
   // than a throw, so the caller simply finds nothing to compact instead of
@@ -1147,16 +1269,42 @@ function projectRegion(session, region) {
     const event = events[seq]
     if (event === undefined || event === null || typeof event !== 'object') continue
     const data = (event.data && typeof event.data === 'object') ? event.data : {}
+    // Canonical message seam FIRST. Durable `@messageProjection` milestones are
+    // stored OUTSIDE the event payload (2026-09 `image/offload` records only
+    // which occurrences were dropped; the `offloaded` mark itself exists only in
+    // the projection). Replaying `event.data` verbatim therefore handed the
+    // adapter an unmarked image that the session had already offloaded, so the
+    // adapter's own placeholder substitution skipped it and a replayed span could
+    // exceed the route image budget. `surface.deriveEventMessage` applies every
+    // committed projection to one event, which restores the marks.
+    const projected = projectedMessageFor(session, event)
+    if (projected === null) {
+      // The seam answered DEFINITIVELY that this event derives no model
+      // message — upstream returns null for an empty-content assistant/message,
+      // which exists only to host a max-tokens step's usage and must not inject
+      // a content-less assistant turn into a provider transcript. The node is
+      // still shadowed by the replace.
+      shadowedSeqs.push(seq)
+      continue
+    }
     if (event.type === 'user/message') {
       shadowedSeqs.push(seq)
-      messages.push({ role: 'user', content: data.content })
+      const content = (projected && projected.content !== undefined) ? projected.content : data.content
+      messages.push({ role: 'user', content })
     } else if (event.type === 'assistant/message') {
       shadowedSeqs.push(seq)
-      const content = (data.message && data.message.content !== undefined) ? data.message.content : undefined
-      const source = (data.message && typeof data.message.source === 'object' && data.message.source !== null) ? data.message.source : { kind: 'model' }
-      if (content) messages.push({ role: 'assistant', content, source })
+      const raw = (data.message && typeof data.message === 'object') ? data.message : undefined
+      const carrier = (projected && projected.content !== undefined) ? projected : raw
+      const content = (carrier && carrier.content !== undefined) ? carrier.content : undefined
+      const source = (carrier && typeof carrier.source === 'object' && carrier.source !== null) ? carrier.source : { kind: 'model' }
+      // Same emptiness rule the seam applies: an empty content array is a usage
+      // host, not a turn (and `[]` is truthy, so a bare `if (content)` would
+      // emit it).
+      const empty = Array.isArray(content) && content.length === 0
+      if (content && !empty) messages.push({ role: 'assistant', content, source })
     } else if (event.type === 'tool/result') {
-      const msg = (data.message && typeof data.message === 'object') ? data.message : undefined
+      const raw = (data.message && typeof data.message === 'object') ? data.message : undefined
+      const msg = (projected && projected.content !== undefined) ? projected : raw
       if (msg && msg.content) {
         shadowedSeqs.push(seq)
         messages.push({ role: 'user', content: msg.content, tool_call_id: msg.toolCallId })
@@ -1169,6 +1317,33 @@ function projectRegion(session, region) {
     }
   }
   return { shadowedSeqs, messages }
+}
+
+/**
+ * Model-visible message for ONE surface event with every committed message
+ * projection applied (`@messageProjection` milestones such as `image/offload`).
+ * Three-valued, and the distinction matters:
+ *   • an object — the projected message to replay;
+ *   • `null`    — the seam answered that this event derives NO message (an
+ *                 empty-content assistant usage host, or a projection that drops
+ *                 it): honor it;
+ *   • `undefined` — the seam is unavailable (older session core, or it threw),
+ *                 so the caller falls back to the raw event payload.
+ * Never throws: a projection failure must not abort the compaction transaction.
+ */
+function projectedMessageFor(session, event) {
+  try {
+    const surface = session && session.surface
+    if (surface && typeof surface.deriveEventMessage === 'function') {
+      const message = surface.deriveEventMessage(event)
+      if (message === null) return null
+      if (typeof message === 'object') return message
+    }
+  } catch {
+    // Defensive: an older/newer session core without a usable projection seam
+    // degrades to the raw payload.
+  }
+  return undefined
 }
 
 /**
