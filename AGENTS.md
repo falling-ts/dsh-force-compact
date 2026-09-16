@@ -415,6 +415,25 @@ DeepSeek 适配器（无独立的 llama.cpp 适配器包），再起一份 adapt
 
 ---
 
+## 主题（浅色 / 暗色）：颜色一律走 `--fcts-*`（2026-09-17 增补）
+
+本插件的设置分区与控件用内联 style。**内联 style 里的 `var()` 会沿 DOM 继承解析**，所以
+`web/client.js` 在 `apply` 时注入一张只定义变量的样式表 `<style id="falling-ts-theme-tokens">`
+（`THEME_TOKENS_CSS`，按 id 幂等），组件只引用 `var(--fcts-*)`：
+
+- `body{…}` = **改动前的浅色字面值**（`rgba(0,0,0,…)` 系）→ 浅色外观逐字节不变；
+- `body[data-ds-dark-theme]{…}` = **上游语义别名**（`label-primary` / `label-secondary` /
+  `border-l*` / `interactive-bg-*`），由官方主题包按肤定义、随主题自动翻转。
+  **暗色下说明文字（hint / intro / placeholder / value）取 `--dsw-alias-label-primary`
+  = `rgb(249,250,251)`（纯白）**，对比度 17.45:1；此前的 `rgba(0,0,0,0.45)` 在暗色下几乎不可见。
+
+保留字面量的只有品牌色（蓝渐变与辉光）、开关高光与投影阴影；其余（分隔线、边框、滑轨、
+未选中文字、开关关闭态底色）一律 token 化。`--fcts-*` 规则与 dsh-web-ding 注入的**逐字相同**
+（共享工作区命名空间，按 id 幂等，谁先注入都一样）。
+
+验证：`node exploration/theme-token-probe.mjs`（解析官方主题表 → 逐级解析 var 链 → 按 WCAG
+算对比度 → 拒绝悬空的上游 token → 保证浅色取值未漂移 → 扫出设置区残留字面色）。
+
 ## 界面文案与语言（i18n，2026-09-17 增补）
 
 设置分区与 LiveUI 徽章的**每一句产品文案都归 locale 服务所有**，代码里不得出现硬编码副本

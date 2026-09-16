@@ -254,9 +254,12 @@ window.__ModuleLoader__.load({
     // 参照通用设置分区（如「语言」）的排版：扁平、无背景色、行间细分隔线、
     // 紧凑纵向节奏；三栏网格 label（定宽一列）· control（右对齐一列）· hint，
     // label 与 hint 同列同字体纵向对齐，control 靠右，数值输入框等宽中性描边。
-    const divider = "rgba(0,0,0,0.08)";
-    const hintColor = "rgba(0,0,0,0.45)";
-    const mutedColor = "rgba(0,0,0,0.55)";
+    //
+    // 颜色一律经主题别名 `var(--fcts-*)`（见下方 THEME_TOKENS_CSS），**不写字面色**：
+    // 浅色沿用原字面值，暗色自动翻转为上游语义别名（说明文字取纯白）。
+    const divider = "var(--fcts-line)";
+    const hintColor = "var(--fcts-text-hint)";
+    const mutedColor = "var(--fcts-text-muted)";
     const gridCols = "172px 140px minmax(0,1fr)";
     const wrapStyle = { padding: "4px 0" };
     const titleStyle = { margin: "2px 0 2px", fontSize: 15, lineHeight: 1.4 };
@@ -266,7 +269,7 @@ window.__ModuleLoader__.load({
     const labelStyle = { fontSize: 13.5, fontWeight: 500, lineHeight: 1.35 };
     const controlStyle = { display: "flex", justifyContent: "flex-end", alignItems: "center" };
     const hintStyle = { gridColumn: "1 / 3", gridRow: 3, color: hintColor, fontSize: 12, lineHeight: 1.55 };
-    const inputStyle = { width: 128, textAlign: "right", padding: "5px 10px", boxSizing: "border-box", border: "1px solid rgba(0,0,0,0.22)", borderRadius: 6, fontVariantNumeric: "tabular-nums", backgroundColor: "transparent", outline: "none", fontSize: 13 };
+    const inputStyle = { width: 128, textAlign: "right", padding: "5px 10px", boxSizing: "border-box", border: "1px solid var(--fcts-line-strong)", borderRadius: 6, fontVariantNumeric: "tabular-nums", backgroundColor: "transparent", outline: "none", fontSize: 13 };
     // 精致的 Switch：更缓动的位移动画（cubic-bezier），开态用品牌蓝→亮青渐变
     // + 轻微外发光，滑块白色带双层阴影；悬停时外圈高亮提示可点。
     const brandGrad = "linear-gradient(90deg,#2f6bff 0%,#3d8bff 100%)";
@@ -287,7 +290,7 @@ window.__ModuleLoader__.load({
       height: 22,
       borderRadius: 999,
       transition: "background .22s ease, box-shadow .22s ease",
-      background: on ? brandGrad : (hovered && !disabled ? "rgba(0,0,0,0.24)" : "rgba(0,0,0,0.16)"),
+      background: on ? brandGrad : (hovered && !disabled ? "var(--fcts-fill-off-hover)" : "var(--fcts-fill-off)"),
       boxShadow: on ? "inset 0 0 0 1px rgba(255,255,255,0.12), 0 0 10px rgba(47,107,255,0.35)" : "inset 0 1px 2px rgba(0,0,0,0.12)",
       opacity: disabled ? 0.5 : 1,
     });
@@ -386,9 +389,9 @@ window.__ModuleLoader__.load({
           ...btnBase,
           padding: "5px 12px",
           borderRadius: 999,
-          border: sel ? "1px solid rgba(47,107,255,0.7)" : "1px solid rgba(0,0,0,0.18)",
+          border: sel ? "1px solid rgba(47,107,255,0.7)" : "1px solid var(--fcts-line-soft)",
           background: sel ? "linear-gradient(90deg,#2f6bff 0%,#3d8bff 100%)" : "transparent",
-          color: sel ? "#ffffff" : "rgba(0,0,0,0.65)",
+          color: sel ? "#ffffff" : "var(--fcts-text-body)",
           boxShadow: sel ? "0 0 8px rgba(47,107,255,0.35)" : "none",
           opacity: disabled ? 0.5 : 1,
           transition: "color .18s ease, background .18s ease, border-color .18s ease, box-shadow .18s ease",
@@ -616,7 +619,7 @@ window.__ModuleLoader__.load({
           outline: "none",
         },
       },
-        h("div", { style: { position: "absolute", left: 0, right: 0, top: TRACK_TOP, height: SLIDER_H, borderRadius: 999, background: "rgba(0,0,0,0.14)" } }),
+        h("div", { style: { position: "absolute", left: 0, right: 0, top: TRACK_TOP, height: SLIDER_H, borderRadius: 999, background: "var(--fcts-fill-subtle)" } }),
         h("span", { style: sliderFill(pct) }),
         h("span", { style: sliderKnob(pct, dragging, hovered) }));
 
@@ -944,6 +947,65 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 主题感知的颜色别名（浅色 / 暗色两套）。
+     *
+     * 本插件是 plain JS、无构建步骤，组件用内联 style 而非 CSS Module，因此不能像官方
+     * 客户端包那样直接写 `color: var(--dsw-alias-*)`——但**内联 style 里的 var() 照样
+     * 沿 DOM 继承解析**，所以做法是：注入一张只定义变量的样式表，组件里只引用
+     * `var(--fcts-*)`。这样浅色与暗色各有一份取值，组件代码与主题完全解耦。
+     *
+     * - **浅色**：逐个取改动前的字面值（`rgba(0,0,0,…)` 系），故浅色外观逐字节不变。
+     * - **暗色**（选择器 `body[data-ds-dark-theme]`，官方 ui-theme 切换主题时打的属性）：
+     *   改指上游语义别名。**说明文字取 `--dsw-alias-label-primary`**——它在暗色下解析为
+     *   `--dsw-static-neutral-bluish-50` = `rgb(249,250,251)`，即纯白；其余次级文字取
+     *   `label-secondary`，分隔/边框/底纹取 `border-l*` / `interactive-bg-hover`。这些别名
+     *   由官方主题包按肤定义（packages/client/ui-theme/src/styles/design-platform.css），
+     *   随主题自动翻转，不必本插件自己判肤。
+     *
+     * 变量前缀用工作区命名空间 `--fcts-`（falling-ts）。dsh-web-ding 注入的规则逐字相同，
+     * 两者谁先注入都一样（幂等按元素 id 判定）。
+     */
+    const THEME_TOKENS_CSS = [
+      "body{",
+      "--fcts-text-hint:rgba(0,0,0,0.45);",
+      "--fcts-text-muted:rgba(0,0,0,0.55);",
+      "--fcts-text-body:rgba(0,0,0,0.65);",
+      "--fcts-line:rgba(0,0,0,0.08);",
+      "--fcts-line-soft:rgba(0,0,0,0.18);",
+      "--fcts-line-strong:rgba(0,0,0,0.22);",
+      "--fcts-fill-subtle:rgba(0,0,0,0.14);",
+      "--fcts-fill-off:rgba(0,0,0,0.16);",
+      "--fcts-fill-off-hover:rgba(0,0,0,0.24);",
+      "--fcts-fill-hover:rgba(0,0,0,0.06);",
+      "}",
+      "body[data-ds-dark-theme]{",
+      "--fcts-text-hint:var(--dsw-alias-label-primary);",
+      "--fcts-text-muted:var(--dsw-alias-label-secondary);",
+      "--fcts-text-body:var(--dsw-alias-label-secondary);",
+      "--fcts-line:var(--dsw-alias-border-l2);",
+      "--fcts-line-soft:var(--dsw-alias-border-l2);",
+      "--fcts-line-strong:var(--dsw-alias-border-l3);",
+      "--fcts-fill-subtle:var(--dsw-alias-border-l3);",
+      "--fcts-fill-off:var(--dsw-alias-interactive-bg-active);",
+      "--fcts-fill-off-hover:var(--dsw-alias-interactive-bg-hover-accent);",
+      "--fcts-fill-hover:var(--dsw-alias-interactive-bg-hover);",
+      "}",
+    ].join("");
+
+    /**
+     * 确保主题别名样式表已挂在 <head>（幂等，至多一次）。
+     * @returns void
+     */
+    function ensureThemeTokensInlined() {
+      if (typeof document === "undefined") return;
+      if (document.getElementById("falling-ts-theme-tokens")) return;
+      const el = document.createElement("style");
+      el.id = "falling-ts-theme-tokens";
+      el.textContent = THEME_TOKENS_CSS;
+      document.head.appendChild(el);
+    }
+
+    /**
      * 把本插件贡献的语言（ja / ko）注册进 locale 目录。
      *
      * 上游 @deepseek-ai/dsh-client-locale 只内置 zh / en（LOCALE_IDS 为
@@ -993,6 +1055,8 @@ window.__ModuleLoader__.load({
       const scope = ctx.settingsScope.bind({ namespace: NS_SETTINGS });
       // 挂载 swish 调色板样式表（首次 apply 时执行一次；effect 登记便于 fiber 卸载时清理）。
       ctx.effect(() => ensureSwishStylesheetInlined(), "force-compact: swish stylesheets");
+      // 主题别名（浅色/暗色两套取值）。注入失败只影响取色、不影响功能。
+      ctx.effect(() => ensureThemeTokensInlined(), "force-compact: theme tokens");
       // 把 settingsScope 镜像成 uSES 安全的 SnapshotStore（hooks 分区的可观察源）。
       const store = createSnapshotStore({ status: "loading", value: undefined, writable: false });
       const derive = () => {
