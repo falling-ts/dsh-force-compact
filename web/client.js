@@ -62,6 +62,29 @@ window.__ModuleLoader__.load({
       notWritable: "（当前为只读/内存模式，改动仅本进程生效）",
       onWord: "开",
       offWord: "关",
+      badgeCompressing: "[强制压缩中>>>]",
+      badgeDone: "[压缩完成!]",
+      badgeEnd: "",
+      badgeWorking0: "正在酝酿骚操作...",
+      badgeWorking1: "正在憋大招...",
+      badgeWorking2: "灵感正在路上...",
+      badgeWorking3: "脑细胞开会中...",
+      badgeWorking4: "灵魂拷问进行中...",
+      badgeWorking5: "偷偷翻你底牌...",
+      badgeWorking6: "量子纠缠计算中...",
+      badgeWorking7: "假装很忙...",
+      badgeWorking8: "摸鱼式工作中...",
+      badgeWorking9: "疯狂敲键盘(精神上)...",
+      badgeWorking10: "正在缝合上下文...",
+      badgeWorking11: "正在驯服混沌...",
+      badgeWorking12: "正在召唤赛博大脑...",
+      badgeWorking13: "正在翻阅《天机》...",
+      badgeWorking14: "GPU 正在冒烟...",
+      badgeWorking15: "正在跟熵值搏斗...",
+      badgeWorking16: "正在画饼给你吃...",
+      badgeWorking17: "正在偷渡灵感...",
+      badgeWorking18: "正在暗中观察...",
+      badgeWorking19: "马上就好(大概)...",
     };
     const en = {
       nav: "Force Compact",
@@ -94,6 +117,29 @@ window.__ModuleLoader__.load({
       notWritable: "(read-only / memory mode; changes are process-local)",
       onWord: "on",
       offWord: "off",
+      badgeCompressing: "[Compacting…]",
+      badgeDone: "[Compaction complete!]",
+      badgeEnd: "",
+      badgeWorking0: "Cooking up a wild move...",
+      badgeWorking1: "Charging up a big move...",
+      badgeWorking2: "Inspiration is on the way...",
+      badgeWorking3: "Brain cells in session...",
+      badgeWorking4: "Soul-searching in progress...",
+      badgeWorking5: "Sneaking a peek at your cards...",
+      badgeWorking6: "Quantum-entangled computing...",
+      badgeWorking7: "Looking busy...",
+      badgeWorking8: "Low-key slacking (working)...",
+      badgeWorking9: "Pounding keys furiously (mentally)...",
+      badgeWorking10: "Stitching context together...",
+      badgeWorking11: "Taming the chaos...",
+      badgeWorking12: "Summoning a cyber brain...",
+      badgeWorking13: "Leafing through heaven's manual...",
+      badgeWorking14: "GPU is smoking...",
+      badgeWorking15: "Wrestling with entropy...",
+      badgeWorking16: "Dangling a tasty promise...",
+      badgeWorking17: "Smuggling in inspiration...",
+      badgeWorking18: "Watching from the shadows...",
+      badgeWorking19: "Almost done (maybe)...",
     };
 
     /** 必需服务（cordis fiber inject）。settingsScope 由 ui-settings 提供。 */
@@ -615,12 +661,13 @@ window.__ModuleLoader__.load({
      * 「Deep diving…」指示器的实时贴皮器（live UI 徽章）。
      *
      * 宿主半部（core/ui-signal.js）在四个时机改写本命名空间的 liveUi 字段：
-     *   • 每次出站 LLM 调用开始时——写入 20×20 随机工作态（phase/text/color）；
+     *   • 每次出站 LLM 调用开始时——写入 20×20 随机工作态（phase/text/textId/color）；
      *   • 任意一次强制压缩开始前——固定红色「[强制压缩中>>>]」；
      *   • 压缩成功后——固定绿色「[压缩完成!]」；
      *   • 会话结束时（agent 转入 idle，hooks/idle.js）——空字符串 text
      *     （isImportant）：语义是"清空"——抹掉徽章文字、撤掉相位 class，
      *     徽章回到官方外观（取代 2026-09 前"会话开始时强制重绘随机工作态"）。
+     * 文本按 textId 经下方词典做 zh/en 本地化（跟随应用语言），见 paintTurnStatus。
      * 本函数把该字段的最新值贴到对话区那个 `<div role="status" aria-live="polite">`
      * （官方 `TurnStatus` 组件，"Deep diving…" 所在处）的**第一个文本节点**上，
      * 并按 phase 着色。这是一次**瞬时 DOM 覆盖**：React 的下一帧重绘会自行还原
@@ -650,8 +697,10 @@ window.__ModuleLoader__.load({
      * 的规则、互不干扰；phase 消失（React 重建节点、新 TurnStatus 挂载）后
      * 属性不复存在 → 规则不再命中 → 官方 shimmer 自然恢复。
      *
-     * @param liveUi - 宿主写入的 { phase, text, color }；缺省/null 时 no-op；
+     * @param liveUi - 宿主写入的 { phase, text, textId, color }；缺省/null 时 no-op；
      *   `text` 为空字符串时执行"清空"（抹掉所贴文本 + 撤相位 class/属性）。
+     *   文本本地化：`textId` 是语言无关鉴别符（phase 或 'working.N'），经 t() 的
+     *   zh/en 词典映射成语种文本；textId 缺失/无 t/解析失败时回落到规范中文 text。
      */
     // ── 扫光配色表：20 个工作态颜色 + 2 个钉住颜色（compressing 红 / done 绿）──
     // 每条对应 web/swish.css 里的 .falling-ts-swish-NN（@keyframes falling-ts-swish-NN），
@@ -681,12 +730,41 @@ window.__ModuleLoader__.load({
     // 重新贴字；React 重建节点（新 element → Map 未命中）时回落到搜索、重新
     // 捕获 React 的新文本节点。
     const paintedTextChild = new WeakMap();
-    function paintTurnStatus(liveUi) {
+    // 把宿主写下的语言无关 textId 映射到本 NS 的词典键。相位猜成语同名键
+    // （compressing/done/end → badgeCompressing/badgeDone/badgeEnd），工作态
+    // 'working.N' → badgeWorkingN（0..19，与 src/core/ui-signal.js 的
+    // WORKING_TEXTS 长度对齐）；越界/未知一律 null（回落到规范中文 text）。
+    function textIdToKey(textId) {
+      if (textId === "compressing" || textId === "done" || textId === "end") {
+        return "badge" + textId[0].toUpperCase() + textId.slice(1);
+      }
+      if (textId.indexOf("working.") === 0) {
+        const n = textId.slice("working.".length);
+        if (/^\d+$/.test(n) && Number(n) < 20) return "badgeWorking" + n;
+      }
+      return null;
+    }
+    // 徽章显示文本：优先按 textId 经 t() 取当前语种词典的译文；t 缺失 / textId
+    // 缺失 / 键未解析（t 返回键名自身）时回落到宿主规范中文 text。空串就是"清空"。
+    function resolvedText(liveUi, t) {
+      const key = textIdToKey(typeof liveUi.textId === "string" ? liveUi.textId : "");
+      if (key === null || typeof t !== "function") return liveUi.text;
+      const localized = t(key);
+      return (typeof localized === "string" && localized !== key) ? localized : liveUi.text;
+    }
+    function paintTurnStatus(liveUi, t) {
       if (typeof document === "undefined") return;
       if (!liveUi || typeof liveUi.text !== "string") return;
       // 空 text = "清空"（会话结束推送，hooks/idle.js → ui-signal publishEnd）：
       // 抹掉徽章文字并撤掉相位 class/属性，徽章回到官方外观。
-      const color = liveUi.text.length === 0 ? null : (typeof liveUi.color === "string" && liveUi.color !== "" ? liveUi.color : null);
+      let display = resolvedText(liveUi, t);
+      // 会话结束清空是承载不变量：end 相位的语义就是"清空"，必须无条件触发，
+      // 不能经本地化判断——若将来 badgeEnd 被译成非空字符串，徽章也会被清空，
+      // 而非残留一段"孤儿文字"挂在官方样式上。
+      if (display.length !== 0 && (liveUi.text === "" || liveUi.textId === "end")) {
+        display = "";
+      }
+      const color = display.length === 0 ? null : (typeof liveUi.color === "string" && liveUi.color !== "" ? liveUi.color : null);
       const nodes = document.querySelectorAll('[role="status"][aria-live="polite"]');
       if (nodes.length === 0) return; // 没有 running 会话 → 没有 TurnStatus
       const targetCls = color !== null ? swishClassForColor(color) : null;
@@ -701,7 +779,7 @@ window.__ModuleLoader__.load({
           }
           if (textChild === null) continue;
         }
-        textChild.nodeValue = liveUi.text; // "" → 清空徽章文字
+        textChild.nodeValue = display; // "" → 清空徽章文字
         paintedTextChild.set(node, textChild);
         // class 化：先清掉所有上一轮的 swish class，再贴本次（target 为空时只清不加）。
         for (const cls of [...node.classList]) {
@@ -793,7 +871,7 @@ window.__ModuleLoader__.load({
           // 红线。幂等纯装饰:贴不上（无 running 会话/无 DOM 锚点）即静默跳过。
           const liveUi = (typeof s.value === "object" && s.value !== null) ? s.value.liveUi : undefined;
           if (s.status === "ready" && typeof liveUi === "object" && liveUi !== null) {
-           paintTurnStatus(liveUi);
+           paintTurnStatus(liveUi, t);
           }
         } catch {
           // Never let a cosmetic derive take down the settings panel.

@@ -116,7 +116,7 @@ thinking there, and business calls (which omit it) keep thinking.
 A tiny host→client messenger (the `liveUi` settings field mirrored live to the browser) pins a
 badge beside the turn:
 
-- **Red "compressing"** — just before a compaction commits (screen text is Chinese);
+- **Red "compressing"** — just before a compaction commits;
 - **Green "done"** — the instant a compaction lands; 3 s later a fresh random working line
   takes over;
 - **Blue "working"** — otherwise a rotating playful one-liner;
@@ -124,6 +124,11 @@ badge beside the turn:
   done), an empty text (isImportant) is pushed: the badge text is wiped and the
   phase color removed, restoring the official look. Replaces the former
   conversation-START forced working-pair override (removed 2026-09).
+
+Badge text follows the app language: the host writes a locale-independent `textId`
+(phase name or `working.N`) alongside the canonical text, and the client half maps
+it to zh/en via its `ctx.locale` dictionaries — English UI shows English one-liners,
+Chinese UI shows the original Chinese.
 
 Publishers are fail-safe: a messenger glitch can never disturb the actual compaction.
 

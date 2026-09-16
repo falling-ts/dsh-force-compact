@@ -36,6 +36,16 @@
  *     and phase class, restoring the official appearance). Replaces the
  *     former conversation-START forced working-pair override (removed 2026-09).
  *
+ * Every published payload carries BOTH a canonical `text` (the Chinese default)
+ * and a locale-independent `textId` discriminator: `'working.N'` (index into
+ * {@link WORKING_TEXTS}), or the phase name itself for the pinned phases
+ * (`'compressing'` / `'done'` / `'end'`). `textId` is the localization seam:
+ * the client half (`web/client.js` `paintTurnStatus`) maps it through its own
+ * `ctx.locale` zh/en dictionaries, so the badge follows the app language, and
+ * falls back to the canonical `text` when `textId` is absent or unresolvable.
+ * The host half must stay locale-agnostic — dsh exposes the locale service
+ * only to the client web half, not to the host.
+ *
  * All writers are GUARANTEED never to throw (they wrap the settings-service
  * write in try/catch): a messenger failure must NEVER disrupt the model
  * request or the compaction transaction itself.
@@ -52,7 +62,7 @@ export const PHASE_COMPRESSING = 'compressing'
 export const PHASE_DONE = 'done'
 export const PHASE_END = 'end'
 
-/** Pinned (never randomized) payloads for the deterministic phases. `end` is the EMPTY clear — see {@link publishEnd}. */
+/** Pinned (never randomized) payloads for the deterministic phases. `end` is the EMPTY clear — see {@link publishEnd}. Canonical zh text; the `textId` (== phase) lets the client half translate per app language. */
 export const PINNED_TEXTS = Object.freeze({
   [PHASE_COMPRESSING]: '[强制压缩中>>>]',
   [PHASE_DONE]: '[压缩完成!]',
@@ -72,6 +82,9 @@ export const PINNED_COLORS = Object.freeze({
  * badge talks about what the agent is supposedly up to in a playful voice
  * instead of dry status verbs. Lengths intentionally exceed the old four-char
  * constraint; the client paints the raw string with no width assumption.
+ * Canonical zh; index `N` becomes `textId 'working.N'`, which the client half
+ * maps to its en/zh dictionaries (`badgeWorking<N>`) so the app-language
+ * setting picks the display tongue.
  * Colors are unchanged and remain randomly paired with these labels.
  * @readonly
  */
@@ -142,25 +155,30 @@ export const WORKING_COLORS = Object.freeze([
 /**
  * Draw a random working-phase status: a random text paired with a random
  * color (independently chosen, so the pair space is 20×20 = 400 distinct
- * combinations). Pure — no I/O, trivially testable.
- * @returns {{phase: string, text: string, color: string}}
+ * combinations). Pure — no I/O, trivially testable. The payload carries the
+ * canonical zh `text` PLUS the locale-independent `textId 'working.N'` so the
+ * client half can render the app-language equivalent.
+ * @returns {{phase: string, text: string, textId: string, color: string}}
  */
 export function randomWorkingPair() {
+  const index = Math.floor(Math.random() * WORKING_TEXTS.length)
   return {
     phase: PHASE_WORKING,
-    text: WORKING_TEXTS[Math.floor(Math.random() * WORKING_TEXTS.length)],
+    text: WORKING_TEXTS[index],
+    textId: 'working.' + index,
     color: WORKING_COLORS[Math.floor(Math.random() * WORKING_COLORS.length)],
   }
 }
 
 /**
  * Build the pinned payload for a deterministic phase (`end` is the empty
- * conversation-END clear).
+ * conversation-END clear). Takes `textId = phase` so the client half can
+ * localize the canonical zh `text` per app language.
  * @param {'compressing'|'done'|'end'} phase
- * @returns {{phase: string, text: string, color: string}}
+ * @returns {{phase: string, text: string, textId: string, color: string}}
  */
 export function pinnedPayload(phase) {
-  return { phase, text: PINNED_TEXTS[phase], color: PINNED_COLORS[phase] }
+  return { phase, text: PINNED_TEXTS[phase], textId: phase, color: PINNED_COLORS[phase] }
 }
 
 /**
@@ -177,7 +195,7 @@ export function pinnedPayload(phase) {
  *     always settles (resolve on success, resolve-with-warning on failure).
  *
  * @param {import('@deepseek-ai/cordis').Context} ctx
- * @param {{phase: string, text: string, color: string}} status
+ * @param {{phase: string, text: string, textId: string, color: string}} status
  * @param {boolean} [isImportant=false] — `true` bypasses the guard entirely
  *   and writes unconditionally. `false` (the default) refuses to overwrite a
  *   currently displayed text that starts with `[` (i.e. a pinned bracket-form
@@ -210,7 +228,7 @@ export async function publishUiStatus(ctx, status, isImportant = false) {
     if (!warnedOnce) {
       warnedOnce = true
       try {
-        ctx.logger.debug(`[force-compact] ui-signal: publishing ${status?.phase} "${status?.text}" (${status?.color}) via ${NS}.${LIVE_UI_FIELD}`)
+        ctx.logger.debug(`[force-compact] ui-signal: publishing ${status?.phase} "${status?.text}" textId=${status?.textId} (${status?.color}) via ${NS}.${LIVE_UI_FIELD}`)
       } catch { /* logging must never propagate */ }
     }
   } catch (error) {
