@@ -237,6 +237,7 @@ summarization wire-fields → <provider>/<model>: reasoningEffort='off' + reason
 | `compactionMode` | `'realm' \| 'global'` | `'realm'` | Official-service resolution strategy (priority-1 path). |
 | `builtinEnabled` | boolean | `true` | Gate for the builtin engine fallback. |
 | `maxSummaryTokens` | integer (1024–200000) | `1024` | Cap on the summarizer LLM `maxTokens`. |
+| `summarizationTimeoutMs` | integer ≥ 5000 (ms) | `90000` | Hard wall-clock cap for ONE summarization stream (hung-stream guard). **Floor 5000**; no ceiling — a very large value effectively disables the guard. |
 
 Example — an aggressive **local** profile:
 

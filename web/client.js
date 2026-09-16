@@ -55,6 +55,8 @@ window.__ModuleLoader__.load({
       builtinEnabledHint: "官方 compaction 服务不可达时（例如标准 preset 将其隔离进 isolate 组），启用插件自研的内置压缩引擎作为后备。默认开启。设为 false 严格只走官方。",
       maxSummaryTokens: "最大摘要数（tokens）",
       maxSummaryTokensHint: "插件自身摘要 LLM 调用的 maxTokens 上限（默认 1024，1024–200000），防止摘要长度失控；收缩门禁另行保证提交的摘要比被遮蔽区间小。最小 1024，若填低于此值会自动重置为 1024。",
+      summarizationTimeoutMs: "摘要超时上限（ms）",
+      summarizationTimeoutMsHint: "一次摘要 LLM 流的硬墙钟超时（毫秒）。流在此限内未产出终止状态即判为挂起并中止（防止 compaction/start 锁永不闭合）。默认 90000（90 秒）；最小 5000，若填低于此值会自动重置为 5000；无上限——填很大的值相当于禁用该守卫。",
       unavailable: "设置不可用",
       loading: "加载中…",
       notWritable: "（当前为只读/内存模式，改动仅本进程生效）",
@@ -85,6 +87,8 @@ window.__ModuleLoader__.load({
       builtinEnabledHint: "Fallback to this plugin's own self-contained engine when the official compaction service is unreachable (e.g. standard-preset realm isolation). Defaults on. Set false to strictly use only the official backend.",
       maxSummaryTokens: "Max summary size (tokens)",
       maxSummaryTokensHint: "maxTokens ceiling on the plugin's own summarization LLM call (default 1024, range 1024–200000). Prevents runaway summaries; the shrink gate separately guarantees the committed summary is smaller than the span it replaces. Minimum 1024 — values below are clamped back to 1024.",
+      summarizationTimeoutMs: "Summarization timeout (ms)",
+      summarizationTimeoutMsHint: "Hard wall-clock cap for ONE summarization stream (ms). A stream that yields no terminal finish within this limit is presumed hung and aborted (preventing a leaked compaction/start lock). Default 90000 (90s); minimum 5000 — values below are clamped back to 5000; no ceiling — a very large value effectively disables the guard.",
       unavailable: "Settings unavailable",
       loading: "Loading…",
       notWritable: "(read-only / memory mode; changes are process-local)",
@@ -494,6 +498,9 @@ window.__ModuleLoader__.load({
       // maxSummaryTokens: 数字框，1024–200000，默认 1024。
       const msOpt = { step: 64, min: 1024, max: 200000 };
       const [msBuf, msHandlers] = useDraftNumberClamped("maxSummaryTokens", valOrUndef("maxSummaryTokens"), msOpt, update, 1024);
+      // summarizationTimeoutMs: 数字框，默认 90000，最小 5000，无上限。
+      const soOpt = { step: 5000, min: 5000 };
+      const [soBuf, soHandlers] = useDraftNumberClamped("summarizationTimeoutMs", valOrUndef("summarizationTimeoutMs"), soOpt, update, 5000);
       const modeOptions = [
         { id: "realm", label: t("modeRealm") },
         { id: "global", label: t("modeGlobal") },
@@ -599,7 +606,8 @@ window.__ModuleLoader__.load({
             textRow("logFile", "logFileHint", lfBuf, lfHandlers, lfOpt, false),
             modeRow(false),
             booleanRow("builtinEnabled", "builtinEnabled", "builtinEnabledHint", false),
-            numberRow("maxSummaryTokens", "maxSummaryTokens", "maxSummaryTokensHint", msBuf, msHandlers, msOpt, true)),
+            numberRow("maxSummaryTokens", "maxSummaryTokens", "maxSummaryTokensHint", msBuf, msHandlers, msOpt, false),
+            numberRow("summarizationTimeoutMs", "summarizationTimeoutMs", "summarizationTimeoutMsHint", soBuf, soHandlers, soOpt, true)),
           disabled ? h("p", { style: disabledHintStyle }, t("notWritable")) : null);
     }
 
