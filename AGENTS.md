@@ -415,6 +415,46 @@ DeepSeek 适配器（无独立的 llama.cpp 适配器包），再起一份 adapt
 
 ---
 
+## 界面文案与语言（i18n，2026-09-17 增补）
+
+设置分区与 LiveUI 徽章的**每一句产品文案都归 locale 服务所有**，代码里不得出现硬编码副本
+（上游 `packages/client/AGENTS.md` 的 locale-owned copy 红线，其闸门是
+`pnpm run verify-client-ui-i18n`）。
+
+**支持语言**：`zh`（中文）、`en`（English）、`ja`（日本語）、`ko`（한국어）。
+
+**上游只内置 zh/en**：`@deepseek-ai/dsh-client-locale` 的 `LOCALE_IDS = ['zh','en']`，
+但 `LocaleId` 是开放的 `string`，注释写明其余语言由**语言包插件**经
+`ctx.locale.addLanguage({ id, label, fallback })` 贡献——`label` 用该语言自述，
+`fallback` 必须已注册且 fallback 链以 `en` 为终点。本插件在 `apply` 里贡献 `ja`/`ko`
+（`contributeLanguages`），于是它们出现在设置页「语言」下拉里，且浏览器语言探测
+（先精确匹配整个 tag、再匹配主语言子标签）能够命中。
+
+**为什么两个插件都贡献同样的 id**：`dsh-web-ding` 也贡献 `ja`/`ko`，而两个插件必须各自能
+独立安装，不能约定"只由其中一个注册"。先到者拥有该目录项，后到者会收到
+`locale "ja" is already registered`——`contributeLanguages` **只吞这一种错**（其余照抛），
+并且只为**自己真正添加**的目录项登记 disposer（让位者的 disposer 是 no-op，卸载它不会
+误删先到者的目录项）。
+
+**字典**：`web/client.js` 顶部四份平表，zh 是键集事实源，其余三份必须逐键对齐。
+`ctx.locale.register(NS, { zh, en, ja, ko })` 一次注册。查找链是
+活动语言 → 其 fallback 链 → `en` → `common` 命名空间 → **键名本身**，所以缺键**不报错**，
+只会静默回落到 en（或显示键名）——这正是必须由探针守住的原因。
+
+**LiveUI 徽章**：宿主发出的 `liveUi` 只带语言无关的 `textId`（相位名或 `working.N`）
+加规范中文 `text`；客户端把 `textId` 映射为 `badgeCompacting`/`badgeDone`/`badgeEnd`/
+`badgeWorkingN` 后按活动语言取词，仅当 `textId` 缺失/未知时才回落到宿主的中文 `text`。
+`badgeWorking0..19` 的顺序必须与宿主 `src/core/ui-signal.js` 的 `WORKING_TEXTS` 逐位一致
+（客户端 zh 条目会**遮蔽**宿主 text，漂移即改变 zh 用户实际看到的文案）。
+
+**验证**（两条都必须绿）：
+
+```sh
+node exploration/i18n-parity-probe.mjs        # 词典键集/语言包/副本归属，51 项
+node --import <harness>/node_modules/tsx/dist/esm/index.mjs \
+     exploration/i18n-locale-runtime-probe.mjs  # 驱动官方 LocaleRuntime 真身，40 项
+```
+
 ## 如何判断插件是否加载成功
 
 插件加载成功的**客观判据**是它会在日志文件 `~/.dsh/logs/dsh-force-compact.log`
@@ -446,7 +486,7 @@ DeepSeek 适配器（无独立的 llama.cpp 适配器包），再起一份 adapt
 
 ## 概览
 
-- 插件的持久效果是**追加到会话日志的压缩事务**——具体形态取决于实际走了哪条引擎：走官方时落 `compaction/*` 系列（`compaction/start`、`compaction/summary`、`compaction/end`）加一个 `surfaceOp:replace` 的 `user/message`；走内置时同样落 `compaction/*` 系列（`compaction/start`、`compaction/summary`、`compaction/end`，字段形状与官方完全一致）加同样形态的 `user/message`。两种事务都以"前置括号事件 + 后置 replace 表面节点"的形式落地。除上文"例外"节的单用途定时器（`ui-signal.js` `publishDone`，有意偏离，见该节）外，插件不引入 timer 或内存态存储；Host 半部保持是**核心模型请求缝**（`agent/request` / `agent/pre-step`）与 `session/flush` 上的纯 Host 监听器。**另有一个 web client 半部**（`web/client.js`，`package.json` 的 `exports["./client"]` + `dsh.client.platform: web`，经 client module 系统自动组成，无需改 web-app 组合）：仅注册一个 `settings.section`（设置页左侧菜单"强制压缩 / Force Compact"分区，order 30），经 `settingsScope.bind({ namespace: 'falling-ts-force-compact' })` 镜像成 uSES 安全的 `SnapshotStore` 并读写字段（`scope.set`/`scope.unset` 写回 `settings.yaml`），**不**引入 timer、内存态存储或额外订阅；client 半部 `inject: ['slots','locale','settingsScope']`（这三个 client 服务在 client 启动时即可用，与 Host 侧的 `compaction` 运行时依赖不同）。**liveUi 徽标文字双语**：宿主发出的 `liveUi` 事件携带语言无关的 `textId`（相位名或 `working.N`）+ 规范中文 `text`；badge 显示文本由 client 半部经 `ctx.locale` 的 zh/en 词典按 `textId` 本地化（`badgeCompressing`/`badgeDone`/`badgeWorkingN`），跟随应用语言——英文 UI 显示英文俏皮话，中文 UI 保持原文；宿主半部无 locale 服务，刻意保持语言无关（textId 缺失/未知时 client 回落到规范中文 `text`）。
+- 插件的持久效果是**追加到会话日志的压缩事务**——具体形态取决于实际走了哪条引擎：走官方时落 `compaction/*` 系列（`compaction/start`、`compaction/summary`、`compaction/end`）加一个 `surfaceOp:replace` 的 `user/message`；走内置时同样落 `compaction/*` 系列（`compaction/start`、`compaction/summary`、`compaction/end`，字段形状与官方完全一致）加同样形态的 `user/message`。两种事务都以"前置括号事件 + 后置 replace 表面节点"的形式落地。除上文"例外"节的单用途定时器（`ui-signal.js` `publishDone`，有意偏离，见该节）外，插件不引入 timer 或内存态存储；Host 半部保持是**核心模型请求缝**（`agent/request` / `agent/pre-step`）与 `session/flush` 上的纯 Host 监听器。**另有一个 web client 半部**（`web/client.js`，`package.json` 的 `exports["./client"]` + `dsh.client.platform: web`，经 client module 系统自动组成，无需改 web-app 组合）：仅注册一个 `settings.section`（设置页左侧菜单"强制压缩 / Force Compact"分区，order 30），经 `settingsScope.bind({ namespace: 'falling-ts-force-compact' })` 镜像成 uSES 安全的 `SnapshotStore` 并读写字段（`scope.set`/`scope.unset` 写回 `settings.yaml`），**不**引入 timer、内存态存储或额外订阅；client 半部 `inject: ['slots','locale','settingsScope']`（这三个 client 服务在 client 启动时即可用，与 Host 侧的 `compaction` 运行时依赖不同）。**liveUi 徽标文字四语**：宿主发出的 `liveUi` 事件携带语言无关的 `textId`（相位名或 `working.N`）+ 规范中文 `text`；badge 显示文本由 client 半部经 `ctx.locale` 的 **zh/en/ja/ko** 词典按 `textId` 本地化（`badgeCompressing`/`badgeDone`/`badgeWorkingN`），跟随应用语言——英文 UI 显示英文俏皮话，日文/韩文 UI 显示对应译文，中文 UI 保持原文；宿主半部无 locale 服务，刻意保持语言无关（textId 缺失/未知时 client 回落到规范中文 `text`）。语言目录项与词典登记见下文"界面文案与语言"节。
 - **两条压缩引擎**（见上文"双引擎架构"节）：
   - **官方引擎**——`compaction` 服务提供的 `compactNow` / `compactRegion`，由 preset 平面（`include:agent-presets:compaction-basic`）挂载，**是运行时可选依赖**：插件**不**声明 `inject`——profile 层条目在进程启动时激活，彼时 preset 平面尚未挂载该服务，硬 `inject` 会导致 `assertEntriesActivated` 启动断言失败；各压缩路径在事件时经 `findOfficialService`（`engine/backend.js`）按 `compactionMode`（`realm` 先试 `agent.ctx` 再试 `ctx`；`global` 只试 `ctx`）定位。
   - **内置引擎**——`src/engine/builtin.js` 自实现的完整压缩事务，只依赖 `ctx.sessions.append`、`ctx.llm.stream`、`ctx.tokenMeter.estimateMessage`（全部经 `ctx.get` 读取、可缺省、对 `undefined` 做守卫）。它追加**官方命名的 `compaction/*` 事件**（`compaction/start`、`compaction/summary`、`compaction/end`）与 `user/message`(replace)——**复用**官方词汇而非私造 `fc-compact/*`，因为官方类型天生在 `KNOWN_SESSION_EVENT_TYPES` 编目内，重载无需 `ignorable` 标记即可跨 build 持久（详见上文"为什么内置引擎改用官方 `compaction/*` 词汇"一节）。代价是须满足官方全局 `compaction/invariant` 监听器的全部不变量（共享 `compactionId`、owner/turn 一致、`shadowedSeqs` 对齐 `shadowedRange`、`provider`/`model` 必填、无错 `end` 需紧跟 `summary`）。两引擎并存时优先级：官方可达即用官方；官方不可达才落到内置（`builtinEnabled !== false` 且 `agent.session` / `llm.service/stream` 可用）。

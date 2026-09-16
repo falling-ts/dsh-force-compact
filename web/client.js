@@ -60,8 +60,6 @@ window.__ModuleLoader__.load({
       unavailable: "设置不可用",
       loading: "加载中…",
       notWritable: "（当前为只读/内存模式，改动仅本进程生效）",
-      onWord: "开",
-      offWord: "关",
       badgeCompressing: "[强制压缩中>>>]",
       badgeDone: "[压缩完成!]",
       badgeEnd: "",
@@ -115,8 +113,6 @@ window.__ModuleLoader__.load({
       unavailable: "Settings unavailable",
       loading: "Loading…",
       notWritable: "(read-only / memory mode; changes are process-local)",
-      onWord: "on",
-      offWord: "off",
       badgeCompressing: "[Compacting…]",
       badgeDone: "[Compaction complete!]",
       badgeEnd: "",
@@ -140,6 +136,115 @@ window.__ModuleLoader__.load({
       badgeWorking17: "Smuggling in inspiration...",
       badgeWorking18: "Watching from the shadows...",
       badgeWorking19: "Almost done (maybe)...",
+    };
+    // ja / ko 由本插件作为**语言包**贡献（上游 @deepseek-ai/dsh-client-locale 只内置
+    // zh/en；LanguageRegistration 的 label 用该语言自述，fallback 必须已注册并以
+    // en 为终点）。键集必须与上方 zh 完全一致——zh 是键集事实源，缺键会回落到 en。
+    const ja = {
+      nav: "強制圧縮",
+      intro: "force-compact プラグインの圧縮動作（強制圧縮設定）を制御します。変更は $DSH_HOME/settings.yaml の falling-ts-force-compact セクションに反映されます。",
+      disableThinking: "圧縮時の思考を無効化",
+      disableThinkingHint: "true のとき、このプラグイン自身の圧縮要約呼び出しに reasoningEffort: off を付与し、思考を無効化してトークンを節約します。通常の対話リクエストには影響しません（マシンの既定値のまま）。",
+      autoThresholdTokens: "自動圧縮のしきい値（トークン）",
+      autoThresholdTokensHint: "セッションの総コンテキストトークンがこの値以上になると、agent/pre-step のしきい値ゲートが強制圧縮を実行します。最小 32000。これ未満の値は 32000 に戻されます。",
+      retainLatestTokens: "最新コンテキストの保持量（トークン）",
+      retainLatestTokensHint: "自動／強制圧縮のとき、セッションの最新エントリから公式 tokenMeter のノード単位カウントでトークンを遡って加算し、この値に達した時点で停止します。その境界より前のエントリはまとめて要約 LLM に送られ（元のエントリは遮蔽／スキップされます）、保持された末尾はそのまま残ります。既定 8000、最小 8000。これ未満の値は 8000 に戻されます。",
+      turnEndForceCompaction: "ターン終了時の強制圧縮",
+      turnEndForceCompactionHint: "true のとき、agent が idle（1 ターンの終了）へ移行した時点でターン終了圧縮を 1 回実行します。",
+      debug: "詳細ログ（debug）",
+      debugHint: "true のとき、リクエスト／ステップごとの主要な観測行を logFile（既定 ~/.dsh/logs/dsh-force-compact.log）へ書き出します。本番では false にしてノイズを減らせます。",
+      logFile: "ログファイルのパス",
+      logFileHint: "詳細ログの出力先パス（先頭の ~ はユーザーのホームディレクトリに展開されます）。変更は次回起動時に有効になります。",
+      logFilePlaceholder: "~/.dsh/logs/dsh-force-compact.log",
+      compactionMode: "圧縮サービスの解決モード",
+      compactionModeHint: "realm: 現在の Agent のレルムから compaction サービスを探し、見つからなければグローバルへフォールバックします。global: グローバルの compaction サービスを直接使います（バックエンドが root レルムにマウントされている必要があります）。",
+      modeRealm: "realm（レルム優先）",
+      modeGlobal: "global（グローバル）",
+      builtinEnabled: "内蔵圧縮エンジン",
+      builtinEnabledHint: "公式の compaction サービスに到達できないとき（標準プリセットが isolate グループへ隔離している場合など）に、このプラグイン自前の内蔵圧縮エンジンをフォールバックとして使います。既定は有効。false にすると公式のみを使います。",
+      maxSummaryTokens: "要約の最大サイズ（トークン）",
+      maxSummaryTokensHint: "このプラグイン自身の要約 LLM 呼び出しの maxTokens 上限（既定 1024、範囲 1024〜200000）。要約が暴走するのを防ぎます。コミットされる要約が遮蔽区間より小さいことは、別途シュリンクゲートが保証します。最小 1024。これ未満の値は 1024 に戻されます。",
+      summarizationTimeoutMs: "要約のタイムアウト上限（ms）",
+      summarizationTimeoutMsHint: "1 回の要約 LLM ストリームに対するハードな実時間上限（ミリ秒）。この時間内に終端状態を返さないストリームはハングとみなして中断します（compaction/start ロックが閉じない事態を防ぎます）。既定 90000（90 秒）、最小 5000。これ未満の値は 5000 に戻されます。上限はありません（非常に大きな値はこのガードを実質的に無効化します）。",
+      unavailable: "設定を利用できません",
+      loading: "読み込み中…",
+      notWritable: "（現在は読み取り専用／メモリモードのため、変更はこのプロセス内でのみ有効です）",
+      badgeCompressing: "[強制圧縮中>>>]",
+      badgeDone: "[圧縮完了!]",
+      badgeEnd: "",
+      badgeWorking0: "大胆な一手を思案中...",
+      badgeWorking1: "大技をチャージ中...",
+      badgeWorking2: "ひらめきが向かっています...",
+      badgeWorking3: "脳細胞が会議中...",
+      badgeWorking4: "魂の問い詰め中...",
+      badgeWorking5: "こっそり手札を覗き中...",
+      badgeWorking6: "量子もつれ計算中...",
+      badgeWorking7: "忙しいフリ中...",
+      badgeWorking8: "サボりながら作業中...",
+      badgeWorking9: "キーボードを狂ったように叩いています(精神的に)...",
+      badgeWorking10: "コンテキストを縫合中...",
+      badgeWorking11: "混沌を手なずけ中...",
+      badgeWorking12: "サイバー脳を召喚中...",
+      badgeWorking13: "『天機』をめくっています...",
+      badgeWorking14: "GPU が煙を上げています...",
+      badgeWorking15: "エントロピーと格闘中...",
+      badgeWorking16: "絵に描いた餅を焼いています...",
+      badgeWorking17: "ひらめきを密輸中...",
+      badgeWorking18: "影から様子をうかがっています...",
+      badgeWorking19: "もうすぐです(たぶん)...",
+    };
+    const ko = {
+      nav: "강제 압축",
+      intro: "force-compact 플러그인의 압축 동작(강제 압축 설정)을 제어합니다. 변경 사항은 $DSH_HOME/settings.yaml의 falling-ts-force-compact 섹션에 반영됩니다.",
+      disableThinking: "압축 시 사고 비활성화",
+      disableThinkingHint: "true이면 이 플러그인 자체의 압축 요약 호출에 reasoningEffort: off를 실어 사고를 끄고 토큰을 절약합니다. 일반 대화 요청에는 영향을 주지 않습니다(머신 기본값 유지).",
+      autoThresholdTokens: "자동 압축 임계값(토큰)",
+      autoThresholdTokensHint: "세션의 총 컨텍스트 토큰이 이 값 이상이면 agent/pre-step 임계값 게이트가 강제 압축을 실행합니다. 최소 32000이며 이보다 낮은 값은 32000으로 되돌립니다.",
+      retainLatestTokens: "최신 컨텍스트 유지량(토큰)",
+      retainLatestTokensHint: "자동/강제 압축 시 세션의 최신 항목부터 공식 tokenMeter의 노드별 계산으로 토큰을 역산해 더하다가 이 값에 도달하면 멈춥니다. 그 경계 이전의 모든 항목은 한 번에 요약 LLM으로 보내지고(원본 항목은 가려지거나 건너뜀) 유지된 꼬리는 그대로 남습니다. 기본 8000, 최소 8000이며 이보다 낮은 값은 8000으로 되돌립니다.",
+      turnEndForceCompaction: "턴 종료 시 강제 압축",
+      turnEndForceCompactionHint: "true이면 agent가 idle(한 턴 종료)로 전환될 때 턴 종료 압축을 한 번 실행합니다.",
+      debug: "상세 로그(debug)",
+      debugHint: "true이면 요청/단계마다 주요 관찰 줄을 logFile(기본 ~/.dsh/logs/dsh-force-compact.log)에 기록합니다. 운영 환경에서는 false로 두어 소음을 줄일 수 있습니다.",
+      logFile: "로그 파일 경로",
+      logFileHint: "상세 로그의 대상 경로입니다(앞의 ~는 사용자 홈 디렉터리로 확장됩니다). 변경은 다음 시작 시 적용됩니다.",
+      logFilePlaceholder: "~/.dsh/logs/dsh-force-compact.log",
+      compactionMode: "압축 서비스 해석 모드",
+      compactionModeHint: "realm: 현재 Agent의 렐름에서 compaction 서비스를 먼저 찾고 없으면 전역으로 폴백합니다. global: 전역 compaction 서비스를 바로 사용합니다(백엔드가 root 렐름에 마운트되어 있어야 합니다).",
+      modeRealm: "realm(렐름 우선)",
+      modeGlobal: "global(전역)",
+      builtinEnabled: "내장 압축 엔진",
+      builtinEnabledHint: "공식 compaction 서비스에 닿을 수 없을 때(예: 표준 프리셋이 isolate 그룹으로 격리한 경우) 이 플러그인 자체의 내장 압축 엔진을 폴백으로 사용합니다. 기본값은 켜짐이며 false로 두면 공식 엔진만 사용합니다.",
+      maxSummaryTokens: "요약 최대 크기(토큰)",
+      maxSummaryTokensHint: "이 플러그인 자체 요약 LLM 호출의 maxTokens 상한입니다(기본 1024, 범위 1024–200000). 요약이 폭주하는 것을 막습니다. 커밋되는 요약이 가려진 구간보다 작다는 것은 별도의 축소 게이트가 보장합니다. 최소 1024이며 이보다 낮은 값은 1024로 되돌립니다.",
+      summarizationTimeoutMs: "요약 시간 초과 상한(ms)",
+      summarizationTimeoutMsHint: "요약 LLM 스트림 한 번에 대한 하드 실시간 상한(밀리초)입니다. 이 시간 안에 종료 상태를 내지 않는 스트림은 멈춘 것으로 보고 중단합니다(compaction/start 잠금이 닫히지 않는 상황을 막습니다). 기본 90000(90초), 최소 5000이며 이보다 낮은 값은 5000으로 되돌립니다. 상한은 없습니다(아주 큰 값은 이 가드를 사실상 무력화합니다).",
+      unavailable: "설정을 사용할 수 없습니다",
+      loading: "불러오는 중…",
+      notWritable: "(현재 읽기 전용/메모리 모드라 변경은 이 프로세스에서만 적용됩니다)",
+      badgeCompressing: "[강제 압축 중>>>]",
+      badgeDone: "[압축 완료!]",
+      badgeEnd: "",
+      badgeWorking0: "대담한 한 수를 구상 중...",
+      badgeWorking1: "필살기를 충전 중...",
+      badgeWorking2: "영감이 오고 있습니다...",
+      badgeWorking3: "뇌세포 회의 중...",
+      badgeWorking4: "영혼 심문 진행 중...",
+      badgeWorking5: "몰래 당신의 패를 엿보는 중...",
+      badgeWorking6: "양자 얽힘 계산 중...",
+      badgeWorking7: "바쁜 척하는 중...",
+      badgeWorking8: "딴짓하며 일하는 중...",
+      badgeWorking9: "키보드를 미친 듯이 두드리는 중(정신적으로)...",
+      badgeWorking10: "컨텍스트를 꿰매는 중...",
+      badgeWorking11: "혼돈을 길들이는 중...",
+      badgeWorking12: "사이버 두뇌를 소환 중...",
+      badgeWorking13: "《천기》를 넘겨보는 중...",
+      badgeWorking14: "GPU가 연기를 내뿜는 중...",
+      badgeWorking15: "엔트로피와 씨름 중...",
+      badgeWorking16: "그림의 떡을 구워주는 중...",
+      badgeWorking17: "영감을 밀수 중...",
+      badgeWorking18: "그림자에서 지켜보는 중...",
+      badgeWorking19: "거의 다 됐습니다(아마도)...",
     };
 
     /** 必需服务（cordis fiber inject）。settingsScope 由 ui-settings 提供。 */
@@ -839,11 +944,51 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 把本插件贡献的语言（ja / ko）注册进 locale 目录。
+     *
+     * 上游 @deepseek-ai/dsh-client-locale 只内置 zh / en（LOCALE_IDS 为
+     * ['zh','en']），'ja'/'ko' 这类 id 是**语言包插件**的扩展点：addLanguage 会把
+     * 它们加进设置页「语言」下拉，并让浏览器语言探测（先精确匹配、再按主语言
+     * 子标签匹配）能够命中它们。label 用该语言自述，fallback 必须已注册且以 en
+     * 为终点——这里直接落到内置的 en。
+     *
+     * 幂等容错：dsh-web-ding 也贡献同样的两种语言（两个插件必须各自能独立安装，
+     * 因此不能约定只由其中一个注册）。先到者拥有该目录项，后到者命中
+     * "already registered" 而让位——字典仍按 id 生效，只是该语言目录项的生存期
+     * 不归本插件所有。返回的 disposer 只撤销本插件真正添加的那几项。
+     * @param {object} locale - ctx.locale（LocaleRuntime）。
+     * @returns {() => void} 撤销本插件添加的语言目录项。
+     */
+    function contributeLanguages(locale) {
+      const owned = [];
+      const languages = [
+        { id: "ja", label: "日本語", fallback: "en" },
+        { id: "ko", label: "한국어", fallback: "en" },
+      ];
+      for (const lang of languages) {
+        try {
+          owned.push(locale.addLanguage(lang));
+        } catch (error) {
+          const message = String(error && error.message ? error.message : error);
+          if (!/is already registered/.test(message)) throw error;
+        }
+      }
+      return () => { for (const dispose of owned) dispose(); };
+    }
+
+    /**
      * 注册文案字典、绑定设置命名空间、把分区挂到 settings.section。
      * @param ctx - client 根上下文。
      */
     function apply(ctx) {
-      ctx.effect(() => ctx.locale.register(NS, { zh, en }), "force-compact: dictionaries");
+      // zh 是键集事实源，en/ja/ko 必须与之逐键对齐（缺键时查找链回落到 en）。
+      // 语言目录项与字典分开登记：addLanguage 可能因兄弟插件已注册同一 id 而让位
+      // （见 contributeLanguages），字典注册则始终由本插件持有。
+      ctx.effect(() => {
+        const disposeLanguages = contributeLanguages(ctx.locale);
+        const disposeDicts = ctx.locale.register(NS, { zh, en, ja, ko });
+        return () => { disposeDicts(); disposeLanguages(); };
+      }, "force-compact: dictionaries and languages");
       const t = ctx.locale.bind(NS);
       const scope = ctx.settingsScope.bind({ namespace: NS_SETTINGS });
       // 挂载 swish 调色板样式表（首次 apply 时执行一次；effect 登记便于 fiber 卸载时清理）。
