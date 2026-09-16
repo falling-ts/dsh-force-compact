@@ -14,6 +14,7 @@
 
 import { guardFn } from '../core/crashnet.js'
 import { sessionEventAt } from '../core/session-events.js'
+import { MAX_TIMEOUT_MS, MIN_TIMEOUT_MS } from '../core/settings.js'
 
 /** Tag opening the structured summary block inside a landed checkpoint node.
  *  (The matching close tag is the symmetric `</compacted-summary>`; it is kept
@@ -282,13 +283,19 @@ async function __summarizeBody(ctx, config, agent, input, signal, extra) {
   // still cancels earlier); only when the TIMEOUT fires does the caller
   // receive a labeled `timeout` failure instead of an open-ended hang.
   // The cap is CONFIGURABLE via `config.summarizationTimeoutMs` (the settings
-  // `summarizationTimeoutMs` GUI knob); this constant is the default. Values
-  // below the MIN_TIMEOUT_MS floor are already clamped up by `readSettings`;
-  // a direct caller passing a non-finite/absent field falls back to the default.
-  const timeoutMs = (config !== null && typeof config === 'object'
+  // `summarizationTimeoutMs` GUI knob); this constant is the default. A
+  // non-finite/absent field falls back to the default, and the resolved value is
+  // clamped to `[MIN_TIMEOUT_MS, MAX_TIMEOUT_MS]` and truncated to an integer
+  // HERE — at the single site that SCHEDULES it. `readSettings` already
+  // normalizes the stored preference, but `summarize` accepts a plain `config`
+  // object from any caller, and `AbortSignal.timeout` throws `ERR_OUT_OF_RANGE`
+  // on a fractional delay while silently degrading a 2^31..2^32-1 delay to 1ms
+  // (see `MAX_TIMEOUT_MS`): both would break every summarization.
+  const configuredTimeoutMs = (config !== null && typeof config === 'object'
     && Number.isFinite(config.summarizationTimeoutMs) && config.summarizationTimeoutMs > 0)
     ? config.summarizationTimeoutMs
     : SUMMARIZATION_TIMEOUT_MS
+  const timeoutMs = Math.trunc(Math.min(Math.max(configuredTimeoutMs, MIN_TIMEOUT_MS), MAX_TIMEOUT_MS))
   // TIMEOUT-RACE DIAGNOSTIC (2026-09): warn BEFORE firing the call when this
   // plugin's own wall-clock cap cannot win the race against the target
   // adapter's stream-idle watchdog. The adapters arm their OWN
@@ -296,8 +303,10 @@ async function __summarizeBody(ctx, config, agent, input, signal, extra) {
   // if our `timeoutMs` is not strictly below it (defaults compare equal → warn),
   // the adapter's watchdog expires first and the failure surfaces as a
   // provider-side `TIMEOUT` error (CRASH-HARNESS) rather than our clean labeled
-  // `timeout` abort. The bound is read best-effort from the target route's
-  // `llm-pi-ai.providers.<provider>.streamIdleTimeoutMs`; when it cannot be
+  // `timeout` abort. The bound is read best-effort from BOTH adapter settings
+  // places (`llm-pi-ai.providers.<provider>.streamIdleTimeoutMs` and
+  // `llm-deepseek.streamIdleTimeoutMs`), keeping the tightest confirmed one —
+  // the tightest watchdog is the one that decides the race; when neither can be
   // confirmed, the known platform default is assumed (marked as such in the
   // line). Never throws and never escapes `summarize`.
   emitTimeoutRaceDiagnostic(ctx, target.provider, timeoutMs)
@@ -601,31 +610,58 @@ function renderFinish(finish) {
 }
 
 /**
- * Best-effort read of the target route's adapter-level stream-idle watchdog
- * bound (`streamIdleTimeoutMs` under the `llm-pi-ai.providers.<provider>`
- * settings section), used by the timeout-race diagnostic to decide whether
- * our own wall-clock cap will win the race against the adapter's idle
- * watchdog. Read-only and total: any missing/weird shape (settings service
- * absent, namespace absent, route absent, field absent/non-numeric) folds to
- * `undefined`, which the caller replaces with the platform default.
+ * Best-effort read of the stream-idle watchdog bound the target ADAPTER will
+ * actually arm, used by the timeout-race diagnostic to decide whether our own
+ * wall-clock cap can win the race against it. The two shipping adapters keep
+ * that watchdog in DIFFERENT settings places, so both are consulted:
+ *
+ *   - `llm-pi-ai.providers.<provider>.streamIdleTimeoutMs` — per-ROUTE (pi-ai
+ *     adapts many providers, each with its own profile), and
+ *   - `llm-deepseek.streamIdleTimeoutMs` — one TOP-LEVEL field for the whole
+ *     plugin (it owns a single provider family, so it has no route key).
+ *
+ * Exactly one of them describes the route in play, but which one is not
+ * determinable from here (the route-to-adapter mapping lives in the LLM
+ * service), so the TIGHTEST confirmed bound is returned: the tightest watchdog
+ * is the one that decides the race. Read-only and total: any missing/weird
+ * shape (settings service absent, namespace absent, route absent, field
+ * absent/non-numeric) contributes nothing, and `undefined` means no bound could
+ * be confirmed — the caller then substitutes the platform default.
  *
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @param {string} provider the resolved target provider (route key)
- * @returns {number|undefined} positive configured `streamIdleTimeoutMs`, else `undefined`
+ * @returns {{ms: number, origin: string}|undefined} tightest confirmed bound, else `undefined`
  */
-function adapterIdleTimeoutMs(ctx, provider) {
+export function adapterIdleBound(ctx, provider) {
   try {
     const settings = ctx === undefined || ctx === null ? undefined : ctx.get('settings')
     if (settings === undefined || settings === null || typeof settings.get !== 'function') return undefined
-    const ns = settings.get('llm-pi-ai')
-    const route = (ns !== undefined && ns !== null && typeof ns === 'object'
-      && ns.providers !== undefined && ns.providers !== null && typeof ns.providers === 'object')
-      ? ns.providers[provider]
-      : undefined
-    const value = (route !== undefined && route !== null && typeof route === 'object')
-      ? route.streamIdleTimeoutMs
-      : undefined
-    return (Number.isFinite(value) && value > 0) ? value : undefined
+    const section = (ns) => {
+      const value = settings.get(ns)
+      return (value !== undefined && value !== null && typeof value === 'object') ? value : undefined
+    }
+    const piAi = section('llm-pi-ai')
+    const route = (piAi !== undefined && piAi.providers !== undefined && piAi.providers !== null
+      && typeof piAi.providers === 'object') ? piAi.providers[provider] : undefined
+    const deepseek = section('llm-deepseek')
+    const confirmed = [
+      {
+        value: (route !== undefined && route !== null && typeof route === 'object')
+          ? route.streamIdleTimeoutMs
+          : undefined,
+        origin: `llm-pi-ai.providers.${provider}.streamIdleTimeoutMs`,
+      },
+      {
+        value: deepseek === undefined ? undefined : deepseek.streamIdleTimeoutMs,
+        origin: 'llm-deepseek.streamIdleTimeoutMs',
+      },
+    ].filter((candidate) => Number.isFinite(candidate.value) && candidate.value > 0)
+    if (confirmed.length === 0) return undefined
+    let tightest = confirmed[0]
+    for (const candidate of confirmed) {
+      if (candidate.value < tightest.value) tightest = candidate
+    }
+    return { ms: tightest.value, origin: tightest.origin }
   } catch {
     return undefined
   }
@@ -634,39 +670,41 @@ function adapterIdleTimeoutMs(ctx, provider) {
 /**
  * Emit the timeout-race WARN (or a clean-race DEBUG note) BEFORE the
  * summarization call fires. Compares our plugin wall-clock cap (`timeoutMs`)
- * against the target route's adapter `streamIdleTimeoutMs` (defaulting to the
- * platform-wide 300000ms when the route cannot be confirmed). When
- * `timeoutMs >= bound`, the adapter's idle watchdog is guaranteed to win the
- * race and the failure would surface as a provider-side `TIMEOUT` error
- * (CRASH-HARNESS) instead of our clean labeled `timeout` abort — the WARN
- * carries the actionable fix (raise
- * `llm-pi-ai.providers.<provider>.streamIdleTimeoutMs`, or lower
- * `falling-ts-force-compact.summarizationTimeoutMs`). Total: never throws,
+ * against the adapter stream-idle watchdog bound resolved by
+ * `adapterIdleBound` (falling back to the platform-wide 300000ms when no bound
+ * can be confirmed from settings). When `timeoutMs >= bound`, the adapter's idle
+ * watchdog is guaranteed to win the race and the failure would surface as a
+ * provider-side `TIMEOUT` error (CRASH-HARNESS) instead of our clean labeled
+ * `timeout` abort — the WARN carries the actionable fix (raise the watchdog
+ * above `timeoutMs` via `llm-pi-ai.providers.<provider>.streamIdleTimeoutMs` for
+ * a pi-ai route or `llm-deepseek.streamIdleTimeoutMs` for a DeepSeek route, or
+ * lower `falling-ts-force-compact.summarizationTimeoutMs`). Total: never throws,
  * never escapes `summarize`.
  *
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @param {string} provider the resolved target provider (route key)
  * @param {number} timeoutMs the effective plugin wall-clock cap for this call
  */
-function emitTimeoutRaceDiagnostic(ctx, provider, timeoutMs) {
+export function emitTimeoutRaceDiagnostic(ctx, provider, timeoutMs) {
   const logger = (ctx === undefined || ctx === null) ? null : ctx.logger
   try {
     if (logger === null || logger === undefined || typeof logger.warn !== 'function') {
       // No usable logger — the diagnostic is best-effort only.
       return
     }
-    const configured = adapterIdleTimeoutMs(ctx, provider)
-    const bound = configured !== undefined ? configured : ADAPTER_STREAM_IDLE_TIMEOUT_MS
-    const origin = configured !== undefined
-      ? `configured llm-pi-ai.providers.${provider}.streamIdleTimeoutMs`
-      : `adapter default streamIdleTimeoutMs (${ADAPTER_STREAM_IDLE_TIMEOUT_MS} — route not confirmed in config)`
+    const confirmed = adapterIdleBound(ctx, provider)
+    const bound = confirmed !== undefined ? confirmed.ms : ADAPTER_STREAM_IDLE_TIMEOUT_MS
+    const origin = confirmed !== undefined
+      ? `configured ${confirmed.origin}`
+      : `adapter default streamIdleTimeoutMs (${ADAPTER_STREAM_IDLE_TIMEOUT_MS} — no bound confirmed in config)`
     const prefix = `[force-compact] summarization timeout-race: summarizationTimeoutMs=${timeoutMs}ms vs ${origin}=${bound}ms`
     if (timeoutMs >= bound) {
       logger.warn(
         `${prefix} — plugin cap NOT below the adapter idle watchdog; the adapter's ` +
         `stream idle expiry fires FIRST and a timed-out/hung provider surfaces as a ` +
         `provider 'TIMEOUT' error (CRASH-HARNESS) instead of a clean labeled 'timeout' abort. ` +
-        `Fix: set llm-pi-ai.providers.${provider}.streamIdleTimeoutMs above ${timeoutMs}ms ` +
+        `Fix: raise the watchdog above ${timeoutMs}ms — llm-pi-ai.providers.${provider}.streamIdleTimeoutMs ` +
+        `for a pi-ai route, llm-deepseek.streamIdleTimeoutMs for a DeepSeek route — ` +
         `(or lower falling-ts-force-compact.summarizationTimeoutMs), keeping ` +
         `summarizationTimeoutMs < streamIdleTimeoutMs so THIS cap is the only one that counts.`,
       )

@@ -60,12 +60,14 @@
  *   be strictly smaller than the span it replaces), this prevents runaway
  *   summarizer outputs from ballooning past the region being condensed.
  *   Stored values below the floor are coerced up to it at read time.
- * - `summarizationTimeoutMs` (positive integer, default `90000`, floor `5000`):
- *   the hard wall-clock cap for ONE summarization stream in milliseconds
- *   (plugs into `summarizer.js`'s hung-stream guard — see
+ * - `summarizationTimeoutMs` (positive integer, default `90000`, floor `5000`,
+ *   ceiling `2147483647`): the hard wall-clock cap for ONE summarization stream
+ *   in milliseconds (plugs into `summarizer.js`'s hung-stream guard — see
  *   `SUMMARIZATION_TIMEOUT_MS`). Below-floor values are coerced UP to the floor
  *   at read time (a sub-5s cap would false-positive abort slow local endpoints);
- *   there is NO ceiling — a large value effectively disables the guard.
+ *   above-ceiling values are coerced DOWN and fractional values are truncated,
+ *   because this cap is SCHEDULED through `AbortSignal.timeout` rather than
+ *   merely compared — see `MAX_TIMEOUT_MS` for why that bound is hard.
  *
  * The namespace is registered against the `settings` service when one is
  * mounted. The schema is BUILT BEST-EFFORT through `@deepseek-ai/schemastery`:
@@ -156,8 +158,19 @@ export const MIN_TOKEN_SCALES = Object.freeze({
 /** Floor applied to the summarization hang-guard timeout on EVERY read
  *  (milliseconds). Below-floor values are coerced UP to it — a sub-5s cap would
  *  false-positive abort slow local endpoints (llama.cpp summarizations routinely
- *  run ~40s). There is NO ceiling: a large value effectively disables the guard. */
+ *  run ~40s). */
 export const MIN_TIMEOUT_MS = 5000
+
+/** Ceiling applied to the summarization hang-guard timeout on EVERY read
+ *  (milliseconds). This is Node's largest schedulable timer delay
+ *  (`MAX_TIMER_DELAY_MS`, `@deepseek-ai/dsh-util-timeout`), which both shipping
+ *  adapters also use as the exact upper bound of their own `streamIdleTimeoutMs`
+ *  watchdog schema. The bound is hard, not advisory: `AbortSignal.timeout`
+ *  THROWS `ERR_OUT_OF_RANGE` on a fractional delay, and a delay inside the
+ *  2^31..2^32-1 band is silently clamped to 1ms — a state where every
+ *  summarization aborts at once while the recorded reason still reports the full
+ *  configured span. Above-ceiling values are coerced DOWN to it. */
+export const MAX_TIMEOUT_MS = 2_147_483_647
 
 export const DEFAULTS = Object.freeze({
   disableThinking: true,
@@ -188,7 +201,9 @@ export const DEFAULTS = Object.freeze({
   maxSummaryTokens: 1024,
   // Hard wall-clock cap for ONE summarization stream, in milliseconds (the
   // hung-stream guard — see `engine/summarizer.js` `SUMMARIZATION_TIMEOUT_MS`).
-  // Floored at `MIN_TIMEOUT_MS` on read; no ceiling.
+  // Floored at `MIN_TIMEOUT_MS` and ceiled at `MAX_TIMEOUT_MS` on read, and
+  // always truncated to an integer (see `asTimeoutMs` — this value is
+  // SCHEDULED, not just compared).
   summarizationTimeoutMs: 90_000,
    // Ceiling on the NUMBER OF SURFACE NODES one compaction region may span
    // (positional, counted from the head of the ordered surface). When the
@@ -256,6 +271,15 @@ async function __readSettingsBody(ctx) {
     const v = asPositiveInt(field, DEFAULTS[field])
     return Number.isFinite(v) && v < floor ? floor : v
   }
+  // Hang-guard timeout: parse + floor + ceiling + integer truncation. The token
+  // scales are only ever COMPARED, so a fractional or astronomically large value
+  // is harmless there — `AbortSignal.timeout` is the one consumer that must
+  // receive a delay the platform can actually schedule, so both ends are clamped
+  // here and the result is always a usable integer (see `MAX_TIMEOUT_MS`).
+  const asTimeoutMs = (field) => {
+    const v = asPositiveInt(field, DEFAULTS[field])
+    return Math.trunc(Math.min(Math.max(v, MIN_TIMEOUT_MS), MAX_TIMEOUT_MS))
+  }
   const disableThinking = asBool('disableThinking', DEFAULTS.disableThinking)
   const autoThresholdTokens = asScaled('autoThresholdTokens', MIN_TOKEN_SCALES.autoThresholdTokens)
   const retainLatestTokens = asScaled('retainLatestTokens', MIN_TOKEN_SCALES.retainLatestTokens)
@@ -272,7 +296,7 @@ async function __readSettingsBody(ctx) {
     ? section.builtinEnabled
     : DEFAULTS.builtinEnabled)
   const maxSummaryTokens = asScaled('maxSummaryTokens', MIN_TOKEN_SCALES.maxSummaryTokens)
-  const summarizationTimeoutMs = asScaled('summarizationTimeoutMs', MIN_TIMEOUT_MS)
+  const summarizationTimeoutMs = asTimeoutMs('summarizationTimeoutMs')
   return {
     disableThinking,
     autoThresholdTokens,
@@ -449,13 +473,12 @@ export async function buildSchema() {
       // strictly smaller than the span it replaces) this keeps transactions
       // bounded while ensuring compression is always net-negative.
       maxSummaryTokens: z.number().default(DEFAULTS.maxSummaryTokens),
-        liveUi: z.any(), // TRANSIENT UI MESSENGER (core/ui-signal.js): host-written { phase,text,textId,color }, textId = locale-independent discriminator the client half localizes via ctx.locale. z.any() used because the vendored schemastery exposes object/any/string/number/boolean/array only (no record/unknown/chained .optional()); z.record(z.unknown()).optional() throws there and aborts the whole z.object(...), stranding the settings panel on "loading". Absence-by-default is inherent (no .default). readSettings ignores it — not a user preference.
+      liveUi: z.any(), // TRANSIENT UI MESSENGER (core/ui-signal.js): host-written { phase,text,textId,color }, textId = locale-independent discriminator the client half localizes via ctx.locale. z.any() used because the vendored schemastery exposes object/any/string/number/boolean/array only (no record/unknown/chained .optional()); z.record(z.unknown()).optional() throws there and aborts the whole z.object(...), stranding the settings panel on "loading". Absence-by-default is inherent (no .default). readSettings ignores it — not a user preference.
       // Hard wall-clock cap for ONE summarization stream (ms). Floored at
-      // read-time by `MIN_TIMEOUT_MS` (the schema is descriptive here, the
-      // floor is behavioral — same documented trade-off as the token scales);
-      // no ceiling.
+      // read-time by `MIN_TIMEOUT_MS`, ceiled by `MAX_TIMEOUT_MS` and truncated
+      // to an integer (the schema is descriptive here, those bounds are
+      // behavioral — same documented trade-off as the token scales).
       summarizationTimeoutMs: z.number().default(DEFAULTS.summarizationTimeoutMs),
-        liveUi: z.any(), // TRANSIENT UI MESSENGER (core/ui-signal.js): host-written { phase,text,color }. z.any() used because the vendored schemastery exposes object/any/string/number/boolean/array only (no record/unknown/chained .optional()); z.record(z.unknown()).optional() throws there and aborts the whole z.object(...), stranding the settings panel on "loading". Absence-by-default is inherent (no .default). readSettings ignores it — not a user preference.
     })
     return schema
   } catch {

@@ -27,10 +27,22 @@ process-local `Map` 标记也无 timer。
 同一豁免；除这两处外仍不引入 timer。
 
 **超时值可配置（2026-09）**：实际生效的时限优先取 `settings.summarizationTimeoutMs`
-（GUI 设置项「摘要超时上限（ms）」，默认 `90000`，下限 `5000`，无上限），
-`SUMMARIZATION_TIMEOUT_MS` 常量降级为调用方未提供该字段时的回退默认。读取时低于
-下限的值自动抬升至 5000——过小的上限会让慢速本地端点（如 llama.cpp，摘要常需
-~40s）被误判挂起而频繁失败，故不设下限之下再放行。
+（GUI 设置项「摘要超时上限（ms）」，默认 `90000`，下限 `5000`，上限
+`2147483647`），`SUMMARIZATION_TIMEOUT_MS` 常量降级为调用方未提供该字段时的
+回退默认。读取时低于下限的值自动抬升至 5000——过小的上限会让慢速本地端点
+（如 llama.cpp，摘要常需 ~40s）被误判挂起而频繁失败，故不设下限之下再放行。
+
+**上限为何是硬的（2026-09-17 修正）**：`summarizationTimeoutMs` 是**被调度**的值
+（喂给 `AbortSignal.timeout`），不是只参与比较的阈值，所以不能像 token 刻度那样
+放任超界。上限取 `2147483647`（Node 最大可调度定时器延迟，即
+`@deepseek-ai/dsh-util-timeout` 的 `MAX_TIMER_DELAY_MS`；两个适配器的
+`streamIdleTimeoutMs` schema 也用同一上限）：小数会直接抛 `ERR_OUT_OF_RANGE` 中断
+摘要；而 `2^31..2^32-1` 区间虽不抛错，却被 Node 静默降为 **1ms**——表现为每次摘要
+瞬间超时、而记录的 reason 仍声称走满了配置的时长（实测
+`exploration/abortsignal-timeout-boundary-probe.mjs`：`4294967295`/`4294967294`/
+`2147483648` 均在 250ms 内 abort，`2147483647` 不 abort）。修法：`settings.js`
+读取时双向钳制并取整（`asTimeoutMs`），`summarizer.js` 在唯一调度点再次钳制
+（`summarize` 接受任意调用方的 `config`，不能依赖上游已归一化）。
 
 **适配器竞态的时限诊断（2026-09 增补）：** plugin 的 `summarizationTimeoutMs` 必须
 **严格小于**目标适配器自带的 stream-idle 看门狗（`streamIdleTimeoutMs`，默认
@@ -38,11 +50,16 @@ process-local `Map` 标记也无 timer。
 空闲超时先到，挂起/超时的 provider 以 provider 侧 `TIMEOUT` error 呈现在
 CRASH-HARNESS，而非本插件干净的 `'timeout'` abort（2026-09-14 在 135 消息慢速
 llama.cpp 上实测）。`summarizer.js` 的 `emitTimeoutRaceDiagnostic` 在每次摘要调用
-放行前做**只读、best-effort、total** 竞态诊断：best-effort 读
-`settings.get('llm-pi-ai').providers.<provider>.streamIdleTimeoutMs`（缺省时假定平台
-默认 300000 并标注"未从配置确认"）；当 `summarizationTimeoutMs >= 该界` 时发
-WARN 携修复指引（调高 `llm-pi-ai.providers.<provider>.streamIdleTimeoutMs` 至高于
-`summarizationTimeoutMs`，或调低后者，保持 `summarizationTimeoutMs <
+放行前做**只读、best-effort、total** 竞态诊断：best-effort 读**两个适配器各自的
+配置位置**——`settings.get('llm-pi-ai').providers.<provider>.streamIdleTimeoutMs`
+（逐路由）与 `settings.get('llm-deepseek').streamIdleTimeoutMs`（顶层字段；该插件
+只有单一 provider 家族故无路由键。2026-09-17 补上：此前只读前者，令 `llm-deepseek`
+路由误落到默认 300000 并指向未被使用的命名空间）——取其中**最紧**的一个作为判界
+（哪个适配器服务该路由无法在此判定，而最紧的看门狗才是决定竞态的那个）；两者都
+读不到时假定平台默认 300000 并标注"未从配置确认"。当 `summarizationTimeoutMs >=
+该界` 时发 WARN 携修复指引（把看门狗抬到高于 `summarizationTimeoutMs`：pi-ai 路由
+改 `llm-pi-ai.providers.<provider>.streamIdleTimeoutMs`，DeepSeek 路由改
+`llm-deepseek.streamIdleTimeoutMs`；或调低后者，保持 `summarizationTimeoutMs <
 streamIdleTimeoutMs`）。它不写任何配置、绝不抛出，只增加一条诊断日志。用户要"以
 `summarizationTimeoutMs` 为准"的做法：在 settings.yaml 把适配器看门狗抬高到该值
 之上（如 `llm-pi-ai.providers.llama.streamIdleTimeoutMs: 600000` 配
@@ -210,7 +227,7 @@ preset 把 `compaction-basic` 挂在了 `- isolate:{compaction:true,…}` 组里
 | `compactionMode` | `'realm'\|'global'` | `'realm'` | 官方服务解析策略（仅影响 priority-1 路径） |
 | `builtinEnabled` | boolean | `true` | **内置引擎闸门**。`false` 时严格只走官方；缺省视为 `true`（兼容旧 yaml） |
 | `maxSummaryTokens` | integer (1024–200000) | `1024` | 摘要 LLM 调用的 `maxTokens` 上限；防超长摘要。**下限 1024**（低于 1024 的值读取时自动抬升至 1024） |
-| `summarizationTimeoutMs` | integer (≥ 5000, ms) | `90000` | 一次摘要流的硬墙钟超时上限（`summarizer.js` 挂起守卫；见上文硬超时守卫 + 适配器竞态诊断节）。**下限 5000**（低于 5000 的值读取时自动抬升至 5000）；**无上限**——填很大的值相当于禁用该守卫，但必须**严格小于**目标适配器的 `streamIdleTimeoutMs`（否则适配器空闲超时先到，表面出现 `TIMEOUT` error 而非本插件干净的 `'timeout'` abort）；`emitTimeoutRaceDiagnostic` 在调用前自动诊断并在失配时发出 WARN |
+| `summarizationTimeoutMs` | integer (5000–2147483647, ms) | `90000` | 一次摘要流的硬墙钟超时上限（`summarizer.js` 挂起守卫；见上文硬超时守卫 + 适配器竞态诊断节）。**下限 5000**（低于 5000 的值读取时自动抬升至 5000）；**上限 2147483647**（`AbortSignal.timeout` 可调度的最大延迟；超界值双向钳制、小数截断——见上文"上限为何是硬的"）。必须**严格小于**目标适配器的 `streamIdleTimeoutMs`（否则适配器空闲超时先到，表面出现 `TIMEOUT` error 而非本插件干净的 `'timeout'` abort）；`emitTimeoutRaceDiagnostic` 在调用前自动诊断并在失配时发出 WARN |
 
 ### 如何验证内置引擎工作
 

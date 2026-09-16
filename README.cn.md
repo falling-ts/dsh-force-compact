@@ -235,7 +235,7 @@ summarization wire-fields → <provider>/<model>: reasoningEffort='off' + reason
 | `compactionMode` | `'realm' \| 'global'` | `'realm'` | 官方服务解析策略(优先级一)。 |
 | `builtinEnabled` | 布尔 | `true` | 内置引擎回落闸门。 |
 | `maxSummaryTokens` | 整数(1024–200000) | `1024` | 摘要 LLM `maxTokens` 上限。 |
-| `summarizationTimeoutMs` | 整数 ≥ 5000(毫秒) | `90000` | 一次摘要流的硬墙钟超时上限(挂起流守卫)。读取时不低于 5000;无上限——填很大的值相当于禁用该守卫。 |
+| `summarizationTimeoutMs` | 整数 5000–2147483647(毫秒) | `90000` | 一次摘要流的硬墙钟超时上限(挂起流守卫)。读取时不低于 5000(过小的上限会误判慢速本地端点挂起);不高于 2147483647——该值经 `AbortSignal.timeout` **调度**, 小数会直接抛错, 而 2^31..2^32-1 区间会被静默降成 1ms。超界值双向钳制, 小数截断。 |
 
 示例——激进的**本地**档:
 
