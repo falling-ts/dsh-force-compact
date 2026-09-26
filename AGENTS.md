@@ -239,9 +239,9 @@ CHARS_PER_TOKEN` 或 meter 估价版）保留不变，确保合规事务净 delt
 
 | 步骤 | 追加的事件 | 说明 |
 |------|-----------|------|
-| 打开锁 | `compaction/start` | `compactionId`（UUID），`turn`（当前 open turn 号或 null） |
-| 摘要生成 | — | 通过 `ctx.llm.stream` 流式生成，受 `maxSummaryTokens` 上限约束；**对齐官方 `compaction-basic`**：注入会话的 `system` 提示词（0.1.5 起取自表面节点 0 的 `system/message`，旧版取请求头 `system`；见 `summarizer.js` `headerPrefix`）+ 请求头 `tools` 模式做前缀缓存对齐、三级 target 解析（configured→routed header→agent.options）、`purpose:'compaction'` 标签、完整 StreamChunk 装配（文本/推理/图像/用量）、终止 finish 分类（error/aborted/max-tokens/image 均按 fail-closed 抛错） |
+| 摘要生成 | — | **必须先于开括号**（2026-09-25 修复，见下文"括号时序事故"）：通过 `ctx.llm.stream` 流式生成，受 `maxSummaryTokens` 上限约束；**对齐官方 `compaction-basic`**：注入会话的 `system` 提示词（0.1.5 起取自表面节点 0 的 `system/message`，旧版取请求头 `system`；见 `summarizer.js` `headerPrefix`）+ 请求头 `tools` 模式做前缀缓存对齐、三级 target 解析（configured→routed header→agent.options）、`purpose:'compaction'` 标签、完整 StreamChunk 装配（文本/推理/图像/用量）、终止 finish 分类（error/aborted/max-tokens/image 均按 fail-closed 抛错） |
 | 收缩门禁 | — | `tokenMeter.estimateMessage` 判定摘要 tokens < 被遮蔽区间 tokens，否则中止 |
+| 打开锁 | `compaction/start` | **摘要就绪后才开**（下面三条与其同批）：`compactionId`（UUID）+ `turn`（`currentOpenTurn(session)` 的实时值，空闲路径为 `null`）；括号之前失败**不再补**闭合事件 |
 | 提交摘要标记 | `compaction/summary` | 记录 `compactionId`、`shadowedRange`、`shadowedSeqs`、`shadowedTokenCount`、**必填** `provider`/`model`、实测 `maxTokens`/`usage`（摘要调用真正观察到的 LLM 封装，而非预调用启发式猜测） |
 | Surface 替换 | `user/message` + `surfaceOp:{op:'replace',startSeq,endSeq}` | 带规范的 compact 检查点 source `{kind:'plugin',plugin:'compact',compactionId}`；`sourceEventSeqs` 指向 start+summary+shadowed |
 | 闭合锁 | `compaction/end` | 同上 `compactionId`；失败路径在此带 `error:` 字段（可省略 summary） |
@@ -267,11 +267,65 @@ open turn 时取该 turn 号、空闲路径取 `null`（与 `validateOwner` 一�
 `compaction/summary` 的 `shadowedSeqs` 非空且首尾等于 `shadowedRange` 起止、
 `provider`/`model` 必填；无错误的 `compaction/end` 必须跟在一条 `compaction/summary`
 之后（出错路径可省略 summary 并携带 `error`）；括号跨度内不与 `turn/start|end`
-交错（四条 append 是同步串，天然成立）。检查点 `user/message` 的 source 也换成
+交错——**这条不是"天然成立"，而必须靠"摘要先于开括号 + 括号内零 `await`"维持**
+（见下节）。检查点 `user/message` 的 source 也换成
 规范的 `{kind:'plugin',plugin:'compact',compactionId}`（`isCompactCheckpointSource`
 据此识别，并要求 source 上的 `compactionId` 等于在途事务的 `compactionId`）。
 两引擎在同一进程仍可并存（官方服务可达就用官方、不可达才内置接管），共用同一套
 `compaction/*` 词汇与同一份 invariant 校验。
+
+#### 括号时序事故与修复（2026-09-25，实测驱动）
+
+**症状**：用户会话 `session-ed8e0108`（cwd `D:\Comfy`）在 GUI 里**永久打不开**——
+`chat.loadError`：`stored log is corrupt: SessionFormatError: turn/start crosses an
+open compaction`。日志字节没丢（6492 事件全在），是**加载门禁**拒绝了整个日志。
+
+**根因（本插件，非 harness）**：内置引擎在**回合外**（idle 路径）先落
+`compaction/start`，再 `await` 一次 37 秒的摘要调用。现场证据（解压逐事件）：
+
+```
+seq=4359 turn/end   turn=21
+seq=4360 compaction/start  turn=null   ← 开括号，此刻无回合
+seq=4362 turn/start turn=22            ← 21 秒后用户发来新消息，落进括号
+seq=4366 compaction/summary  range 4208..4272
+seq=4367 user/message (checkpoint)
+seq=4368 compaction/end turn=22        ← 与 start 的 owner 也不一致（null vs 22）
+```
+
+`session-format-v3-to-v4/src/relationships.ts:270` 因此抛
+`turn/start crosses an open compaction`（同括号随后还会抛
+`compaction/start does not match the open turn` / `compaction/end changes its owner turn`）。
+官方引擎不可能这样：`compaction-basic/src/region.ts:199` 的
+`compactRegion: no open turn — automatic compaction events must be enclosed in a turn`
+直接拒绝回合外自动压缩——**回合外压缩是本插件 idle/flush 路径的扩展，缺口也由此而来**。
+该会话 27 个括号里只有这 1 个违规：恰好是摘要期间来了新回合的那一次。
+
+**修复**：把 `compaction/start` 推迟到**摘要就绪之后**追加，于是
+`start → summary → replace → end` 四条 append 成为**一个同步批次**（其间零 `await`）。
+单线程下没有任何调度点能让 `turn/start` 挤进括号；若摘要是期间开始的回合，
+`currentOpenTurn(session)` 就在该回合命名 owner——正是官方"回合内自动压缩"的语义。
+
+**书面不变量**（`exploration/fc-bracket-order-probe.mjs` 8 项锁死，防回归）：
+`session.append('compaction/start'` 必须出现在 `await summarize(` **之后**；
+start 与 end 之间**零 `await`**；`closeWithError` 必须容忍未开括号；
+no-target 分支不得补 `compaction/end`。
+
+**语义变化（须知）**：括号之前失败（摘要失败 / 收缩门禁不过）**不再留下任何持久痕迹**
+——旧实现会补一条配对的 `compaction/end`（带 `error`）。后果：`assertNoActiveCompaction`
+的持久 busy 锁不再覆盖摘要窗口，只剩进程内 per-session 槽在管，两条路径理论上可并发
+摘要，后到者的 `replace` 会被表面校验干净拒绝（不会损坏日志）。
+
+**已损坏会话的修复**（同日完成，作为事故收尾）：会话格式要求 `seq === 行号`
+（`session-format-v3-to-v4/src/validation.ts:64` 的 `format v4 event N is not dense`），
+故任何重排都必须**同步重编号**并重映射 `references.ts` 列出的全部引用字段
+（`sourceEventSeq` / `shadowedRange` / `shadowedSeqs` / `messageSeqs` / `targets[].seq` /
+`sourceEventSeqs` / `surfaceOp.startSeq|endSeq`）。本例做法：`compaction/start` 由
+seq 4360 移到 4365（块内六事件右旋一位），owner `turn` 由 `null` 改为 `22`（与
+`compaction/end` 一致），并重映射 3 处引用（该检查点的 `sourceEventSeqs`、后两条压缩的
+`shadowedRange`/`shadowedSeqs`/`surfaceOp`）。验收：harness 自己的
+`session-format-catalog` 的 `restoreCurrent` 由 REJECTED（原错误）变为 VALID；活体
+`session/page` 由 `gateway/internal` 变为 ok，全量回扫 `seq 0..6490` 共 6491 条记录无错；
+未触碰的 zstd 帧逐字节保留（3653/3658）。
 
 ### 历史背景（为何需要内置引擎）
 
@@ -479,6 +533,45 @@ dsh 安装提供）：`dsh-settings`（Config/表单）、`dsh-compaction`
 `builtin compaction OK — replaced span seq[35..38] (4 nodes, ~19982 tokens)`；落盘检查点
 `source={"kind":"compact-checkpoint","compactionId":"fc-…"}`、
 `surfaceOp={"op":"replace","startSeq":35,"endSeq":38}`。
+
+## 摘要路由的推理档位适配（2026-09-25 修复，实测驱动）
+
+**故障**：`disableThinking: true` 让摘要调用带 `reasoningEffort: 'off'`，但**并非每个目录模型都
+声明 off**——pi-ai 的 `thinkingLevelMap` 可把 `off` 映射为 `null`。实测本机
+`opencode-go/deepseek-v4.1-flash` 支持档位为 `['low','high','max']`，而
+`deepseek/deepseek-flash` 为 `['off','low','high','max']`。会话路由一切到前者，harness 就在
+provider I/O 之前以 `UNSUPPORTED_REASONING_EFFORT` 拒绝，**整笔压缩事务失败**：2026-09-23
+日志中连续 15 次失败、零检查点（`builtin compaction summarized-but-unusable (provider-error):
+… does not support reasoning effort "off"`）。注意这不是 pi-ai 升级本身引入的，而是"路由换了 +
+插件硬传 off"的组合。
+
+**修复**（`src/engine/summarizer.js`）：
+
+1. **`resolveEffectiveEffort`**：调用前用 `llm.resolveCallConfig({ provider, model, reasoningEffort })`
+   （纯能力查询、无 provider I/O、不绑定后续 dispatch）探测；请求档位不被接受时按
+   `EFFORT_LADDER`（off→minimal→low→medium→high→xhigh→max）取**最省的可用档位**；模型完全
+   无推理支持则**省略该字段**（路由默认生效）；探测遇到非档位类错误一律不干预（交给真实调用
+   报错）；旧 harness 无 `resolveCallConfig` 时保持原行为。每条「路由+档位」只 WARN 一次。
+   降级后 `reasoning_effort: 'none'`（llama.cpp 兼容字段）**不再**附加——它与"档位已降级"矛盾。
+2. **`REASONING_ALLOWANCE_TOKENS = 4096`**：无法关闭思考时推理轨迹与摘要正文**共用同一个
+   `maxTokens` 上限**，默认 1024 会被推理吃光并得到 `truncated-empty`（实测紧随降级之后出现）。
+   故在 `maxSummaryTokens`（语义是"摘要**文本**上限"）之上追加固定推理余量，而不是把摘要压小。
+
+**端到端验证**（3180 dev 实例 + `opencode-go/deepseek-v4.1-flash`）：
+
+```
+summarization route opencode-go/deepseek-v4.1-flash does not support reasoning effort 'off'
+  — using the cheapest supported level 'low' instead; compaction continues
+summarization wire-fields → opencode-go/deepseek-v4.1-flash: reasoningEffort='low' + reasoning_effort=(absent …)
+builtin compaction OK — replaced span seq[8..49] (15 nodes, ~23918 tokens) with a 3348-char checkpoint
+idle loop compaction — after 2 round(s) the projected context ~39438 tokens is below threshold 700000; target reached
+```
+
+单测：`node exploration/fc-summary-effort-probe.mjs`（19 项：提取真实实现 + 桩 llm，覆盖
+接受/降级/完全无推理/旧 harness/无关错误/告警去重/消息级识别）。
+
+**待决项**：`/force-compact` 在 15k tokens 区间上产出过 40 字符检查点——收缩门禁只校验"更小"，
+不校验信息量。是否需要最小信息量守卫（绝对或相对下限）属产品决策，未擅自加。
 
 ## 主题（浅色 / 暗色）：颜色一律走 `--fcts-*`（2026-09-17 增补）
 

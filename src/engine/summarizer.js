@@ -204,6 +204,106 @@ export function frameSummary(textBlocks) {
  *   labeled failure, so a bad provider response can never surface a TypeError
  *   nor trap the idle path in an uncaught-exception retry loop.
  */
+/**
+ * Reasoning efforts in ascending cost order. `disableThinking` asks for the
+ * cheapest one (`off`); a route that cannot express it degrades to the cheapest
+ * level it does declare.
+ */
+const EFFORT_LADDER = Object.freeze(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
+
+/**
+ * Extra `maxTokens` granted to a summary that has to THINK. A thinking trace is
+ * billed against the same cap as the summary text, so a thinking route needs
+ * headroom on top of `maxSummaryTokens` (documented as the cap on the summary
+ * text itself). Sized for a multi-thousand-token trace over a compacted region.
+ */
+const REASONING_ALLOWANCE_TOKENS = 4096
+
+/**
+ * Recognize the LLM service's "this route has no such effort" rejection. It
+ * throws `LlmError` with code `UNSUPPORTED_REASONING_EFFORT` before any provider
+ * I/O; the message is matched as well because a wrapped or aggregated error may
+ * arrive without the code.
+ * @param {unknown} error - the rejection value.
+ * @returns {boolean} whether the route refused the requested effort.
+ */
+function isUnsupportedEffort(error) {
+  if (error === null || typeof error !== 'object') return false
+  if (readProp(error, 'code') === 'UNSUPPORTED_REASONING_EFFORT') return true
+  const message = readProp(error, 'message')
+  return typeof message === 'string' && message.includes('does not support reasoning effort')
+}
+
+/** Routes already told about an effort they cannot honor (one warning per route+effort). */
+const effortDowngradeWarned = new Set()
+
+/**
+ * Report a route's inability to honor the requested effort exactly once.
+ * @param {object} ctx - plugin context (logger only).
+ * @param {{provider: string, model: string}} target - resolved summary route.
+ * @param {string} requested - the effort the caller asked for.
+ * @param {string|undefined} substitute - the accepted level, or `undefined` when
+ *   the model declares no reasoning support at all.
+ * @returns {void}
+ */
+function warnEffortDowngrade(ctx, target, requested, substitute) {
+  const key = `${target.provider}/${target.model}:${requested}`
+  if (effortDowngradeWarned.has(key)) return
+  effortDowngradeWarned.add(key)
+  try {
+    ctx.logger.warn(`[force-compact] summarization route ${target.provider}/${target.model} does not support reasoning effort '${requested}' — `
+      + (substitute === undefined
+        ? 'the model declares no reasoning support, so the summary call omits the field (route default applies); compaction continues'
+        : `using the cheapest supported level '${substitute}' instead; compaction continues`))
+  } catch { /* logging must never escape the summarizer */ }
+}
+
+/**
+ * Resolve the effort this route actually accepts, starting from the requested
+ * level and walking {@link EFFORT_LADDER} upward. `llm.resolveCallConfig` is a
+ * detached capability lookup — no provider I/O and no binding to a later
+ * dispatch — so probing costs nothing next to a doomed compaction call.
+ *
+ * Why this exists: `disableThinking` asks for `reasoningEffort: 'off'`, but a
+ * catalog model may declare no `off` level at all (a pi-ai `thinkingLevelMap`
+ * entry of `null`, as `opencode-go/deepseek-v4.1-flash` does). The LLM service
+ * then rejects the call up front and the WHOLE compaction transaction fails —
+ * observed 2026-09-23 as 15 consecutive failures with zero checkpoints once the
+ * session moved onto that route. Degrading to the cheapest accepted level keeps
+ * compaction working while still minimizing thinking cost.
+ * @param {object} llm - the `llm` service (`ctx.get('llm')`).
+ * @param {{provider: string, model: string}} target - resolved summary route.
+ * @param {string} requested - the caller's requested effort.
+ * @param {object} ctx - plugin context (for the one-shot downgrade warning).
+ * @returns {Promise<string|undefined>} an accepted effort, or `undefined` when
+ *   the model declares no reasoning support at all (omit the field entirely).
+ */
+async function resolveEffectiveEffort(llm, target, requested, ctx) {
+  // Older harnesses expose no capability query: keep the requested effort and
+  // let the call report the failure itself.
+  if (typeof llm.resolveCallConfig !== 'function') return requested
+  const accepts = async (effort) => {
+    try {
+      await llm.resolveCallConfig({ provider: target.provider, model: target.model, reasoningEffort: effort })
+      return true
+    } catch (error) {
+      // Any failure that is NOT the effort rejection must not be swallowed here:
+      // treat it as "accepted" and let the real call surface the real error.
+      return !isUnsupportedEffort(error)
+    }
+  }
+  if (await accepts(requested)) return requested
+  for (const candidate of EFFORT_LADDER) {
+    if (candidate === requested) continue
+    if (await accepts(candidate)) {
+      warnEffortDowngrade(ctx, target, requested, candidate)
+      return candidate
+    }
+  }
+  warnEffortDowngrade(ctx, target, requested, undefined)
+  return undefined
+}
+
 // Internal body of `summarize` — routed through the crash-net wrapper. The
 // documented contract is "NEVER THROWS", but a genuinely novel throw shape
 // (e.g. a `JSON.stringify` on a cycle, an exotic iterator) escapes into the
@@ -268,8 +368,17 @@ async function __summarizeBody(ctx, config, agent, input, signal, extra) {
   // The force-compact "disable thinking" setting maps to a per-request
   // `reasoningEffort: 'off'`, which the adapter turns into
   // `thinking: { type: 'disabled' }` (provider thinking off for the call).
-  if (extra !== undefined && typeof extra.reasoningEffort === 'string') {
-    options.reasoningEffort = extra.reasoningEffort
+  // The route may not declare that level at all (see `resolveEffectiveEffort`):
+  // `effectiveEffort` is what the call actually carries, and `undefined` omits
+  // the field so the route default applies instead of failing the transaction.
+  const requestedEffort = (extra !== undefined && typeof extra.reasoningEffort === 'string')
+    ? extra.reasoningEffort
+    : undefined
+  const effectiveEffort = requestedEffort === undefined
+    ? undefined
+    : await resolveEffectiveEffort(llm, target, requestedEffort, ctx)
+  if (effectiveEffort !== undefined) {
+    options.reasoningEffort = effectiveEffort
   }
   // Callers may override the static `config.maxSummaryTokens` via the
   // `extra.maxTokens` knob (e.g., to honor the `settings.maxSummaryTokens`
@@ -278,6 +387,18 @@ async function __summarizeBody(ctx, config, agent, input, signal, extra) {
   // static `config` value.
   if (extra !== undefined && Number.isFinite(extra.maxTokens) && extra.maxTokens > 0) {
     options.maxTokens = extra.maxTokens
+  }
+  // THINKING HEADROOM: a route that could not express `off` (see
+  // `resolveEffectiveEffort`) still reasons while summarizing, and the reasoning
+  // trace is billed against the SAME `maxTokens` cap. With the shipped
+  // 1024-token default the trace consumed the entire budget and the call ended
+  // `truncated-empty` (max-tokens finish, zero text) — observed on
+  // `opencode-go/deepseek-v4.1-flash` immediately after the effort downgrade.
+  // `maxSummaryTokens` is documented as the cap on the summary TEXT, so when
+  // thinking is on, add a fixed reasoning allowance on top of it instead of
+  // silently shrinking the summary (or failing the transaction).
+  if (effectiveEffort !== undefined && effectiveEffort !== 'off' && Number.isFinite(options.maxTokens)) {
+    options.maxTokens += REASONING_ALLOWANCE_TOKENS
   }
   // HUNG-STREAM GUARD: pin the summarization stream to a hard wall-clock
   // timeout ON TOP OF the caller's signal. `AbortSignal.timeout` + `AbortSignal.any`
@@ -353,9 +474,9 @@ async function __summarizeBody(ctx, config, agent, input, signal, extra) {
   // Because `builtin.js` gates `extra.reasoningEffort` on
   // `settings.disableThinking`, this compatibility field rides the EXACT
   // same scoping rule as the primary one — only emitted on compaction calls
-  // where the user has turned thinking OFF; business-conversation and other
-  // LLM calls never reach this code path and are unaffected.
-  if (extra !== undefined && extra.reasoningEffort === 'off') {
+  // where the user has turned thinking OFF AND the route actually accepted
+  // `'off'` (a route that could not is never asked to think "none" either).
+  if (effectiveEffort === 'off') {
     options.reasoning_effort = 'none'
   }
   // AUDIT LOG (2026-08 addition): the LLAMA.CPP-COMPATIBILITY stamp site. One

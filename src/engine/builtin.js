@@ -21,10 +21,14 @@
  * non-empty `shadowedSeqs` aligned with `shadowedRange`, and — for a successful
  * `compaction/end` — a preceding `compaction/summary`).
  *
- * The transaction mirrors the official backend's structure:
- *   compaction/start → (LLM summarize) → compaction/summary →
+ * The transaction mirrors the official backend's structure, except for WHEN the
+ * durable bracket opens (2026-09-25 corruption fix — see `runTransaction`):
+ *   (LLM summarize) → compaction/start → compaction/summary →
  *   user/message{surfaceOp:replace} → compaction/end
- *
+ * The four appends therefore run as ONE synchronous batch, so the bracket can
+ * never span a TURN boundary (`turn/start crosses an open compaction` makes the
+ * whole session log unloadable — the official engine avoids it by requiring
+ * automatic compaction to sit inside a turn).
  * `seq` is auto-assigned by the session (`log.length`); the `replace` bounds
  * and provenance (`sourceEventSeqs`) are enforced by the session core at append
  * time. A stability re-check AFTER the async LLM call aborts the transaction if
@@ -807,7 +811,27 @@ async function runTransaction(ctx, agent, session, region, signal, settings, sou
     return null
   }
 
-  // ---- Open the durable lock ---------------------------------------------
+  // ---- The durable lock is DEFERRED until the summary is ready ------------
+  // A compaction bracket must NEVER span a TURN boundary: the session-format
+  // validator rejects any `turn/*` event that crosses an open compaction
+  // (`session-format-v3-to-v4/src/relationships.ts` — `turn/start crosses an
+  // open compaction`), which makes the WHOLE session log unloadable. That is
+  // why the official engine requires automatic compaction to be enclosed in a
+  // turn (`compaction-basic/src/region.ts`: "automatic compaction events must
+  // be enclosed in a turn").
+  //
+  // The summarization call below is an `await` of up to `summarizationTimeoutMs`
+  // (observed live: 37 s). A bracket opened before it would span that window,
+  // and a user message arriving meanwhile appends `turn/start` INSIDE it —
+  // exactly how session-ed8e0108 (D:\Comfy) was corrupted on 2026-09-25:
+  // `compaction/start` fc-904d9bf at seq 4360, `turn/start` turn=22 at seq 4362.
+  //
+  // So the bracket is appended only once the summary exists, immediately before
+  // `compaction/summary`; start → summary → replace → end then run as ONE
+  // synchronous append batch, which is the atomicity the durable format
+  // assumes. If a turn opened while we summarized, `currentOpenTurn` names it
+  // and the bracket is a valid in-turn compaction (official semantics).
+  //
   // `sourceCommandId` (P1): the originating `/compact`/`/force-compact` command
   // id, threaded conditionally — OMITTED when `undefined` so the event stays
   // backward-compatible with readers that predate the field (exact mirror of
@@ -816,16 +840,6 @@ async function runTransaction(ctx, agent, session, region, signal, settings, sou
   // listener enforces it.
   const compactionId = mintCompactionId()
   let startEvent
-  try {
-    startEvent = session.append('compaction/start', {
-      compactionId,
-      turn: currentOpenTurn(session),
-      ...(sourceCommandId === undefined ? {} : { sourceCommandId }),
-    })
-  } catch (error) {
-    warn(ctx, `${session.id}: builtin compaction — failed to append compaction/start: ${messageOf(error)}`)
-    return null
-  }
   if (signal !== undefined) signal.throwIfAborted()
 
   // ---- Summarize ---------------------------------------------------------
@@ -904,24 +918,10 @@ async function runTransaction(ctx, agent, session, region, signal, settings, sou
       // (no doomed round-trip occurred).
       const why = (typeof preview.reason === 'string' && preview.reason.length > 0) ? preview.reason : preview.status
       info(ctx, `${session.id}: builtin compaction skipped (no summarization call made — ${why})`)
-      try {
-        // `error`, NOT `note`: the bracket is already open and cannot be preceded
-        // by a summary — the whole point of this branch is that no call was made —
-        // and the official invariant rejects a successful-looking
-        // `compaction/end` that has neither ("successful compaction/end requires
-        // one compaction/summary"). Swallowing that rejection left an UNCLOSED
-        // `compaction/start`, which `assertNoActiveCompaction` then used to refuse
-        // every later compaction of the same session.
-        session.append('compaction/end', {
-          compactionId,
-          turn: currentOpenTurn(session),
-          error: why,
-          // Echo the opening bracket's `sourceCommandId` (the invariant requires
-          // start/summary/end to agree; a mismatch makes this append THROW and the
-          // bracket stays open).
-          ...(sourceCommandId === undefined ? {} : { sourceCommandId }),
-        })
-      } catch { /* best effort */ }
+      // No bracket exists yet (it is opened only once a summary is ready — see
+      // the deferral note at the top of this function), so there is nothing to
+      // close: a compaction that never produced a summary leaves no durable
+      // trace at all.
       return null
     } else {
       // A call was made but yielded no usable summary — OR (defensively) the
@@ -999,6 +999,21 @@ async function runTransaction(ctx, agent, session, region, signal, settings, sou
   }
   if (summarizationUsage !== undefined) summaryData.usage = summarizationUsage
 
+  // ---- Open the durable lock HERE, immediately before the summary ---------
+  // Everything from this point to `compaction/end` is SYNCHRONOUS: start →
+  // summary → replace → end. This is the only window in which the bracket is
+  // open, so no `turn/*` event can cross it (see the deferral note at the top
+  // of this function); the owner turn is read at THIS instant.
+  try {
+    startEvent = session.append('compaction/start', {
+      compactionId,
+      turn: currentOpenTurn(session),
+      ...(sourceCommandId === undefined ? {} : { sourceCommandId }),
+    })
+  } catch (error) {
+    warn(ctx, `${session.id}: builtin compaction — failed to append compaction/start: ${messageOf(error)}`)
+    return null
+  }
   try {
     summaryEvent = session.append('compaction/summary', summaryData)
   } catch (error) {
@@ -1113,6 +1128,14 @@ async function runTransaction(ctx, agent, session, region, signal, settings, sou
  *  it, and a mismatch makes the append THROW — which would leave the bracket open and
  *  wedge every later compaction of that session until a reload. */
 function closeWithError(session, startEvent, compactionId, error, ctx) {
+  // A failure that happened BEFORE the bracket was opened (the summary call and
+  // the shrink gate run first — see the deferral note in `runTransaction`) has
+  // nothing to close: leaving no durable trace is strictly better than leaving
+  // an unclosed `compaction/start` behind.
+  if (startEvent === undefined || startEvent === null) {
+    warn(ctx, `builtin compaction transaction ended in error (no bracket opened): ${messageOf(error)}`)
+    return
+  }
   try {
     const sourceCommandId = (startEvent !== null && typeof startEvent === 'object'
       && startEvent.data !== null && typeof startEvent.data === 'object')

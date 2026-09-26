@@ -71,6 +71,25 @@ plugin's own summarization call (`engine/builtin.js` → `engine/summarizer.js` 
 | Every other model request (business, sub-agents, tools, other plugins) | Machine's `LlmCallConfig` unchanged |
 | Official `compaction` service calls | Not routed through any plugin seam — unaffected |
 
+**A route that cannot express `off` degrades instead of failing.** Not every catalog model
+declares an `off` level — pi-ai's `thinkingLevelMap` may map it to `null`, as
+`opencode-go/deepseek-v4.1-flash` does (it accepts only `low` / `high` / `max`, while
+`deepseek/deepseek-flash` accepts `off` too). The summarizer probes the route's capability
+before the call (`llm.resolveCallConfig`, a detached lookup with no provider I/O) and, when
+`off` is unavailable, uses the **cheapest level the route does accept**; a model with no
+reasoning support at all gets no effort field. Because a thinking route bills its reasoning
+trace against the same `maxTokens` cap, a fixed reasoning allowance is added on top of
+`maxSummaryTokens` (documented as the cap on the summary *text*) so the summary still fits.
+Both are logged once per route:
+
+```
+summarization route opencode-go/deepseek-v4.1-flash does not support reasoning effort 'off'
+  — using the cheapest supported level 'low' instead; compaction continues
+```
+
+Before this guard, such a route failed **every** compaction outright (the harness rejects
+the unsupported effort before any provider I/O).
+
 When the target is a **llama.cpp / OpenAI-compatible endpoint**, the
 `thinking: { type: 'disabled' }` field the adapter emits is silently ignored there — so the
 summarizer ALSO stamps the llama.cpp-native top-level `reasoning_effort: "none"`, gated on
