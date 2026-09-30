@@ -33,7 +33,7 @@
  *
  * Net effect: any injection-at-the-waterfall design either CRASHES (wall 1)
  * or SILENTLY NO-OPS (wall 2). Both were observed in live testing on a
- * running 3180 dev instance; that is the documented reason the module was
+ * running 3080 web instance; that is the documented reason the module was
  * reduced to a pure passthrough.
  *
  * Where the wire-append ACTUALLY lives now (since 2026-08)

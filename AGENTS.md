@@ -374,7 +374,7 @@ preset 把 `compaction-basic` 挂在了 `- isolate:{compaction:true,…}` 组里
 
 ### 如何验证内置引擎工作
 
-1. 重启 3180 dev 实例（`bash harness-server-dev.sh`）。
+1. 重启 3080 web 实例（`bash harness-server.sh`）。
 2. 建一个短会话并发送任意消息（哪怕 "Say hello"），等回合结束进入 `idle`。
 3. 看 `%USERPROFILE%\.dsh\logs\dsh-force-compact.log` 末行是否出现
    `idle compaction (builtin) shadowed N nodes (~M tokens)` 以及
@@ -577,7 +577,7 @@ rc.2 **确实**改了两处并直接命中本插件，均已随本次修订处�
    里为它保留的专用分支与官方 `estimateContent` 的 `default` 分支分叉，实测差 4 tokens
    （见上文"口径纠偏"第 3 条）。
 
-端到端验证（3180 dev 实例，`DSH_HOME=~/.dsh-web`，三个插件均 `fiberPhase: active`）：
+端到端验证（3080 web 实例，`DSH_HOME=~/.dsh-web`，三个插件均 `fiberPhase: active`）：
 `settings/describe` 出现 `falling-ts-force-compact` 与 `falling-ts-web-ding` 两个命名空间；
 `dsh-local-no-auth` 打印 `active: browser token/cookie checks bypassed`；LiveUI 三条探针
 （24 + 12 + 17 项）全绿，含对**运行中实例**的真实 host RPC 推送与截图。
@@ -605,7 +605,7 @@ provider I/O 之前以 `UNSUPPORTED_REASONING_EFFORT` 拒绝，**整笔压缩事
    `maxTokens` 上限**，默认 1024 会被推理吃光并得到 `truncated-empty`（实测紧随降级之后出现）。
    故在 `maxSummaryTokens`（语义是"摘要**文本**上限"）之上追加固定推理余量，而不是把摘要压小。
 
-**端到端验证**（3180 dev 实例 + `opencode-go/deepseek-v4.1-flash`）：
+**端到端验证**（3080 web 实例 + `opencode-go/deepseek-v4.1-flash`）：
 
 ```
 summarization route opencode-go/deepseek-v4.1-flash does not support reasoning effort 'off'
@@ -752,7 +752,7 @@ node --import <harness>/node_modules/tsx/dist/esm/index.mjs \
   而看不到此标记，属正常（表示功能仍在工作、只是未开日志），此时以上面的
   `settings.describe` 命名空间作为加载判据。
 
-> 排障经验：`ctx.logger` 的输出不一定落在 `harness-server[-dev]*.sh` 捕获的
+> 排障经验：`ctx.logger` 的输出不一定落在 `harness-server.sh` 捕获的
 > stdout/stderr 日志里；要看插件自身是否运行，直接看上面的 `~/.dsh/logs/
 > dsh-force-compact.log` 最可靠。另注意：**0.2.0 的 CLI 确实有 `--patch` 选项**
 > （`apps/cli/src/args.ts` 的 `.option('--patch <path>')`，可重复；实测
