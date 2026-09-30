@@ -179,9 +179,6 @@ export function estimateContentBlocks(blocks) {
           + Math.ceil(String(block.arguments === undefined || block.arguments === null ? '' : block.arguments).length / CHARS_PER_TOKEN)
           + ESTIMATE_BLOCK_OVERHEAD
         break
-      case 'tool-result':
-        tokens += estimateContentBlocks(Array.isArray(block.content) ? block.content : []) + ESTIMATE_BLOCK_OVERHEAD
-        break
       case 'image': {
         // Official `estimateStructuralBlock` prices an image by its REFERENCE
         // JSON with the `offloaded` mark stripped (2026-09, when the

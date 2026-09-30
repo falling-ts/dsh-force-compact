@@ -119,13 +119,30 @@ wire 字段的持久证据:
 - **会话结束「还原」**——agent 转入 idle(一轮彻底结束)时推一个空文本(isImportant):
   客户端把官方原文放回去并撤掉替换前缀。取代 2026-09 前的"会话开始时强制重绘随机工作态"。
 
-harness 0.1.7 把该标签渲染成**一个插值字符串**(`深度求索中，用时1分14秒` /
-`Deep diving for 1m 14s`),位于 `button[data-turn-process] > span`,运行期间每秒重渲染一次;
-而 `role="status"` 节点已变成 1px 裁剪的**读屏专用播报**节点。因此客户端半部**只替换前缀**:
-拿播报节点的文本当锚,按两者的**公共前缀**切开可见标签,其余部分——harness 的计时(含
-`，用时` / ` for ` 这类连接词)——逐字保留。播报节点绝不触碰,读屏器仍听到官方文案。
-一个 `MutationObserver`(仅在有活跃相位期间连接)在 React 重写标签的同一微任务里重新贴上,
-所以计时继续走、且全程零轮询。
+harness 0.2.0 把这行运行态文案搬进了独立组件 `RunningStatus`(0.1.7 时的
+`button[data-turn-process] > span` 现在只渲染**已结束**回合),锚点是容器属性
+`data-chat-running`。结构如下:
+
+```
+<div data-chat-running>
+  <span role="status" aria-live="polite">深度求索中</span>        ← 1px 裁剪的读屏播报
+  <span .runningDivider>                                          ← 分隔线
+  <span .runningContent>
+    <span .runningIcon>…鲸鱼动画(APNG mask + SVG 兜底)…</span>    ← 前缀动画小图标
+    <TextShimmer data-shimmer>深度求索中，用时1分14秒 ···</TextShimmer>
+  </span>
+</div>
+```
+
+客户端半部**只替换那句文字的前缀**:拿 `role="status"` 播报节点的文本当锚,按两者的
+**公共前缀**切开原文,其余部分——harness 的计时尾巴(含官方结尾的 ` ···`)——逐字保留。
+**前缀的鲸鱼动画图标与分隔线原样保留**,不写颜色、不改字体、不动布局;播报节点绝不触碰,
+读屏器仍听到官方文案。
+
+一个 `MutationObserver`(仅在有活跃相位期间连接)**双写**两处文字:TextShimmer 把同一句渲染了
+两遍(真实文本节点 + 一份 `aria-hidden` 的动画高亮副本,后者的字由 CSS
+`::after { content: attr(data-shimmer-text) }` 从属性取)——只改文本节点的话,扫光扫过时会
+露出官方旧文案。观察器在 React 重写的同一微任务里重新贴上,所以计时继续走、且全程零轮询。
 
 徽标文字跟随应用语言:宿主写入语言无关的 `textId`(相位名或 `working.N`)加规范中文文本,
 客户端半部经自己的 `ctx.locale` zh/en/ja/ko 词典解析——英文界面显示英文俏皮话,中文界面

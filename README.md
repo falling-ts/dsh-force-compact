@@ -145,14 +145,32 @@ elapsed-time text, font, and colour are left exactly as shipped.
   and drops its replacement prefix. Replaces the former conversation-START forced
   working override (removed 2026-09).
 
-Harness 0.1.7 renders that label as a single interpolated string (`深度求索中，用时1分14秒` /
-`Deep diving for 1m 14s`) inside `button[data-turn-process] > span`, rewritten once per second while
-the turn runs; the `role="status"` node is now a visually-hidden screen-reader announcement only. So
-the client half substitutes **just the leading phrase**: it uses the announcement node's text as an
-anchor, splits the visible label at their common prefix, and keeps the remainder — the harness clock,
-connector included — verbatim. The announcement node is never touched, so screen readers keep the
-official text. A `MutationObserver`, connected only while a phase is active, re-applies the prefix in
-the same microtask in which React rewrites the label, so the clock keeps ticking and nothing polls.
+Harness 0.2.0 moved that line into its own `RunningStatus` component — the old
+`button[data-turn-process] > span` now renders only **settled** turns — anchored on the
+container attribute `data-chat-running`:
+
+```
+<div data-chat-running>
+  <span role="status" aria-live="polite">深度求索中</span>        ← visually-hidden announcement
+  <span .runningDivider>
+  <span .runningContent>
+    <span .runningIcon>…whale animation (APNG mask + SVG fallback)…</span>
+    <TextShimmer data-shimmer>深度求索中，用时1分14秒 ···</TextShimmer>
+  </span>
+</div>
+```
+
+So the client half substitutes **just the leading phrase**: it uses the announcement node's text
+as an anchor, splits the text at their common prefix, and keeps the remainder — the harness clock
+tail, the official trailing ` ···` included — verbatim. **The whale animation icon and the divider
+are left exactly as they are**: no colours, no font changes, no layout. The announcement node is
+never touched, so screen readers keep the official text.
+
+A `MutationObserver`, connected only while a phase is active, **writes both copies** of the
+sentence: TextShimmer renders it twice (a real text node plus an `aria-hidden` animated highlight
+copy whose glyphs come from CSS `::after { content: attr(data-shimmer-text) }`), so patching only
+the text node would let the sweep reveal the official wording. The observer re-applies in the same
+microtask in which React rewrites the label, so the clock keeps ticking and nothing polls.
 
 Label text follows the app language: the host writes a locale-independent `textId` (the phase name or
 `working.N`) plus the canonical Chinese text, and the client half resolves it through its own

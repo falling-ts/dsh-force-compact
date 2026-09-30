@@ -17,18 +17,20 @@ process-local `Map` 标记也无 timer。
 ## 例外：LiveUI 贴皮的 `MutationObserver`（有意偏离"客户端不引入额外订阅"）
 
 集合约定要求 web client 半部"不引入 timer、内存态存储或额外订阅"。`web/client.js` 的
-LiveUI 贴皮存在**一处有意的 DOM 观察器**（`ensureLabelObserver`）：harness 0.1.7 把运行标签
-渲染成**每秒重渲染的插值字符串**，一次性文本替换会在 1 秒内被 React 抹掉，所以需要一个
-"React 一写就重贴"的时机。观察器的性质与 `publishDone` 定时器同类——纯表现层、无持久化、
-不影响任何压缩事务或模型请求，且比定时器更省：
+LiveUI 贴皮存在**一处有意的 DOM 观察器**（`ensureLabelObserver`）：harness 把运行态那行文案
+渲染成**每秒重渲染的插值字符串**（`深度求索中，用时1分14秒 ···`），一次性文本替换会在 1 秒内
+被 React 抹掉，所以需要一个"React 一写就重贴"的时机。观察器的性质与 `publishDone` 定时器同类
+——纯表现层、无持久化、不影响任何压缩事务或模型请求，且比定时器更省：
 
-- **不是周期调度**：只在 React 真正改写标签时触发，空闲时零回调；定时器方案会退化成每秒轮询。
+- **不是周期调度**：只在 React 真正改写文案时触发，空闲时零回调；定时器方案会退化成每秒轮询。
 - **只在有活跃相位期间连接**：`paintTurnStatus` 在相位为空（end 清空）时立即 `disconnect`，
   插件卸载时兜底断开（`ctx.effect(() => releaseLabelObserver, …)`）。
-- **自激被短路**：回调先用 `touchesTurnLabel(records)` 过滤（只认标签自身的 characterData
-  与含标签的 childList），本插件自己的写入再由 `painted` 值比对短路，不产生回环。
-- **内存态有界且可清**：`paintedLabels`（标签 → 贴过的文本 + 官方原文）随清空 `clear()`，
-  体量 = 打开的 running 会话数。
+- **自激被短路**：回调先用 `touchesTurnLabel(records)` 过滤（只认落在 `[data-chat-running]`
+  子树里的 characterData / `data-shimmer-text` 属性变更 / 新增容器），本插件自己的写入再由
+  `painted` 值比对短路，不产生回环。流式输出会在对话区制造大量 characterData 变更，这条过滤是
+  避免全量重扫的关键——它按祖先是否命中容器判定，代价与命中数而非文档规模成正比。
+- **内存态有界且可清**：`paintedLabels`（容器 → 贴过的文本 + 官方原文 + 高亮副本元素引用）
+  随清空 `clear()`，体量 = 打开的 running 会话数。
 
 除这一处外，client 半部仍不引入任何 timer、周期订阅或跨会话内存态。
 
@@ -190,6 +192,19 @@ CHARS_PER_TOKEN` 或 meter 估价版）保留不变，确保合规事务净 delt
    system 按文本密度单次取整 + ROLE；**空内容 system/assistant 一律计 0**
    （空 assistant 节点只承载 usage，官方 `deriveEventMessage` 对它返回 `null`——
    注意 `if (content)` 判断对空数组 `[]` 为真，必须显式查 `length === 0`）。
+
+3. **多留了一个已删除块类型的分支（2026-09-30，rc.2 对拍发现）**：移植块的
+   `estimateContentBlocks` 曾为**旧的** `tool-result` 块保留一条递归分支
+   （`estimateContentBlocks(block.content) + BLOCK_OVERHEAD`）。上游提交
+   `f4a32dbd0a`（"flatten tool results"）早就把该块类型从 `ContentBlockMap` 删掉了
+   （现在只有 `text`/`reasoning`/`image`/`tool-call`；tool result 是 `role:'tool'` 的
+   **消息**，内容就是普通块）。于是同一条输入官方走 merge-extensible 的 `default`
+   分支按**结构 JSON** 计价、插件走专用分支按**递归内容**计价，实测差 4 tokens
+   （官方 36 / 插件 32）——凡含有该形状的历史面就会少报账单。**修法是把那条分支删掉**，
+   让 `default` 分支独自承担未知块的结构价，与官方逐字同形（探针新增
+   `['未知块（legacy tool-result）']` 与 `['tool 结果内嵌图像（V4 形状）']` 两例锁死）。
+   教训：这层移植的价值全在"与官方逐例同价"，**任何官方已删的块类型都不该留兼容分支**
+   ——官方删了，meter 就不认，插件多认一格就是少报账单。
 
 **投影缝（同日同步）**：`priceSurfaceNode` 与 `projectRegion` 现在都先经
 `surface.deriveEventMessage(event)` 取消息（三值：对象=采用；`null`=缝判定无消息；
@@ -534,6 +549,39 @@ dsh 安装提供）：`dsh-settings`（Config/表单）、`dsh-compaction`
 `source={"kind":"compact-checkpoint","compactionId":"fc-…"}`、
 `surfaceOp={"op":"replace","startSeq":35,"endSeq":38}`。
 
+## harness 0.2.0 适配（2026-09-30，rc.2 逐缝核对）
+
+peer 下界**不动**：仍是 `>=0.2.0-rc.1`（0.2.0 列车的首个 prerelease）。rc.1 → rc.2 是同一
+列车内的补丁，而纯下界本就承诺整条列车——收窄到 rc.2 只会让 0.2.0 的 boot 期 peer 预检在
+rc.1 运行时**静默禁用**本插件。`exploration/peer-range-probe.mjs` 已改为校验真正的语义
+不变量：每个 dsh peer 必须逐字等于声明的列车下界、该下界与 checkout 必须**同列车**（列车一
+动就红，逼人重新决策）、且运行时版本在 `includePrerelease` 下被接受。
+
+rc.2 上逐缝核对（全部保留，零改动）：`settings.configure` / `settings.update`；
+`compaction.compactNow|compactRegion`；`llm.stream` + `llm.resolveCallConfig`；`tokenMeter`
+的 `heuristicTokens`（折价仍用它而非 `tokens`）；`agents.get`；`sessions.append` 与
+`session/flush`；`agent/status` / `agent/pre-step` / `agent/request` 三事件的签名与 dispatch
+mode；`commands.register`；客户端 `ctx.configForms.get` + `ConfigForm` 五方法
+（`getSnapshot`/`subscribe`/`set`/`unset`/`mutate`；状态枚举仍含 `'loading'`）、
+`settings.section` 槽（仍 `kind:'list'; scope:'root'`）、`ctx.locale`、`createSnapshotStore`。
+
+rc.2 **确实**改了两处并直接命中本插件，均已随本次修订处理：
+
+1. **运行态文案换了宿主**（见上文"界面文案与语言 → 贴皮方式"）：0.1.7 的
+   `button[data-turn-process] > span` 现在只渲染**已结束**回合，运行态搬进了 `RunningStatus`
+   的 `div[data-chat-running]`，且 TextShimmer 把同一句渲染两遍（真实文本节点 +
+   `data-shimmer-text` 的高亮副本）。**旧实现在 0.2.0 上不只是失效，而是贴错了对象**——它会把
+   已结束回合的「已完成，用时 2分5秒」错贴成工作中的俏皮话（探针新增
+   "已结束回合不被误贴"一项锁死）。
+2. **`tool-result` 块类型被上游删除**（提交 `f4a32dbd0a` "flatten tool results"）：计价移植块
+   里为它保留的专用分支与官方 `estimateContent` 的 `default` 分支分叉，实测差 4 tokens
+   （见上文"口径纠偏"第 3 条）。
+
+端到端验证（3180 dev 实例，`DSH_HOME=~/.dsh-web`，三个插件均 `fiberPhase: active`）：
+`settings/describe` 出现 `falling-ts-force-compact` 与 `falling-ts-web-ding` 两个命名空间；
+`dsh-local-no-auth` 打印 `active: browser token/cookie checks bypassed`；LiveUI 三条探针
+（24 + 12 + 17 项）全绿，含对**运行中实例**的真实 host RPC 推送与截图。
+
 ## 摘要路由的推理档位适配（2026-09-25 修复，实测驱动）
 
 **故障**：`disableThinking: true` 让摘要调用带 `reasoningEffort: 'off'`，但**并非每个目录模型都
@@ -624,19 +672,54 @@ idle loop compaction — after 2 round(s) the projected context ~39438 tokens is
 `badgeWorking0..19` 的顺序必须与宿主 `src/core/ui-signal.js` 的 `WORKING_TEXTS` 逐位一致
 （客户端 zh 条目会**遮蔽**宿主 text，漂移即改变 zh 用户实际看到的文案）。
 
-**贴皮方式（2026-09-24 改版，随 harness 0.1.7）**：只替换**可见标签**
-（`button[data-turn-process] > span`）的前缀，**保留 harness 自己的计时文本**，不写颜色、
-不改字体；`role="status"` 播报节点绝不触碰（读屏器仍听到官方文案）。切分点是**播报文本与
-可见标签的公共前缀**——运行态下标签 = 播报文本 + 计时（中英皆然：`深度求索中` +
-`，用时1分14秒`、`Deep diving` + ` for 1m 14s`），公共前缀之后即为 harness 的计时
-（含 `，用时` / ` for ` 连接词），原样保留；公共前缀为空（回合已结束，如「用时 2分5秒」）
-则不贴、官方原文留着。这套判据不硬编码任何中英文文案，也不依赖 `.turnStatus` /
-`.turnStatusClock`（0.1.7 已删除这两个类与整套 shimmer）。宿主 `liveUi` **不再携带 `color`**。
-行为由 `node exploration/fc-livetext-prefix-probe.mjs` 守住（提取 `web/client.js` 里的真实
-实现 + 最小 DOM 桩，12 项：中英前缀替换、计时保留、每秒重渲染后重贴、自激短路、清空还原、
-多会话、textId 回退）；`node exploration/fc-livetext-apply-probe.mjs` 另按浏览器
-`window.__ModuleLoader__.load` 契约真装载一次并跑 `apply(ctx)`（8 项：effect 登记、主题表注入、
-无 swish 表、liveUi 推送改写可见标签、播报节点不动、end 还原、观察器 disposer 可调）。
+**贴皮方式（2026-09-30 改版，随 harness 0.2.0）**：运行态那行文案在 0.2.0 搬进了独立组件
+`RunningStatus`（0.1.7 时它住在 `button[data-turn-process] > span` 里，而那个按钮现在只渲染
+**已结束**回合）。新的稳定锚点是容器属性 **`data-chat-running`**：
+
+```
+<div data-chat-running>
+  <span role="status" aria-live="polite">深度求索中</span>        ← 1px 裁剪的读屏播报
+  <span class="runningDivider">                                   ← 分隔线
+  <span class="runningContent">
+    <span class="runningIcon">…鲸鱼 APNG mask + SVG 兜底…</span>  ← 前缀动画小图标
+    <TextShimmer data-shimmer>深度求索中，用时1分14秒 ···</TextShimmer>
+  </span>
+</div>
+```
+
+本插件只替换 **TextShimmer 里那句文字的前缀**，并保留 harness 自己的计时尾巴；前缀的
+**鲸鱼动画图标（`runningIcon`）与分隔线原样保留**，不写颜色、不改字体、不动布局，
+`role="status"` 播报节点绝不触碰（读屏器仍听到官方文案）。两个 0.2.0 特有的坑：
+
+1. **TextShimmer 把同一句话渲染两遍**——一份真实文本节点（可选中、可访问），一份
+   `aria-hidden` 的动画高亮副本；后者的字由 CSS `::after { content: attr(data-shimmer-text) }`
+   从属性取值，元素自身没有文本节点。所以替换必须**双写**（`nodeValue` + `data-shimmer-text`），
+   否则扫光扫过时会露出官方旧文案。观察器因此同时监听 `characterData` 与 `attributes`
+   （`attributeFilter: ['data-shimmer-text']`）。
+2. **切分锚点仍是「播报文本 ↔ 原文的公共前缀」**：运行态下原文 = 播报文本 + 计时尾巴
+   （中英皆然：`深度求索中` + `，用时1分14秒 ···`、`Deep diving` + ` for 1m 14s ···`），公共
+   前缀之后即为 harness 的计时（**含官方结尾的 ` ···`**），原样保留；公共前缀为空则不贴。
+   这套判据不硬编码任何中英文文案，也不依赖哈希类名——只用 `data-chat-running` /
+   `data-shimmer` / `data-shimmer-text` / `role=status` 四个上游稳定的属性锚点。
+
+宿主 `liveUi` **不再携带 `color`**。新锚点在 rc.1 与 rc.2 上都存在（rc.2 把鲸鱼从内联 SVG
+SMIL 换成 APNG mask），故 peer 下界仍保持 `>=0.2.0-rc.1`、**不随之收窄**。
+
+行为由三条探针守住：
+
+- `node exploration/fc-livetext-prefix-probe.mjs`（24 项：提取 `web/client.js` 真实实现 + 最小
+  DOM 桩，覆盖中英前缀替换、计时尾巴与官方 ` ···` 保留、高亮副本双写、鲸鱼图标/分隔线/播报
+  节点不动、**已结束回合的 `button[data-turn-process]` 不被误贴**、每秒重渲染后重贴、自激短路、
+  无关变更过滤、清空双还原、多会话、推送后才挂载的容器）；
+- `node exploration/fc-livetext-apply-probe.mjs`（12 项：按浏览器 `window.__ModuleLoader__.load`
+  契约真装载一次并跑 `apply(ctx)`，覆盖 effect 登记、主题表注入、无 swish 表、liveUi 推送双写、
+  鲸鱼图标不动、end 双还原、观察器 disposer 可调）；
+- `node exploration/fc-livetext-e2e-probe.mjs <port>`（17 项：对**运行中的 `dsh web`**。先证明
+  所服务的 ui-chat 客户端包确实含 `data-chat-running`、ui-primitives 含 `data-shimmer-text`，
+  再用实时页面自己的哈希类名注入一行忠实 DOM，然后经**真实 host RPC** `settings/update` 推
+  `liveUi`，走完整条 broadcast → mirror → derive → 贴皮链，并回放 React 的每秒重写与 idle 清空。
+  无需凭据、不花模型额度；截图 `exploration/fc-livetext-e2e{,-before}.png`）。
+
 
 **验证**（两条都必须绿）：
 
@@ -671,9 +754,13 @@ node --import <harness>/node_modules/tsx/dist/esm/index.mjs \
 
 > 排障经验：`ctx.logger` 的输出不一定落在 `harness-server[-dev]*.sh` 捕获的
 > stdout/stderr 日志里；要看插件自身是否运行，直接看上面的 `~/.dsh/logs/
-> dsh-force-compact.log` 最可靠。另注意 `dsh web` CLI **没有 `--patch` 选项**——插件经
-> profile `package.json` 的 `dsh.profile.bundles` 列表 + `package.json` 的
-> `dsh.bundle.patch` 声明自动挂载，不能用 CLI 叠加 patch。
+> dsh-force-compact.log` 最可靠。另注意：**0.2.0 的 CLI 确实有 `--patch` 选项**
+> （`apps/cli/src/args.ts` 的 `.option('--patch <path>')`，可重复；实测
+> `pnpm dsh --profile web --patch <file> --dump-config` 退出码 0，且 dump 的层头
+> 里出现该文件路径）——但叠加的是**配置层**，被叠加的文件若用**包名**引用插件，
+> 该包仍须已装进 profile。常规安装路径仍是 profile `package.json` 的
+> `dsh.profile.bundles` 列表 + 插件自己 `package.json` 的 `dsh.bundle.patch` 声明，
+> 无需 CLI 叠加。
 
 ## 概览
 

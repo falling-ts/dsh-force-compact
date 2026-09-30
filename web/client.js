@@ -772,67 +772,169 @@ window.__ModuleLoader__.load({
      * 会话结束（agent 转入 idle，hooks/idle.js）写入空字符串 text —— 语义是
      * "清空"（还原官方原文、断开观察器）。
      * 文本按 textId 经下方词典做 zh/en/ja/ko 本地化（跟随应用语言）。
+     * 只替换运行态那行**文字**的前缀，前缀的鲸鱼动画图标与分隔线原样保留。
      * 机制与 DOM 定位策略见下方「官方运行标签的前缀替换器」注释块。
      */
     // ── 官方运行标签的「前缀替换器」──
-    // harness 0.1.7 起，那句 running 文案是一个插值字符串
-    // （`深度求索中，用时1分14秒` = t('message.turnProcess.deepDivingFor', { duration })），
-    // 由 TurnProcessNodeView 每秒重渲染一次；而 `[role="status"]` 节点已变成 1px
-    // 裁剪的**读屏专用播报**节点（accessibility.module.css .visuallyHidden），
-    // 不再是可见文案的载体。因此本插件只做三件事：
-    //   • 替换**可见标签**（button[data-turn-process] > span）里「深度求索中」
-    //     这一段前缀，**保留 harness 自己的计时文本**（`，用时1分14秒`）；
-    //   • 不写颜色、不动字体——官方 tertiary 灰与字号逐字不变；
+    // harness 0.2.0 起，运行态文案不再住在回合结束后的 button[data-turn-process] 里
+    // ——那个按钮现在只渲染**已结束**回合（`已完成，用时 2分5秒` / `Took 2m 5s`）。
+    // 运行态搬进了独立组件 RunningStatus
+    // （packages/client/ui-chat/src/client/chat/RunningStatus.tsx），锚点是稳定属性
+    // `data-chat-running`：
+    //
+    //   <div data-chat-running>
+    //     <span role="status" aria-live="polite">深度求索中</span>   ← 1px 裁剪的读屏播报
+    //     <span class="runningDivider">                              ← 分隔线
+    //     <span class="runningContent">
+    //       <span class="runningIcon">…鲸鱼动画…</span>              ← 前缀动画小图标
+    //       <TextShimmer class="runningText" data-shimmer>深度求索中，用时1分14秒 ···</TextShimmer>
+    //     </span>
+    //   </div>
+    //
+    // 因此本插件只做四件事：
+    //   • 替换 TextShimmer 里「深度求索中」这一段**前缀**，**保留 harness 自己的
+    //     计时尾巴**（`，用时1分14秒 ···`）；
+    //   • **绝不触碰前缀的鲸鱼动画图标**（runningIcon 里的 APNG mask + SVG 兜底）
+    //     与 runningDivider 分隔线——官方动效原样保留；
+    //   • 不写颜色、不动字体、不动布局——官方蓝色与字号逐字不变；
     //   • 绝不触碰 role=status 播报节点（无障碍播报归还官方）。
     //
-    // 计时文本的切分不硬编码任何中英文：运行态下「可见标签 = 官方播报文本 + 计时」，
-    // 故取同级 role=status 节点的文本与标签的**公共前缀**为锚——公共前缀之后就是
-    // harness 的计时（中英皆然：`深度求索中` + `，用时1分14秒`、`Deep diving` +
-    // ` for 1m 14s`）；公共前缀为空（如回合结束后的「用时 2分5秒」「Took 2m 5s」）
-    // ⇒ 已不是运行态，直接不贴，官方原文原样留着。
+    // 计时尾巴的切分不硬编码任何中英文：运行态下「TextShimmer 原文 = 官方播报文本 +
+    // 计时尾巴」，故取 role=status 节点的文本与原文的**公共前缀**为锚——公共前缀之后
+    // 就是 harness 的计时（中英皆然：`深度求索中` + `，用时1分14秒 ···`、`Deep diving`
+    // + ` for 1m 14s ···`）；公共前缀为空 ⇒ 不是运行态，官方原文原样留着。
     //
-    // 为什么需要 MutationObserver：标签每秒被 React 重写一次（时长在跳），一次性
-    // 覆盖会在 1 秒内被抹掉。观察器在 React 写入的同一微任务里重新贴上，浏览器不会
-    // 画出中间态；本插件自己的写入由 `painted` 值短路，不会自激。观察器只在**有活跃
-    // 相位**期间连接（清空即断开），空闲时零开销、零轮询。
+    // TextShimmer 把同一句话渲染**两遍**：一份真实文本节点（可选中、可访问），一份
+    // `aria-hidden` 的动画高亮副本——后者的字由 CSS `::after { content:
+    // attr(data-shimmer-text) }` 从属性取，元素自身没有文本节点。所以替换必须**双写**
+    // （nodeValue + data-shimmer-text），否则扫光扫过时会露出官方旧文案。
+    //
+    // 为什么需要 MutationObserver：文案每秒被 React 重写一次（时长在跳），一次性覆盖会在
+    // 1 秒内被抹掉。观察器在 React 写入的同一微任务里重新贴上，浏览器不会画出中间态；
+    // 本插件自己的写入由 `painted` 值短路，不会自激。观察器只在**有活跃相位**期间连接
+    // （清空即断开），空闲时零开销、零轮询。
     //
     // 必须改文本节点的 nodeValue，不能写 textContent——后者会换掉 React 持有的那个
     // 文本节点，官方计时将再也更新不上来。
 
-    /** 可见运行标签：button 带稳定属性 data-turn-process，其 span 即文案载体。 */
-    const TURN_LABEL_SELECTOR = "button[data-turn-process] > span";
+    /** 运行态容器：RunningStatus 的 div 带稳定属性 data-chat-running。 */
+    const RUNNING_ROOT_SELECTOR = "[data-chat-running]";
+
+    /** 文案载体：TextShimmer 根（官方在该容器内唯一带 data-shimmer 的元素）。 */
+    const SHIMMER_SELECTOR = "[data-shimmer]";
+
+    /** 动画高亮副本的文案属性（CSS ::after 的 content 来源）。 */
+    const SHIMMER_TEXT_ATTR = "data-shimmer-text";
 
     /** 当前要替换进去的前缀；null = 不替换（清空态）。 */
     let desiredPrefix = null;
 
-    /** 已改写的标签 → { painted, suffix, official }（清空时据此还原官方原文）。 */
+    /** 已改写的运行态容器 → { painted, suffix, official, decorative }（清空时据此还原官方原文）。 */
     const paintedLabels = new Map();
 
     /** 活跃相位期间的 DOM 观察器；清空 / 插件卸载即断开。 */
     let labelObserver = null;
 
     /**
-     * 取标签内的文本节点。
-     * @param {Element} label 可见标签 span。
-     * @returns {CharacterData|null} 文本节点（无则 null）。
+     * 从任意节点向上找到所属的运行态容器。
+     * @param {Node|null} node 变更记录的目标（文本节点或元素）。
+     * @returns {Element|null} 最近的 [data-chat-running] 祖先（自身算），无则 null。
      */
-    function labelTextNode(label) {
-      for (const child of label.childNodes) {
-        if (child.nodeType === Node.TEXT_NODE) return child;
+    function closestRunningRoot(node) {
+      let el = (node === null || node === undefined)
+        ? null
+        : (node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement);
+      while (el !== null && el !== undefined) {
+        if (typeof el.matches === "function" && el.matches(RUNNING_ROOT_SELECTOR)) return el;
+        el = el.parentElement;
       }
       return null;
     }
 
     /**
-     * 同级 role=status 播报节点的文本——运行态即官方「深度求索中」原文。
-     * @param {Element} label 可见标签 span。
+     * 取容器里最外层的 TextShimmer 根（嵌套实例只算最外层）。
+     * @param {Element} root 运行态容器。
+     * @returns {Element|null} TextShimmer 根（结构变化时为 null）。
+     */
+    function shimmerRootOf(root) {
+      for (const el of root.querySelectorAll(SHIMMER_SELECTOR)) {
+        let parent = el.parentElement;
+        let nested = false;
+        while (parent !== null && parent !== undefined && parent !== root) {
+          if (typeof parent.matches === "function" && parent.matches(SHIMMER_SELECTOR)) { nested = true; break; }
+          parent = parent.parentElement;
+        }
+        if (!nested) return el;
+      }
+      return null;
+    }
+
+    /**
+     * 该元素是否落在读屏播报节点（role=status）里——播报文本绝不参与替换。
+     * @param {Element} el 候选元素。
+     * @param {Element} root 停止上溯的运行态容器。
+     * @returns {boolean} 是否属于播报节点子树。
+     */
+    function insideAnnouncement(el, root) {
+      let current = el;
+      while (current !== null && current !== undefined && current !== root) {
+        if (typeof current.getAttribute === "function" && current.getAttribute("role") === "status") return true;
+        current = current.parentElement;
+      }
+      return false;
+    }
+
+    /**
+     * 取可见文案的载体：那个**持有真实文本节点**的元素。
+     *
+     * 动画高亮副本（带 data-shimmer-text）没有文本节点（字由 CSS ::after 生成），跳过；
+     * 读屏播报节点（role=status）整棵子树也跳过。优先只在 TextShimmer 子树里找，结构
+     * 不含 TextShimmer 时退回整个容器（仍排除播报节点）。
+     * @param {Element} root 运行态容器。
+     * @returns {{el: Element, node: CharacterData}|null} 载体元素与其文本节点。
+     */
+    function runningTextOf(root) {
+      const shimmer = shimmerRootOf(root);
+      const scope = shimmer === null ? root : shimmer;
+      for (const el of scope.querySelectorAll("*")) {
+        if (typeof el.getAttribute === "function" && el.getAttribute(SHIMMER_TEXT_ATTR) !== null) continue;
+        if (scope === root && insideAnnouncement(el, root)) continue;
+        for (const child of el.childNodes) {
+          if (child.nodeType !== Node.TEXT_NODE) continue;
+          if (child.nodeValue.length !== 0) return { el, node: child };
+        }
+      }
+      return null;
+    }
+
+    /**
+     * 动画高亮副本：容器内唯一带 data-shimmer-text 的元素。
+     * @param {Element} root 运行态容器。
+     * @returns {Element|null} 属性载体（结构变化时为 null）。
+     */
+    function decorationOf(root) {
+      return root.querySelector("[" + SHIMMER_TEXT_ATTR + "]");
+    }
+
+    /**
+     * 把动画高亮副本的字同步成同一句（CSS ::after 从属性取 content）。
+     * @param {Element|null} decorative 高亮副本元素。
+     * @param {string} text 要显示的整句。
+     * @returns {void}
+     */
+    function writeDecoration(decorative, text) {
+      if (decorative === null || decorative === undefined) return;
+      if (decorative.getAttribute(SHIMMER_TEXT_ATTR) === text) return;
+      decorative.setAttribute(SHIMMER_TEXT_ATTR, text);
+    }
+
+    /**
+     * 容器内 role=status 播报节点的文本——运行态即官方「深度求索中」原文。
+     * @param {Element} root 运行态容器。
      * @returns {string} 播报文本（结构变化时为空串）。
      */
-    function announcementOf(label) {
-      const button = label.parentElement;
-      const scope = button === null ? null : button.parentElement;
-      if (scope === null) return "";
-      const status = scope.querySelector('[role="status"][aria-live="polite"]');
+    function announcementOf(root) {
+      const status = root.querySelector('[role="status"][aria-live="polite"]');
       return status === null ? "" : status.textContent;
     }
 
@@ -850,65 +952,68 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 官方文本里属于 harness 计时的那一段。
-     * @param {Element} label 可见标签 span。
-     * @param {string} official 标签当前的官方原文。
+     * 官方原文里属于 harness 计时的那一段。
+     * @param {Element} root 运行态容器。
+     * @param {string} official 载体当前的官方原文。
      * @returns {string|null} 计时尾巴；null = 不是运行态（不贴）。
      */
-    function timeSuffixOf(label, official) {
-      const announcement = announcementOf(label);
+    function timeSuffixOf(root, official) {
+      const announcement = announcementOf(root);
       if (announcement.length === 0) return null;
       const anchor = commonPrefixLength(announcement, official);
       return anchor === 0 ? null : official.slice(anchor);
     }
 
     /**
-     * 把一个标签贴成 desiredPrefix + 官方计时文本。
-     * @param {Element} label 可见标签 span。
+     * 把一个运行态容器贴成 desiredPrefix + 官方计时尾巴（真实文本与动画高亮副本双写）。
+     * @param {Element} root 运行态容器。
      * @returns {void}
      */
-    function paintLabel(label) {
-      const node = labelTextNode(label);
-      if (node === null) return;
+    function paintLabel(root) {
+      const carrier = runningTextOf(root);
+      if (carrier === null) return;
+      const node = carrier.node;
+      const decorative = decorationOf(root);
       const current = node.nodeValue;
-      const state = paintedLabels.get(label);
+      const state = paintedLabels.get(root);
       if (state !== undefined && current === state.painted) {
         // 本插件上一轮的文本还在（React 尚未重写）：只需跟上相位文案的变化。
         const next = desiredPrefix + state.suffix;
         if (next !== state.painted) {
           state.painted = next;
           node.nodeValue = next;
+          writeDecoration(decorative, next);
         }
         return;
       }
-      const suffix = timeSuffixOf(label, current);
-      if (suffix === null) { paintedLabels.delete(label); return; } // 非运行态：官方原文不动
+      const suffix = timeSuffixOf(root, current);
+      if (suffix === null) { paintedLabels.delete(root); return; } // 非运行态：官方原文不动
       const painted = desiredPrefix + suffix;
-      paintedLabels.set(label, { painted, suffix, official: current });
+      paintedLabels.set(root, { painted, suffix, official: current, decorative });
       if (current !== painted) node.nodeValue = painted;
+      writeDecoration(decorative, painted);
     }
 
-    /** 贴全部打开的会话 / 标签页里命中的运行标签（装饰性、幂等）。 */
+    /** 贴全部打开的会话 / 标签页里命中的运行状态（装饰性、幂等）。 */
     function paintAllTurnLabels() {
       if (desiredPrefix === null) return;
-      for (const label of document.querySelectorAll(TURN_LABEL_SELECTOR)) paintLabel(label);
+      for (const root of document.querySelectorAll(RUNNING_ROOT_SELECTOR)) paintLabel(root);
     }
 
     /**
-     * 这批 DOM 变更是否可能动到运行标签（流式输出时避免无谓的全量重扫）。
+     * 这批 DOM 变更是否可能动到运行状态（流式输出时避免无谓的全量重扫）。
      * @param {MutationRecord[]} records 观察器回调的变更批次。
      * @returns {boolean} 是否需要重贴。
      */
     function touchesTurnLabel(records) {
       for (const record of records) {
-        if (record.type === "characterData") {
-          const parent = record.target.parentElement;
-          if (parent !== null && parent !== undefined && parent.matches(TURN_LABEL_SELECTOR)) return true;
+        if (record.type === "characterData" || record.type === "attributes") {
+          if (closestRunningRoot(record.target) !== null) return true;
           continue;
         }
         for (const added of record.addedNodes) {
           if (added.nodeType !== Node.ELEMENT_NODE) continue;
-          if (added.matches(TURN_LABEL_SELECTOR) || added.querySelector(TURN_LABEL_SELECTOR) !== null) return true;
+          if (closestRunningRoot(added) !== null || added.querySelector(RUNNING_ROOT_SELECTOR) !== null) return true;
         }
       }
       return false;
@@ -923,7 +1028,13 @@ window.__ModuleLoader__.load({
         if (!touchesTurnLabel(records)) return;
         paintAllTurnLabels();
       });
-      labelObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
+      labelObserver.observe(document.body, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+        attributes: true,
+        attributeFilter: [SHIMMER_TEXT_ATTR],
+      });
     }
 
     /** 断开观察器（清空态 / 插件卸载）。 */
@@ -933,14 +1044,20 @@ window.__ModuleLoader__.load({
       labelObserver = null;
     }
 
-    /** 清空：断开观察器，并把贴过的标签还原成官方原文。 */
+    /** 清空：断开观察器，并把贴过的运行状态还原成官方原文（文本与高亮副本双还原）。 */
     function clearPaintedLabels() {
       releaseLabelObserver();
-      for (const [label, state] of paintedLabels) {
-        if (!label.isConnected) continue;
-        const node = labelTextNode(label);
-        if (node === null) continue;
-        if (node.nodeValue === state.painted) node.nodeValue = state.official;
+      for (const [root, state] of paintedLabels) {
+        if (!root.isConnected) continue;
+        const carrier = runningTextOf(root);
+        if (carrier !== null && carrier.node.nodeValue === state.painted) carrier.node.nodeValue = state.official;
+        const decorative = (state.decorative === undefined || state.decorative === null)
+          ? decorationOf(root)
+          : state.decorative;
+        if (decorative !== null && decorative !== undefined
+          && decorative.getAttribute(SHIMMER_TEXT_ATTR) === state.painted) {
+          decorative.setAttribute(SHIMMER_TEXT_ATTR, state.official);
+        }
       }
       paintedLabels.clear();
     }
@@ -1126,9 +1243,10 @@ window.__ModuleLoader__.load({
           });
           // ── Live UI 徽章（机制见上方「官方运行标签的前缀替换器」）──
           // 每次命名空间快照翻转（含宿主写入 liveUi 瞬间），顺路把最新相位文案
-          // 贴成官方运行标签的替换前缀。贴皮这一步搭车在已有 scope.subscribe
-          // 回调上，不新增订阅；每秒重渲染由 turn-label MutationObserver 兜住
-          // （仅活跃相位期间连接，清空即断开）。幂等纯装饰：无运行标签即静默跳过。
+          // 贴成官方运行态那行文字的前缀（鲸鱼图标与分隔线不动）。贴皮这一步搭车在
+          // 已有 scope.subscribe 回调上，不新增订阅；每秒重渲染由 turn-label
+          // MutationObserver 兜住（仅活跃相位期间连接，清空即断开）。幂等纯装饰：
+          // 页面上没有 [data-chat-running] 就静默跳过。
           const liveUi = (typeof s.value === "object" && s.value !== null) ? s.value.liveUi : undefined;
           if (s.status === "ready" && typeof liveUi === "object" && liveUi !== null) {
            paintTurnStatus(liveUi, t);
