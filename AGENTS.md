@@ -868,3 +868,18 @@ harness 在 0.1.2-rc.1 时代重构了 `Session` 类：**不再暴露公开的 `
 **落盘。** 每个事件一行 JSONL，默认包裹在拼接的带校验和 zstd 帧中（每个追加批次一帧）；SQLite 后端改存打包的 chunk 行。`SESSION_FORMAT_VERSION = 3`（0.1.5；0.1.3 为 2，V2→V3 迁移把系统提示词落成表面节点 0 的 `system/message`）；后端拒绝任何其它版本。崩溃恢复从不截断：未闭合的 `turn/start` 以合成 `turn/end { reason: { kind: 'interrupted' } }` 闭合。
 
 **dsh-force-compact 追加的内容**（其全部持久效果）：一组 log-only 的事务括号事件——官方路径是 `compaction/*`（如 `compaction/summary`，含 `shadowedRange` / `shadowedSeqs` / `shadowedTokenCount`），内置路径现在与官方共用同一套 `compaction/*` 词汇（字段形状完全一致，区别仅在 `compactionId` 来源：官方 backend 铸造 vs 内置 `mintCompactionId` 铸造）——它们不带 `surfaceOp`，因此自身从不进入模型历史；随后同步追加一个 **surface `user/message`**，携带 `surfaceOp: { op: 'replace', startSeq, endSeq }` 遮蔽被压缩区间——该 `replace` 才是真正的 surface 替换。两条路径的 `user/message` 均带 `source: { kind: 'plugin', plugin: 'compact', compactionId }`（规范 checkpoint marker，`isCompactCheckpointSource` 据此识别）便于追溯。推理/"思考"是**内容块类型**（`ContentBlock.type === 'reasoning'`），不是事件类型：它存在于 `assistant/message.content` 内（由 `reasoning-delta` 流块 / `reasoning-chunks` 行组装），UI 通过 `toAssistantBlock()` 把它渲染为可折叠区域。
+
+## 显示元数据（`locale/*.json` + `icon`，2026-09-30 补齐）
+
+宿主 `readPluginMeta`（`packages/boot/app-boot/src/package-meta.ts`）在**不执行插件代码**的前提下读显示文案：按 `${specifier}/locale/en.json` 解析标题与描述（同目录其余 `<lang>.json` 提供其它语言），按清单顶层 `icon` 读图标（相对路径、SVG/PNG/JPEG/WebP、≤256 KiB、必须留在清单目录内）。两者都要经 `exports` 发布，否则 `optionalResourcePath` 拿到
+`ERR_PACKAGE_PATH_NOT_EXPORTED` 就按"资源不存在"静默跳过。
+
+此前本插件两者都缺 → 插件卡片/组件行直接回退到 `package.json` 的 `name` 与 `description`，也就是把那一整段 npm 描述（约 1.2 KB）当描述显示。现在齐备：
+
+- `locale/en.json` = `{ meta: { title: "Force Compact", description: … } }`，`locale/zh.json` 同形（标题与设置分区的 `nav` 文案一致）；
+- `icon.svg`（品牌蓝渐变、压缩双向箭头）；
+- `exports` 加 `"./locale/*.json"`，`files` 加 `"locale/*.json"` 与 `"icon.svg"`。
+
+**清单变更要重启实例才生效**：profile-resolution 在启动时快照插件的 exports 表，profile HMR 只监视 profile 的清单/补丁层，不监视插件自己的 `package.json`（实测：改完不重启，`pluginInventory/list` 里 `icon` 已生效而 `title` 仍是回退值——图标是按清单路径直读文件，文案要走 exports 解析）。
+
+回归闸门：`node exploration/plugin-manifest-check.mjs`（已扩展为同时校验 locale 键集 / 文案长度上限 / icon 存在与体积 / `exports` 与 `files` 覆盖；反向验证过一次：移走 `locale/zh.json` 即红）。

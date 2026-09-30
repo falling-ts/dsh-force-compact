@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Force Compact",
+    "description": "Compacts this session's context at every durability checkpoint and on demand, with its own region policy and LLM summarizer; adds the /force-compact command and a settings section."
+  }
+}
