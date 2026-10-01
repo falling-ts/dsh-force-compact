@@ -33,6 +33,8 @@ window.__ModuleLoader__.load({
 
     const zh = {
       nav: "强制压缩",
+      cmdLabel: "强制压缩",
+      cmdDescription: "立即强制压缩本会话上下文",
       intro: "控制 force-compact 插件的压缩行为（强制压缩配置）。改动在 $DSH_HOME/settings.yaml 的 falling-ts-force-compact 段生效。",
       disableThinking: "压缩时关闭思考",
       disableThinkingHint: "为 true 时每次模型请求携带 reasoningEffort: off，关闭思考以节省 token。",
@@ -86,6 +88,8 @@ window.__ModuleLoader__.load({
     };
     const en = {
       nav: "Force Compact",
+      cmdLabel: "Force compact",
+      cmdDescription: "Force-compact this session context now",
       intro: "Control how the force-compact plugin compacts. Changes land under the falling-ts-force-compact section of $DSH_HOME/settings.yaml.",
       disableThinking: "Disable thinking during compaction",
       disableThinkingHint: "When true, every model request carries reasoningEffort: off to save tokens.",
@@ -142,6 +146,8 @@ window.__ModuleLoader__.load({
     // en 为终点）。键集必须与上方 zh 完全一致——zh 是键集事实源，缺键会回落到 en。
     const ja = {
       nav: "強制圧縮",
+      cmdLabel: "強制圧縮",
+      cmdDescription: "このセッションのコンテキストを今すぐ強制圧縮します",
       intro: "force-compact プラグインの圧縮動作（強制圧縮設定）を制御します。変更は $DSH_HOME/settings.yaml の falling-ts-force-compact セクションに反映されます。",
       disableThinking: "圧縮時の思考を無効化",
       disableThinkingHint: "true のとき、このプラグイン自身の圧縮要約呼び出しに reasoningEffort: off を付与し、思考を無効化してトークンを節約します。通常の対話リクエストには影響しません（マシンの既定値のまま）。",
@@ -195,6 +201,8 @@ window.__ModuleLoader__.load({
     };
     const ko = {
       nav: "강제 압축",
+      cmdLabel: "강제 압축",
+      cmdDescription: "이 세션 컨텍스트를 지금 강제 압축합니다",
       intro: "force-compact 플러그인의 압축 동작(강제 압축 설정)을 제어합니다. 변경 사항은 $DSH_HOME/settings.yaml의 falling-ts-force-compact 섹션에 반영됩니다.",
       disableThinking: "압축 시 사고 비활성화",
       disableThinkingHint: "true이면 이 플러그인 자체의 압축 요약 호출에 reasoningEffort: off를 실어 사고를 끄고 토큰을 절약합니다. 일반 대화 요청에는 영향을 주지 않습니다(머신 기본값 유지).",
@@ -1203,6 +1211,76 @@ window.__ModuleLoader__.load({
       return () => { for (const dispose of owned) dispose(); };
     }
 
+    /** 本插件注册的宿主命令名（`src/hooks/command.js` 的 name，不含前导斜杠）。 */
+    const COMMAND_NAME = "force-compact";
+    /** 已贴面的标记：Symbol.for 保证同一页面里重复装配不会叠加两层包装。 */
+    const ROW_FACE_PATCHED = Symbol.for("@falling-ts/dsh-force-compact/command-row-face");
+
+    /**
+     * 取官方指令行的图标（基线平台模块 `@deepseek-ai/dsh-client-ui-primitives`）。
+     * 官方 `ui-commands` 给一等公民指令行挂的正是这个图标集里的字形；本插件沿用官方
+     * 「压缩」字形（`IconCompactOutlineRegular`），与 /compact 行同族。模块表里没有该
+     * 基线模块（极简 composition）时返回 undefined——行仍带本地化名称与描述，只是无图标。
+     * @returns {Function|undefined} 图标组件（props: {size, className}，颜色走 currentColor）
+     */
+    function resolveCommandIcon() {
+      try {
+        const primitives = require("@deepseek-ai/dsh-client-ui-primitives");
+        const icon = (primitives === undefined || primitives === null) ? undefined : primitives.IconCompactOutlineRegular;
+        return typeof icon === "function" ? icon : undefined;
+      } catch (_moduleTableMiss) {
+        // 图标是纯装饰：基线模块缺席时静默降级，不拖垮设置分区。
+        return undefined;
+      }
+    }
+
+    /**
+     * 给本插件的宿主指令补上官方一等公民指令行的外观：图标 + 本地化名称 + 本地化描述。
+     *
+     * 为什么是「贴面」而不是注册：官方 `ui-commands` 的指令行外观表
+     * （`presentation.ts` 的 `HOST_FACES`）按 `definitionId` 硬编码了六个一等公民命令，
+     * 第三方宿主命令拿不到那条缝；而客户端自有贡献（`ctx.commandUi.register`）与宿主
+     * 命令**同名即冲突**（候选合成阶段直接抛错，整组指令消失），`decorate` 只替换裸调用
+     * 的行为、不换行外观。0.2.0-rc.2 没有第三方指令行的外观缝（见 AGENTS.md
+     * 「指令行的官方外观」）。
+     *
+     * 做法：在 `commandUi` 的候选合成出口（`candidates`）上包一层，只重写**本插件那一行**
+     * 的行对象（label / description / icon 三个展示字段），文案每次合成时现取（切语言即
+     * 生效）。不碰目录、不碰派发、不碰生命周期，不新增命令、不写 DOM。上游若改名或改成
+     * 硬私有，包装不生效、静默回落到官方回退行（name + 宿主 description），功能不受影响。
+     *
+     * @param {object} ctx - client 上下文（commandUi 已就绪）
+     * @param {Function} t - 本插件命名空间的翻译函数
+     * @param {Function|undefined} icon - 行图标组件
+     */
+    function installCommandRowFace(ctx, t, icon) {
+      const commandUi = ctx.get("commandUi");
+      if (commandUi === undefined || commandUi === null) return;
+      const proto = Object.getPrototypeOf(commandUi);
+      if (proto === null || proto === undefined) return;
+      const original = proto.candidates;
+      // 上游实现缺席（改名 / 硬私有 / 换实现）或本页已贴过面 → 什么都不做。
+      if (typeof original !== "function" || original[ROW_FACE_PATCHED] === true) return;
+      const patched = async function patchedCandidates(session, req) {
+        const rows = await original.call(this, session, req);
+        if (!Array.isArray(rows)) return rows;
+        return rows.map((row) => ((row !== null && typeof row === "object" && row.name === COMMAND_NAME)
+          ? {
+            ...row,
+            label: t("cmdLabel"),
+            description: t("cmdDescription"),
+            ...(icon === undefined ? {} : { icon }),
+          }
+          : row));
+      };
+      Object.defineProperty(patched, ROW_FACE_PATCHED, { value: true });
+      proto.candidates = patched;
+      ctx.effect(() => () => {
+        // 只还原自己那一层：若别人后来也包过，保持别人的实现。
+        if (proto.candidates === patched) proto.candidates = original;
+      }, "force-compact: command row face");
+    }
+
     /**
      * 注册文案字典、绑定设置命名空间、把分区挂到 settings.section。
      * @param ctx - client 根上下文。
@@ -1217,6 +1295,9 @@ window.__ModuleLoader__.load({
         return () => { disposeDicts(); disposeLanguages(); };
       }, "force-compact: dictionaries and languages");
       const t = ctx.locale.bind(NS);
+      // 指令行的官方外观（图标 + 本地化名称/描述）：commandUi 服务就绪后贴一层。
+      // 服务缺席（没有指令目录的 composition）时该回调永不触发，分区照常工作。
+      ctx.inject(["commandUi"], (faceCtx) => { installCommandRowFace(faceCtx, t, resolveCommandIcon()); });
       // ui-settings 的 configForms 服务按命名空间交出 ConfigForm（getSnapshot/subscribe
       // 与旧 settingsScope 同形；status 枚举为 'loading'|'ready'|'unavailable'，set/unset/
       // mutate 现在回答 Promise<boolean>）。

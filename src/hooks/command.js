@@ -44,8 +44,19 @@ function __registerCommandBody(ctx) {
   }
 
   const disposeCommand = commands.register({
+    // OFFICIAL PARITY (identity): every first-party command carries a stable
+    // `definitionId` — the key `ui-commands` uses to recognize a command whose
+    // client face it owns. Ours names this plugin, so the descriptor is
+    // identifiable rather than anonymous (the client half's row face reads the
+    // same command by name; see web/client.js `installCommandRowFace`).
+    definitionId: '@falling-ts/dsh-force-compact',
     name: 'force-compact',
-    description: 'Force-compact the agent session context now (compacts immediately when idle).',
+    // OFFICIAL PARITY (copy): first-party descriptions are one short
+    // imperative sentence, no trailing period and no parenthetical
+    // ("Compact older conversation history"). The localized variants live in
+    // the client dictionaries (`cmdDescription`); this one is the headless /
+    // non-localizing client's text.
+    description: 'Force-compact this session context now',
     recordInput: false,
     handler: async (invocation) => {
       // SAFETY ENVELOPE: a slash-command handler that throws surfaces a raw

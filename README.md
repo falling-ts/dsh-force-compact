@@ -45,7 +45,10 @@ No toggling — official wins when reachable, builtin takes over otherwise.
   compacts via `compactNow` (gate: `turnEndForceCompactionEnabled`).
 - **Manual `/force-compact`** — immediate `compactNow` when idle; when busy it queues a
   process-local flag consumed at the next model step. **Loaded lazily** — see "Command
-  availability" under Install.
+  availability" under Install. In the `/` picker the row carries the same face as the
+  first-party commands: an icon, a localized name and a localized description (the official
+  presentation table only covers first-party commands, so the client half attaches the face
+  itself — see `AGENTS.md`, "指令行的官方外观").
 - **`session/flush`** — the awaited durability checkpoint.
 
 Every path funnels into the single *"compaction result landed in the session"* boundary — the

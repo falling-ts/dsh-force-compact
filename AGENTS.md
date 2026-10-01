@@ -724,10 +724,53 @@ SMIL 换成 APNG mask），故 peer 下界仍保持 `>=0.2.0-rc.1`、**不随之
 **验证**（两条都必须绿）：
 
 ```sh
-node exploration/i18n-parity-probe.mjs        # 词典键集/语言包/副本归属，51 项
+node exploration/i18n-parity-probe.mjs        # 词典键集/语言包/副本归属，74 项
 node --import <harness>/node_modules/tsx/dist/esm/index.mjs \
      exploration/i18n-locale-runtime-probe.mjs  # 驱动官方 LocaleRuntime 真身，40 项
 ```
+
+## 指令行的官方外观（图标 + 中文名 + 英文名，2026-10-01 增补）
+
+`/force-compact` 在 `/` 菜单的「指令」区里要和官方一等公民命令长得一样。官方行的外观**不在宿主
+描述符里**，而在客户端 `@deepseek-ai/dsh-client-ui-commands` 的 `presentation.ts` 里一张**硬编码**
+的一等公民表：`HOST_FACES` 只列六个官方命令（goal / plan / feedback / compact / permission /
+export），由 `builtinCommandName(descriptor)` 按 `definitionId` 命中；命中后该行才拿到
+`label`（`label.compact` →「压缩」）、本地化 `description` 与 `icon`（`ui-primitives` 的图标
+组件）。未命中的行只有 `{ name, description }`——正是本插件此前在菜单里的样子：一行
+`force-compact` 加一句英文描述，没有图标、没有中文名。
+
+0.2.0-rc.2 里第三方宿主命令**没有**官方入口走这条缝：客户端自有贡献 `ctx.commandUi.register({…})`
+与宿主命令**同名即冲突**（候选合成阶段抛 `contribution /x collides with a host command`，整组
+「指令」消失），`decorate` 只替换裸调用的行为、不换行外观，`CommandDescriptor` 本身也没有标题/
+图标字段。本插件因此分两步补齐：
+
+1. **宿主侧对齐注册**（`src/hooks/command.js`）：命令声明**自己命名空间的** `definitionId`
+   （`@falling-ts/dsh-force-compact`，官方命令一致的身份写法），描述压成官方那种一句短句
+   （`Force-compact this session context now`：无括号、无句号），`recordInput` 仍为 `false`。
+2. **客户端贴面**（`web/client.js` 的 `installCommandRowFace`）：在 `ctx.commandUi` 的候选合成
+   出口 `candidates(session, req)` 上包一层，只重写**本插件那一行**的行对象（`label` /
+   `description` / `icon` 三个展示字段），文案每次合成都现取（切语言立即生效）。图标取基线平台
+   模块 `@deepseek-ai/dsh-client-ui-primitives` 的 `IconCompactOutlineRegular`——官方 `/compact`
+   用的同一枚「压缩」字形（换字形只需改 `resolveCommandIcon` 里取的那个导出名）。
+
+**为什么可以接受这次越界**（登记在案的偏离）：不碰目录、不碰派发、不碰命令生命周期，不新增命令、
+不写 DOM、不引 timer，只改自己那一行的三个展示字段；`ctx.inject(['commandUi'])` 让服务缺席
+（没有指令目录的 composition）时回调永不触发。上游一旦把 `candidates` 改名或改成硬私有，包装
+**不生效**、行自动回落成官方回退外观（name + 宿主 description），功能不受影响——探针逐条锁死了
+这条降级路径。上游日后若开放第三方指令行外观缝，应删掉这层贴面改用它。
+
+验证：
+
+- `node exploration/fc-command-face-probe.mjs`（39 项，离线：按 `window.__ModuleLoader__.load`
+  契约真装载 `web/client.js` + 假 `commandUi`，覆盖四语言的 `cmdLabel`/`cmdDescription`、安装、
+  只改自己那一行、官方行与其他行原样、切语言即时生效、重复装配不叠加、卸载还原，以及
+  「无 `commandUi` / 无 `candidates` / 图标模块缺席 / 导出非组件」四种降级，并核对宿主注册的
+  `definitionId` 与一句式描述）；
+- `node exploration/fc-command-menu-probe.mjs <port>`（14 项，真浏览器：打开 `/` 菜单，断言该行
+  渲染成「本地化名 + `force-compact` + 本地化描述」三段且带图标，`/compact`、`/permission`、
+  `/export` 三行的官方外观未被影响；截图 `exploration/fc-command-menu-<port>.png`）；
+- `node exploration/fc-plugin-load-probe.mjs`（新增一段：挂上假 `commands` 服务后触发
+  `agent/request`，捕获真实的注册对象并核对 name / definitionId / description / recordInput）。
 
 ## 如何判断插件是否加载成功
 
