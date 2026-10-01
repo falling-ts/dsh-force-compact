@@ -69,6 +69,14 @@
  *   because this cap is SCHEDULED through `AbortSignal.timeout` rather than
  *   merely compared — see `MAX_TIMEOUT_MS` for why that bound is hard.
  *
+ * **Token-scale suffixes.** The three token budgets above may also be stored as
+ * strings carrying a `K` / `M` suffix (`'32K'`, `'1M'`, `'1.5M'`), because a
+ * hand-edited `$DSH_HOME/settings.yaml` is a supported input. Every read goes
+ * through {@linkcode parseTokenScale} (`core/token-scale.js`), which resolves the
+ * suffix against a DECIMAL base (1 K = 1000 tokens) and truncates to an integer;
+ * a suffix-free value is simply converted to an integer. The settings form
+ * accepts the same spellings and writes back the resolved integer.
+ *
  * Harness 0.1.7 replaced the old `settings.register(ns, schema, { base })` API
  * with a Config-driven model: this module builds the schema the plugin entry
  * exports as `Config`, and the settings form namespace is the plugin's LOADER
@@ -84,6 +92,8 @@
  *
  * @module @falling-ts/dsh-force-compact/settings
  */
+
+import { parseTokenScale } from './token-scale.js'
 
 /**
  * The settings namespace id for the force-compact configuration.
@@ -276,11 +286,15 @@ async function __readSettingsBody(ctx) {
     (typeof section[field] === 'boolean' ? section[field] : fallback)
   const asPositiveInt = (field, fallback) =>
     (Number.isFinite(section[field]) && section[field] > 0 ? section[field] : fallback)
-  // Token-scale parameter: parse + clamp up to the published floor (below-floor
-  // values RESOLVE to the floor rather than being rejected).
+  // Token-scale parameter: parse through the SHARED parser (which accepts a
+  // `K` / `M` suffix, for hand-edited settings.yaml) + clamp up to the published
+  // floor (below-floor values RESOLVE to the floor rather than being rejected).
+  // Unparseable or non-positive values fall back to the field default — which is
+  // always at or above the floor — so the result can never land below the floor.
   const asScaled = (field, floor) => {
-    const v = asPositiveInt(field, DEFAULTS[field])
-    return Number.isFinite(v) && v < floor ? floor : v
+    const v = parseTokenScale(section[field], DEFAULTS[field])
+    if (!Number.isFinite(v) || v <= 0) return DEFAULTS[field]
+    return v < floor ? floor : v
   }
   // Hang-guard timeout: parse + floor + ceiling + integer truncation. The token
   // scales are only ever COMPARED, so a fractional or astronomically large value

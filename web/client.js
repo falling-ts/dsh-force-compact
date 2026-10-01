@@ -39,9 +39,9 @@ window.__ModuleLoader__.load({
       disableThinking: "压缩时关闭思考",
       disableThinkingHint: "为 true 时每次模型请求携带 reasoningEffort: off，关闭思考以节省 token。",
       autoThresholdTokens: "自动压缩阈值（tokens）",
-      autoThresholdTokensHint: "会话总上下文 tokens ≥ 该值时，agent/pre-step 阈值门禁触发强制压缩。最小 32000；若填低于此值会自动重置为 32000。",
+      autoThresholdTokensHint: "会话总上下文 tokens ≥ 该值时，agent/pre-step 阈值门禁触发强制压缩。最小 32000；若填低于此值会自动重置为 32000。 支持 K/M 后缀（32K = 32000，1M = 1000000）。",
       retainLatestTokens: "保留最新上下文（tokens）",
-      retainLatestTokensHint: "自动/强制压缩时，从会话最新条目往前累加 token（按官方 tokenMeter 逐节点计数），直到 ≥ 该值停止；该截点之前的所有条目一次性发往大模型做摘要（原条目被遮蔽/跳过），保留的尾部逐字保留。默认 8000；最小 8000，若填低于此值会自动重置为 8000。",
+      retainLatestTokensHint: "自动/强制压缩时，从会话最新条目往前累加 token（按官方 tokenMeter 逐节点计数），直到 ≥ 该值停止；该截点之前的所有条目一次性发往大模型做摘要（原条目被遮蔽/跳过），保留的尾部逐字保留。默认 8000；最小 8000，若填低于此值会自动重置为 8000。 支持 K/M 后缀（32K = 32000，1M = 1000000）。",
       turnEndForceCompaction: "回合结束强制压缩",
       turnEndForceCompactionHint: "为 true 时，agent 转入 idle（一轮结束）时执行一轮结束压缩。",
       debug: "详细日志（debug）",
@@ -49,6 +49,7 @@ window.__ModuleLoader__.load({
       logFile: "日志文件路径",
       logFileHint: "详细日志的目标文件路径（leading ~ 展开为用户家目录）。修改后下次启动生效。",
       logFilePlaceholder: "~/.dsh/logs/dsh-force-compact.log",
+      tokenScalePlaceholder: "32000 或 32K",
       compactionMode: "压缩服务解析模式",
       compactionModeHint: "realm：优先从当前 Agent 域查找 compaction 服务，再回落全局。global：直接使用全局 compaction 服务（需后端已挂到 root realm）。",
       modeRealm: "realm（域优先）",
@@ -56,7 +57,7 @@ window.__ModuleLoader__.load({
       builtinEnabled: "内置压缩引擎",
       builtinEnabledHint: "官方 compaction 服务不可达时（例如标准 preset 将其隔离进 isolate 组），启用插件自研的内置压缩引擎作为后备。默认开启。设为 false 严格只走官方。",
       maxSummaryTokens: "最大摘要数（tokens）",
-      maxSummaryTokensHint: "插件自身摘要 LLM 调用的 maxTokens 上限（默认 1024，1024–200000），防止摘要长度失控；收缩门禁另行保证提交的摘要比被遮蔽区间小。最小 1024，若填低于此值会自动重置为 1024。",
+      maxSummaryTokensHint: "插件自身摘要 LLM 调用的 maxTokens 上限（默认 1024，1024–200000），防止摘要长度失控；收缩门禁另行保证提交的摘要比被遮蔽区间小。最小 1024，若填低于此值会自动重置为 1024。 支持 K/M 后缀（32K = 32000，1M = 1000000）。",
       summarizationTimeoutMs: "摘要超时上限（ms）",
       summarizationTimeoutMsHint: "一次摘要 LLM 流的硬墙钟超时（毫秒）。流在此限内未产出终止状态即判为挂起并中止（防止 compaction/start 锁永不闭合）。默认 90000（90 秒）；最小 5000，若填低于此值会自动重置为 5000；无上限——填很大的值相当于禁用该守卫。",
       unavailable: "设置不可用",
@@ -94,9 +95,9 @@ window.__ModuleLoader__.load({
       disableThinking: "Disable thinking during compaction",
       disableThinkingHint: "When true, every model request carries reasoningEffort: off to save tokens.",
       autoThresholdTokens: "Auto-compaction threshold (tokens)",
-      autoThresholdTokensHint: "When the session's total context tokens ≥ this value, the agent/pre-step threshold gate force-compacts. Minimum 32000; values below are clamped back to 32000.",
+      autoThresholdTokensHint: "When the session's total context tokens ≥ this value, the agent/pre-step threshold gate force-compacts. Minimum 32000; values below are clamped back to 32000. K/M suffixes are accepted: 32K = 32000, 1M = 1000000.",
       retainLatestTokens: "Retain latest context (tokens)",
-      retainLatestTokensHint: "When auto/forced compaction fires, walk backward from the LATEST surface entry accumulating per-node tokens (the official tokenMeter's prices) until the running sum REACHES OR EXCEEDS this budget; everything before that cutoff is sent to the summarizer in ONE batch (its entries become shadowed/skipped in derived history), and the retained tail stays VERBATIM. Default 8000; minimum 8000 — values below are clamped back to 8000.",
+      retainLatestTokensHint: "When auto/forced compaction fires, walk backward from the LATEST surface entry accumulating per-node tokens (the official tokenMeter's prices) until the running sum REACHES OR EXCEEDS this budget; everything before that cutoff is sent to the summarizer in ONE batch (its entries become shadowed/skipped in derived history), and the retained tail stays VERBATIM. Default 8000; minimum 8000 — values below are clamped back to 8000. K/M suffixes are accepted: 32K = 32000, 1M = 1000000.",
       turnEndForceCompaction: "Force-compaction at turn end",
       turnEndForceCompactionHint: "When true, run a turn-end compaction when the agent becomes idle.",
       debug: "Verbose logging (debug)",
@@ -104,6 +105,7 @@ window.__ModuleLoader__.load({
       logFile: "Log file path",
       logFileHint: "Destination for verbose logs (leading ~ expands to the user home). Takes effect on the next restart.",
       logFilePlaceholder: "~/.dsh/logs/dsh-force-compact.log",
+      tokenScalePlaceholder: "32000 or 32K",
       compactionMode: "Compaction-service resolution mode",
       compactionModeHint: "realm: locate the compaction service in the current Agent's realm first, falling back to global. global: use the global compaction service directly (requires the backend to be mounted at the root realm).",
       modeRealm: "realm (realm-first)",
@@ -111,7 +113,7 @@ window.__ModuleLoader__.load({
       builtinEnabled: "Built-in compaction engine",
       builtinEnabledHint: "Fallback to this plugin's own self-contained engine when the official compaction service is unreachable (e.g. standard-preset realm isolation). Defaults on. Set false to strictly use only the official backend.",
       maxSummaryTokens: "Max summary size (tokens)",
-      maxSummaryTokensHint: "maxTokens ceiling on the plugin's own summarization LLM call (default 1024, range 1024–200000). Prevents runaway summaries; the shrink gate separately guarantees the committed summary is smaller than the span it replaces. Minimum 1024 — values below are clamped back to 1024.",
+      maxSummaryTokensHint: "maxTokens ceiling on the plugin's own summarization LLM call (default 1024, range 1024–200000). Prevents runaway summaries; the shrink gate separately guarantees the committed summary is smaller than the span it replaces. Minimum 1024 — values below are clamped back to 1024. K/M suffixes are accepted: 32K = 32000, 1M = 1000000.",
       summarizationTimeoutMs: "Summarization timeout (ms)",
       summarizationTimeoutMsHint: "Hard wall-clock cap for ONE summarization stream (ms). A stream that yields no terminal finish within this limit is presumed hung and aborted (preventing a leaked compaction/start lock). Default 90000 (90s); minimum 5000 — values below are clamped back to 5000; no ceiling — a very large value effectively disables the guard.",
       unavailable: "Settings unavailable",
@@ -152,9 +154,9 @@ window.__ModuleLoader__.load({
       disableThinking: "圧縮時の思考を無効化",
       disableThinkingHint: "true のとき、このプラグイン自身の圧縮要約呼び出しに reasoningEffort: off を付与し、思考を無効化してトークンを節約します。通常の対話リクエストには影響しません（マシンの既定値のまま）。",
       autoThresholdTokens: "自動圧縮のしきい値（トークン）",
-      autoThresholdTokensHint: "セッションの総コンテキストトークンがこの値以上になると、agent/pre-step のしきい値ゲートが強制圧縮を実行します。最小 32000。これ未満の値は 32000 に戻されます。",
+      autoThresholdTokensHint: "セッションの総コンテキストトークンがこの値以上になると、agent/pre-step のしきい値ゲートが強制圧縮を実行します。最小 32000。これ未満の値は 32000 に戻されます。 K/M 接尾辞にも対応：32K = 32000、1M = 1000000。",
       retainLatestTokens: "最新コンテキストの保持量（トークン）",
-      retainLatestTokensHint: "自動／強制圧縮のとき、セッションの最新エントリから公式 tokenMeter のノード単位カウントでトークンを遡って加算し、この値に達した時点で停止します。その境界より前のエントリはまとめて要約 LLM に送られ（元のエントリは遮蔽／スキップされます）、保持された末尾はそのまま残ります。既定 8000、最小 8000。これ未満の値は 8000 に戻されます。",
+      retainLatestTokensHint: "自動／強制圧縮のとき、セッションの最新エントリから公式 tokenMeter のノード単位カウントでトークンを遡って加算し、この値に達した時点で停止します。その境界より前のエントリはまとめて要約 LLM に送られ（元のエントリは遮蔽／スキップされます）、保持された末尾はそのまま残ります。既定 8000、最小 8000。これ未満の値は 8000 に戻されます。 K/M 接尾辞にも対応：32K = 32000、1M = 1000000。",
       turnEndForceCompaction: "ターン終了時の強制圧縮",
       turnEndForceCompactionHint: "true のとき、agent が idle（1 ターンの終了）へ移行した時点でターン終了圧縮を 1 回実行します。",
       debug: "詳細ログ（debug）",
@@ -162,6 +164,7 @@ window.__ModuleLoader__.load({
       logFile: "ログファイルのパス",
       logFileHint: "詳細ログの出力先パス（先頭の ~ はユーザーのホームディレクトリに展開されます）。変更は次回起動時に有効になります。",
       logFilePlaceholder: "~/.dsh/logs/dsh-force-compact.log",
+      tokenScalePlaceholder: "32000 または 32K",
       compactionMode: "圧縮サービスの解決モード",
       compactionModeHint: "realm: 現在の Agent のレルムから compaction サービスを探し、見つからなければグローバルへフォールバックします。global: グローバルの compaction サービスを直接使います（バックエンドが root レルムにマウントされている必要があります）。",
       modeRealm: "realm（レルム優先）",
@@ -169,7 +172,7 @@ window.__ModuleLoader__.load({
       builtinEnabled: "内蔵圧縮エンジン",
       builtinEnabledHint: "公式の compaction サービスに到達できないとき（標準プリセットが isolate グループへ隔離している場合など）に、このプラグイン自前の内蔵圧縮エンジンをフォールバックとして使います。既定は有効。false にすると公式のみを使います。",
       maxSummaryTokens: "要約の最大サイズ（トークン）",
-      maxSummaryTokensHint: "このプラグイン自身の要約 LLM 呼び出しの maxTokens 上限（既定 1024、範囲 1024〜200000）。要約が暴走するのを防ぎます。コミットされる要約が遮蔽区間より小さいことは、別途シュリンクゲートが保証します。最小 1024。これ未満の値は 1024 に戻されます。",
+      maxSummaryTokensHint: "このプラグイン自身の要約 LLM 呼び出しの maxTokens 上限（既定 1024、範囲 1024〜200000）。要約が暴走するのを防ぎます。コミットされる要約が遮蔽区間より小さいことは、別途シュリンクゲートが保証します。最小 1024。これ未満の値は 1024 に戻されます。 K/M 接尾辞にも対応：32K = 32000、1M = 1000000。",
       summarizationTimeoutMs: "要約のタイムアウト上限（ms）",
       summarizationTimeoutMsHint: "1 回の要約 LLM ストリームに対するハードな実時間上限（ミリ秒）。この時間内に終端状態を返さないストリームはハングとみなして中断します（compaction/start ロックが閉じない事態を防ぎます）。既定 90000（90 秒）、最小 5000。これ未満の値は 5000 に戻されます。上限はありません（非常に大きな値はこのガードを実質的に無効化します）。",
       unavailable: "設定を利用できません",
@@ -207,9 +210,9 @@ window.__ModuleLoader__.load({
       disableThinking: "압축 시 사고 비활성화",
       disableThinkingHint: "true이면 이 플러그인 자체의 압축 요약 호출에 reasoningEffort: off를 실어 사고를 끄고 토큰을 절약합니다. 일반 대화 요청에는 영향을 주지 않습니다(머신 기본값 유지).",
       autoThresholdTokens: "자동 압축 임계값(토큰)",
-      autoThresholdTokensHint: "세션의 총 컨텍스트 토큰이 이 값 이상이면 agent/pre-step 임계값 게이트가 강제 압축을 실행합니다. 최소 32000이며 이보다 낮은 값은 32000으로 되돌립니다.",
+      autoThresholdTokensHint: "세션의 총 컨텍스트 토큰이 이 값 이상이면 agent/pre-step 임계값 게이트가 강제 압축을 실행합니다. 최소 32000이며 이보다 낮은 값은 32000으로 되돌립니다. K/M 접미사도 지원합니다: 32K = 32000, 1M = 1000000.",
       retainLatestTokens: "최신 컨텍스트 유지량(토큰)",
-      retainLatestTokensHint: "자동/강제 압축 시 세션의 최신 항목부터 공식 tokenMeter의 노드별 계산으로 토큰을 역산해 더하다가 이 값에 도달하면 멈춥니다. 그 경계 이전의 모든 항목은 한 번에 요약 LLM으로 보내지고(원본 항목은 가려지거나 건너뜀) 유지된 꼬리는 그대로 남습니다. 기본 8000, 최소 8000이며 이보다 낮은 값은 8000으로 되돌립니다.",
+      retainLatestTokensHint: "자동/강제 압축 시 세션의 최신 항목부터 공식 tokenMeter의 노드별 계산으로 토큰을 역산해 더하다가 이 값에 도달하면 멈춥니다. 그 경계 이전의 모든 항목은 한 번에 요약 LLM으로 보내지고(원본 항목은 가려지거나 건너뜀) 유지된 꼬리는 그대로 남습니다. 기본 8000, 최소 8000이며 이보다 낮은 값은 8000으로 되돌립니다. K/M 접미사도 지원합니다: 32K = 32000, 1M = 1000000.",
       turnEndForceCompaction: "턴 종료 시 강제 압축",
       turnEndForceCompactionHint: "true이면 agent가 idle(한 턴 종료)로 전환될 때 턴 종료 압축을 한 번 실행합니다.",
       debug: "상세 로그(debug)",
@@ -217,6 +220,7 @@ window.__ModuleLoader__.load({
       logFile: "로그 파일 경로",
       logFileHint: "상세 로그의 대상 경로입니다(앞의 ~는 사용자 홈 디렉터리로 확장됩니다). 변경은 다음 시작 시 적용됩니다.",
       logFilePlaceholder: "~/.dsh/logs/dsh-force-compact.log",
+      tokenScalePlaceholder: "32000 또는 32K",
       compactionMode: "압축 서비스 해석 모드",
       compactionModeHint: "realm: 현재 Agent의 렐름에서 compaction 서비스를 먼저 찾고 없으면 전역으로 폴백합니다. global: 전역 compaction 서비스를 바로 사용합니다(백엔드가 root 렐름에 마운트되어 있어야 합니다).",
       modeRealm: "realm(렐름 우선)",
@@ -224,7 +228,7 @@ window.__ModuleLoader__.load({
       builtinEnabled: "내장 압축 엔진",
       builtinEnabledHint: "공식 compaction 서비스에 닿을 수 없을 때(예: 표준 프리셋이 isolate 그룹으로 격리한 경우) 이 플러그인 자체의 내장 압축 엔진을 폴백으로 사용합니다. 기본값은 켜짐이며 false로 두면 공식 엔진만 사용합니다.",
       maxSummaryTokens: "요약 최대 크기(토큰)",
-      maxSummaryTokensHint: "이 플러그인 자체 요약 LLM 호출의 maxTokens 상한입니다(기본 1024, 범위 1024–200000). 요약이 폭주하는 것을 막습니다. 커밋되는 요약이 가려진 구간보다 작다는 것은 별도의 축소 게이트가 보장합니다. 최소 1024이며 이보다 낮은 값은 1024로 되돌립니다.",
+      maxSummaryTokensHint: "이 플러그인 자체 요약 LLM 호출의 maxTokens 상한입니다(기본 1024, 범위 1024–200000). 요약이 폭주하는 것을 막습니다. 커밋되는 요약이 가려진 구간보다 작다는 것은 별도의 축소 게이트가 보장합니다. 최소 1024이며 이보다 낮은 값은 1024로 되돌립니다. K/M 접미사도 지원합니다: 32K = 32000, 1M = 1000000.",
       summarizationTimeoutMs: "요약 시간 초과 상한(ms)",
       summarizationTimeoutMsHint: "요약 LLM 스트림 한 번에 대한 하드 실시간 상한(밀리초)입니다. 이 시간 안에 종료 상태를 내지 않는 스트림은 멈춘 것으로 보고 중단합니다(compaction/start 잠금이 닫히지 않는 상황을 막습니다). 기본 90000(90초), 최소 5000이며 이보다 낮은 값은 5000으로 되돌립니다. 상한은 없습니다(아주 큰 값은 이 가드를 사실상 무력화합니다).",
       unavailable: "설정을 사용할 수 없습니다",
@@ -464,6 +468,32 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 客户端侧的 token 尺度解析器。与宿主 `src/core/token-scale.js` 的
+     * `parseTokenScale` **逐规则一致**：十进制 K = 1000 / M = 1000000、忽略 `,`
+     * `_` 与空白、不接受科学计数法、解析失败返回 fallback。
+     *
+     * 宿主半部与浏览器半部是同一个 package 的**两个独立打包 artifact**（前者走
+     * main 入口、后者走 exports["./client"]），无法共享模块，所以一致性由
+     * `exploration/fc-token-scale-parity-probe.mjs` 逐用例对拉两端实现来锁死。
+     * @param {unknown} raw 存储值：数字，或带可选 K/M 后缀的字符串。
+     * @param {unknown} fallback 无法解析时原样返回。
+     * @returns {unknown} 解析出的整数，或 fallback。
+     */
+    function parseTokenScaleText(raw, fallback) {
+      if (raw === undefined || raw === null) return fallback;
+      if (typeof raw === "number") return Number.isFinite(raw) ? Math.trunc(raw) : fallback;
+      if (typeof raw !== "string") return fallback;
+      const text = raw.replace(/[\s,_]/g, "");
+      if (text === "") return fallback;
+      const m = /^([+-]?(?:\d+(?:\.\d+)?|\.\d+))([kKmM])?$/.exec(text);
+      if (m === null) return fallback;
+      const n = Number(m[1]);
+      if (!Number.isFinite(n)) return fallback;
+      const mult = m[2] === undefined ? 1 : (m[2].toLowerCase() === "k" ? 1000 : 1000000);
+      return Math.trunc(n * mult);
+    }
+
+    /**
      * 在 `useDraftNumber` 之上再套一层「硬性 floor」：commit 时把数值先 clamp
      * 到 [hardFloor, opts.max]（忽略 opts.min，改用传入的硬下界），并把钳位后的
      * 值同时写回 store——即使另一入口绕过表单写入 sub-floor 值，下一次 blur
@@ -507,6 +537,55 @@ window.__ModuleLoader__.load({
         onBlur: commit,
         onKeyDown: (e) => { if (e.key === "Enter") { e.currentTarget.blur(); } },
         inputMode: "decimal",
+      };
+      return [buf, handlers];
+    }
+
+    /**
+     * token 尺度草稿编辑：与 `useDraftNumberClamped` 同形，但输入框是**文本**，
+     * 接受 `K` / `M` 后缀（`32K` / `1M` / `1.5M`）。提交时经
+     * `parseTokenScaleText` 解析成整数 token 数，再按 [hardFloor, opts.max] 钳位
+     * 后写回 store —— store 里始终是**整数**（settings.yaml 保持数值型，无迁移），
+     * 后缀纯粹是输入糖；解析失败或非正数则还原为当前值，不写回。
+     * @param {string} key
+     * @param {*} currentValue 当前 store 中的值。
+     * @param {{ step?: number, min?: number, max?: number, placeholder?: string }} opts
+     * @param {(k:string,v:any)=>void} update 底层写回函数。
+     * @param {number} hardFloor 不可逾越的下限（提交时向上 clamp）。
+     * @returns [draftValue, handlers]
+     */
+    function useDraftTokenScale(key, currentValue, opts, update, hardFloor) {
+      const [buf, setBuf] = React.useState(currentValue === undefined ? "" : String(currentValue));
+      const focusedRef = React.useRef(false);
+      React.useEffect(() => {
+        // 外部漂移（另一标签页 / 程序化写入）只在不在编辑中时回灌缓冲。
+        if (!focusedRef.current) {
+          setBuf(currentValue === undefined ? "" : String(currentValue));
+        }
+      }, [currentValue, hardFloor]);
+      const commit = () => {
+        focusedRef.current = false;
+        const trimmed = buf.trim();
+        if (trimmed === "") { update(key, undefined); setBuf(""); return; }
+        const parsed = parseTokenScaleText(trimmed, undefined);
+        if (parsed === undefined || !Number.isFinite(parsed) || parsed <= 0) {
+          setBuf(currentValue === undefined ? "" : String(currentValue));
+          return;
+        }
+        let c = parsed;
+        if (c < hardFloor) c = hardFloor;
+        if (opts.max !== undefined && c > opts.max) c = opts.max;
+        update(key, c);
+        setBuf(String(c));
+      };
+      const handlers = {
+        onFocus: () => { focusedRef.current = true; },
+        onChange: (e) => setBuf(e.target.value),
+        onBlur: commit,
+        onKeyDown: (e) => { if (e.key === "Enter") { e.currentTarget.blur(); } },
+        inputMode: "text",
+        spellCheck: false,
+        autoComplete: "off",
       };
       return [buf, handlers];
     }
@@ -649,17 +728,17 @@ window.__ModuleLoader__.load({
       // hooks 顺序恒定（状态切换不改变 hook 数）。
       // 三个 token 尺度参数均带硬性下界：schema 与表单两侧同设同一 floor，
       // 表单提交时再做一次运行时 clamp（防键盘直接键入 sub-floor 值）。
-      const thOpt = { step: 1000, min: 32000, max: 1000000 };
-      const [thBuf, thHandlers] = useDraftNumberClamped("autoThresholdTokens", valOrUndef("autoThresholdTokens"), thOpt, update, 32000);
-      // retainLatestTokens：整 token 值（step 512），范围 8000–1_000_000。
-      const rtOpt = { step: 512, min: 8000, max: 1000000 };
-      const [rtBuf, rtHandlers] = useDraftNumberClamped("retainLatestTokens", valOrUndef("retainLatestTokens"), rtOpt, update, 8000);
+      const thOpt = { step: 1000, min: 32000, max: 1000000, placeholder: t("tokenScalePlaceholder") };
+      const [thBuf, thHandlers] = useDraftTokenScale("autoThresholdTokens", valOrUndef("autoThresholdTokens"), thOpt, update, 32000);
+      // retainLatestTokens：整 token 值，范围 8000–1_000_000。
+      const rtOpt = { step: 512, min: 8000, max: 1000000, placeholder: t("tokenScalePlaceholder") };
+      const [rtBuf, rtHandlers] = useDraftTokenScale("retainLatestTokens", valOrUndef("retainLatestTokens"), rtOpt, update, 8000);
       // 新增三项的可观察源（同样放在顶部无条件调用，保持 hooks 顺序稳定）。
       const lfOpt = { placeholder: t("logFilePlaceholder") };
       const [lfBuf, lfHandlers] = useDraftText("logFile", valOrUndef("logFile"), update);
       // maxSummaryTokens: 数字框，1024–200000，默认 1024。
-      const msOpt = { step: 64, min: 1024, max: 200000 };
-      const [msBuf, msHandlers] = useDraftNumberClamped("maxSummaryTokens", valOrUndef("maxSummaryTokens"), msOpt, update, 1024);
+      const msOpt = { step: 64, min: 1024, max: 200000, placeholder: t("tokenScalePlaceholder") };
+      const [msBuf, msHandlers] = useDraftTokenScale("maxSummaryTokens", valOrUndef("maxSummaryTokens"), msOpt, update, 1024);
       // summarizationTimeoutMs: 数字框，默认 90000，最小 5000，无上限。
       const soOpt = { step: 5000, min: 5000 };
       const [soBuf, soHandlers] = useDraftNumberClamped("summarizationTimeoutMs", valOrUndef("summarizationTimeoutMs"), soOpt, update, 5000);
@@ -714,6 +793,24 @@ window.__ModuleLoader__.load({
           hintCell(hintKey));
       }
 
+      // token 尺度行：**文本**输入框（接受 K/M 后缀），提交时解析为整数 token 数。
+      // placeholder 顺带演示两种写法；输入框宽度比数字框宽一点，容下 "1000000"。
+      function tokenRow(key, labelKey, hintKey, buf, handlers, opts, isLast) {
+        return h("div", { key: key, style: isLast ? lastRowStyle : rowStyle },
+          labelCell(labelKey),
+          h("span", { style: controlStyle },
+            h("input", {
+              type: "text",
+              value: buf,
+              disabled: disabled,
+              placeholder: opts.placeholder || "",
+              "aria-label": t(labelKey),
+              style: { ...inputStyle, width: 148 },
+              ...handlers,
+            })),
+          hintCell(hintKey));
+      }
+
       // 比例行：左 label（同列宽），中拖动滑块 + 实时百分比，下排 hint。
       // 单独定义三栏模板（中间留给 200px 滑轨），避免共用 140px 窄列造成溢出。
       const ratioGrid = "172px auto minmax(0,1fr)";
@@ -761,14 +858,14 @@ window.__ModuleLoader__.load({
           h("p", { style: introStyle }, t("intro")),
           h("div", null,
             booleanRow("disableThinking", "disableThinking", "disableThinkingHint", false),
-            numberRow("autoThresholdTokens", "autoThresholdTokens", "autoThresholdTokensHint", thBuf, thHandlers, thOpt, false),
-            numberRow("retainLatestTokens", "retainLatestTokens", "retainLatestTokensHint", rtBuf, rtHandlers, rtOpt, false),
+            tokenRow("autoThresholdTokens", "autoThresholdTokens", "autoThresholdTokensHint", thBuf, thHandlers, thOpt, false),
+            tokenRow("retainLatestTokens", "retainLatestTokens", "retainLatestTokensHint", rtBuf, rtHandlers, rtOpt, false),
             booleanRow("turnEndForceCompactionEnabled", "turnEndForceCompaction", "turnEndForceCompactionHint", false),
             booleanRow("debug", "debug", "debugHint", false),
             textRow("logFile", "logFileHint", lfBuf, lfHandlers, lfOpt, false),
             modeRow(false),
             booleanRow("builtinEnabled", "builtinEnabled", "builtinEnabledHint", false),
-            numberRow("maxSummaryTokens", "maxSummaryTokens", "maxSummaryTokensHint", msBuf, msHandlers, msOpt, false),
+            tokenRow("maxSummaryTokens", "maxSummaryTokens", "maxSummaryTokensHint", msBuf, msHandlers, msOpt, false),
             numberRow("summarizationTimeoutMs", "summarizationTimeoutMs", "summarizationTimeoutMsHint", soBuf, soHandlers, soOpt, true)),
           disabled ? h("p", { style: disabledHintStyle }, t("notWritable")) : null);
     }
@@ -1285,6 +1382,113 @@ window.__ModuleLoader__.load({
      * 注册文案字典、绑定设置命名空间、把分区挂到 settings.section。
      * @param ctx - client 根上下文。
      */
+    // ── 设置导航图标（`settings.section` 没有 icon 选项）───────────────────────
+    // 设置外壳（ui-settings-general 的 SettingsRoot）按 **section id 硬编码** 导航
+    // 字形：只有官方那几个 id 有专属图标，其余一律回退齿轮；而 settings.section 的
+    // 注册选项只有 id / order / label，第三方分区**拿不到图标位**。生态通行做法
+    // （dshmarket 的 settings-nav-icon、dsh-better-sidebar、dsh-skill-mcp-panel）是：
+    // 对话框挂载后按**本地化 label 文本**认领自己那一行，用 CSS `mask-image` 画自己
+    // 的标记并隐藏兜底的齿轮。这里照做，范围刻意收窄——
+    //   · 只给「可见文本 === 本插件当前本地化分区名」的那一行打属性，不碰外壳结构；
+    //   · 属性与注入的样式表都由 ctx.effect 持有，随 fiber 卸载一并撤销；
+    //   · 切语言时 MutationObserver 重新认领，标签与字形不会互相矛盾；
+    //   · 不新增订阅以外的内存态（一个 style 元素 + 一个属性）。
+    // 官方一旦给 settings.section 加上 icon 字段，就删掉这段、改用官方字段。
+    const NAV_ICON_ATTR = "data-fc-nav-icon";
+    /** 导航行定位：设置对话框 nav 里的按钮（外壳把每个 section 渲染成一个 button）。 */
+    const NAV_ROW_SELECTOR = "[role=\"dialog\"] nav button";
+    // mask 只用 alpha 通道：模板本身**不命名任何颜色**（一律 currentColor），
+    // 可见颜色来自 CSS 的 background-color: currentColor。
+
+    /** 本插件的导航标记：中杠 + 上下两个内收箭头 —— 与 icon.svg 同一个「压缩」语义。 */
+    const NAV_MARK_PATH = '<rect x="3" y="7.25" width="10" height="1.5" rx="0.75"/>'
+      + '<rect x="7.25" y="1.2" width="1.5" height="3.2"/>'
+      + '<path d="M8 6.8 10.7 4 5.3 4Z"/>'
+      + '<rect x="7.25" y="11.6" width="1.5" height="3.2"/>'
+      + '<path d="M8 9.2 5.3 12 10.7 12Z"/>';
+    /** 标记的 mask URL（空格等一律运行时编码，不手工转义）。 */
+    function navMarkUrl() {
+      return "data:image/svg+xml," + encodeURIComponent(
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor">'
+        + NAV_MARK_PATH + "</svg>");
+    }
+    /** 被认领那一行的样式：藏掉外壳齿轮，用 mask 画标记（颜色取 currentColor）。 */
+    function navIconCss(maskUrl) {
+      const sel = "[" + NAV_ICON_ATTR + "]";
+      return [
+        sel + " > svg { display: none; }",
+        sel + "::before {",
+        "  content: '';",
+        "  flex: none;",
+        "  width: 16px;",
+        "  height: 16px;",
+        "  background-color: currentColor;",
+        "  -webkit-mask-image: url(\"" + maskUrl + "\");",
+        "  mask-image: url(\"" + maskUrl + "\");",
+        "  -webkit-mask-repeat: no-repeat;",
+        "  mask-repeat: no-repeat;",
+        "  -webkit-mask-position: center;",
+        "  mask-position: center;",
+        "  -webkit-mask-size: 16px 16px;",
+        "  mask-size: 16px 16px;",
+        "}",
+      ].join("\n");
+    }
+    /**
+     * 该行是不是本插件自己的。
+     *
+     * 这是本特性唯一的判断：可见文本 === 外壳当前投影的分区名。空标签不认领任何
+     * 行——语言未就绪时不能把整条导航都标记掉。
+     */
+    function isOwnNavRow(rowText, wantedLabel) {
+      const wanted = String(wantedLabel === undefined || wantedLabel === null ? "" : wantedLabel).trim();
+      if (wanted.length === 0) return false;
+      return String(rowText === undefined || rowText === null ? "" : rowText).trim() === wanted;
+    }
+    /**
+     * 装配设置导航图标。
+     * @param ctx - 客户端上下文（用于 effect 归属）。
+     * @param resolveLabel - 本插件当前的本地化分区名（每次同步现取，切语言即生效）。
+     */
+    function installSettingsNavIcon(ctx, resolveLabel) {
+      if (typeof document === "undefined") return;
+      ctx.effect(() => {
+        const tag = document.createElement("style");
+      // 装饰性特性：宿主（或测试桩）只提供部分 DOM 面时静默跳过，绝不把
+      // 设置面板带下水。
+      if (tag === undefined || tag === null || tag.dataset === undefined || tag.dataset === null) return;
+        tag.dataset.plugin = "@falling-ts/dsh-force-compact";
+        tag.dataset.pluginCss = "force-compact/settings-nav-icon";
+        tag.textContent = navIconCss(navMarkUrl());
+        document.head.appendChild(tag);
+        let disposed = false;
+        let scheduled = false;
+        const sync = () => {
+          scheduled = false;
+          if (disposed) return;
+          const wanted = resolveLabel();
+          for (const row of document.querySelectorAll(NAV_ROW_SELECTOR)) {
+            if (isOwnNavRow(row.textContent, wanted)) row.setAttribute(NAV_ICON_ATTR, "");
+            else row.removeAttribute(NAV_ICON_ATTR);
+          }
+        };
+        const schedule = () => {
+          if (scheduled || disposed) return;
+          scheduled = true;
+          queueMicrotask(sync);
+        };
+        sync();
+        const observer = new MutationObserver(schedule);
+        observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+        return () => {
+          disposed = true;
+          observer.disconnect();
+          for (const row of document.querySelectorAll("[" + NAV_ICON_ATTR + "]")) row.removeAttribute(NAV_ICON_ATTR);
+          if (typeof tag.remove === "function") tag.remove();
+        };
+      }, "force-compact: settings nav icon");
+    }
+
     function apply(ctx) {
       // zh 是键集事实源，en/ja/ko 必须与之逐键对齐（缺键时查找链回落到 en）。
       // 语言目录项与字典分开登记：addLanguage 可能因兄弟插件已注册同一 id 而让位
@@ -1295,6 +1499,8 @@ window.__ModuleLoader__.load({
         return () => { disposeDicts(); disposeLanguages(); };
       }, "force-compact: dictionaries and languages");
       const t = ctx.locale.bind(NS);
+      // 设置导航图标（机制与偏离登记见上方 installSettingsNavIcon）。
+      installSettingsNavIcon(ctx, () => t("nav"));
       // 指令行的官方外观（图标 + 本地化名称/描述）：commandUi 服务就绪后贴一层。
       // 服务缺席（没有指令目录的 composition）时该回调永不触发，分区照常工作。
       ctx.inject(["commandUi"], (faceCtx) => { installCommandRowFace(faceCtx, t, resolveCommandIcon()); });

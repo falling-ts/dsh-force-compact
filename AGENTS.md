@@ -926,3 +926,70 @@ harness 在 0.1.2-rc.1 时代重构了 `Session` 类：**不再暴露公开的 `
 **清单变更要重启实例才生效**：profile-resolution 在启动时快照插件的 exports 表，profile HMR 只监视 profile 的清单/补丁层，不监视插件自己的 `package.json`（实测：改完不重启，`pluginInventory/list` 里 `icon` 已生效而 `title` 仍是回退值——图标是按清单路径直读文件，文案要走 exports 解析）。
 
 回归闸门：`node exploration/plugin-manifest-check.mjs`（已扩展为同时校验 locale 键集 / 文案长度上限 / icon 存在与体积 / `exports` 与 `files` 覆盖；反向验证过一次：移走 `locale/zh.json` 即红）。
+
+## 设置项支持 K/M 后缀（2026-10-01 增补）
+
+三个 token 预算设置（`autoThresholdTokens` / `retainLatestTokens` /
+`maxSummaryTokens`）除裸整数外还接受 **`K` / `M` 后缀**（`32K` / `1M` / `1.5M`）。
+
+**进制是 1000，不是 1024。** `32K` 必须等于 `32000` —— 即 `autoThresholdTokens`
+的出厂默认值与硬下界。三个 floor（32000 / 8000 / 1024）与文档上限（200000）全是
+十进制数，用二进制 K 会让「文档里的默认值」无法用后缀表达（那会是 `31.25K`）；
+模型上下文窗口的报价口径同样是十进制。
+
+**解析器是共享模块** `src/core/token-scale.js` 的 `parseTokenScale(raw, fallback)`：
+接受 `number` 或带可选后缀的 `string`，忽略 `,` `_` 与空白，拒绝科学计数法，
+不可解析 / 非正数回落 `fallback`，**永不抛**。宿主侧唯一读取路径 `settings.js` 的
+`asScaled` 现在必经它，因此**手改 `$DSH_HOME/settings.yaml` 写 `"1M"` / `"32K"`
+也合法**：
+
+- 有后缀 → 数值 × 1000（K）/ × 1000000（M），截断为整数；
+- 无后缀 → 直接转整数（`"32000"` → `32000`）；
+- 之后仍按各自 floor 向上钳位（`"5K"` → 32000）；不可解析则回落该字段默认值。
+
+**两端各写一份，靠探针锁一致**：宿主半部与浏览器半部是同一 package 的两个独立打包
+artifact（main 入口 / `exports["./client"]`），无法共享模块，故 `web/client.js` 里
+有一份逐规则相同的 `parseTokenScaleText`，由
+`node exploration/fc-token-scale-parity-probe.mjs` 抽出两端**真实实现**逐用例对拉。
+
+**表单写回的是整数**：`useDraftTokenScale` 把 `32K` 解析成 `32000` 再写回 store，
+所以 `settings.yaml` 里始终是数值型（无迁移、无 schema 变更、默认值显示不受影响），
+后缀纯粹是输入糖。输入框由 `type="number"` 改为 `type="text"`，placeholder 按语言
+给出 `32000 或 32K` / `32000 or 32K` 等写法，三条 hint 各补一句后缀说明（zh/en/ja/ko
+四份词典同步，键集仍与 zh 对齐）。
+
+## 设置导航图标（`settings.section` 没有 icon 选项，2026-10-01 增补）
+
+设置外壳（`ui-settings-general` 的 `SettingsRoot`）按 **section id 硬编码**导航字形：
+只有官方那几个 id（account / models / agent-presets / plugins / archived-sessions）
+有专属图标，其余一律回退同一枚齿轮。`settings.section` 的注册选项只有
+`id` / `order` / `label`（`SettingsSectionRow = { id, order, label }`），
+**第三方分区拿不到图标位**。上游 `settings.section` 的 slot 契约与运行时 slot 清单
+都只列这三项；工作区 pin 的 `ui-settings-general` 与桌面应用 `app.asar` 里打包的
+客户端同源，`navIcon()` 是同一份硬编码映射（已逐行核对）。
+
+生态通行做法（`dshmarket` 的 `settings-nav-icon`、`dsh-better-sidebar`、
+`dsh-skill-mcp-panel`）是：对话框挂载后按**本地化 label 文本**认领自己那一行，用
+CSS `mask-image` 画自己的标记并隐藏兜底齿轮。本插件照做
+（`installSettingsNavIcon`，在 `apply` 里装配），范围刻意收窄：
+
+- 只给「可见文本 === 本插件当前本地化分区名」的 `[role="dialog"] nav button` 打
+  `data-fc-nav-icon` 属性；空标签不认领任何行（语言未就绪时不会把整条导航标记掉）；
+- **不碰 React 节点**：不删不换，只加一个属性 + 注入一张 `<style>`；
+- 属性与样式表都由 `ctx.effect` 持有，随 fiber 卸载一并撤销；
+- `MutationObserver` 只在 React 改写导航时触发（切语言 / 分区增减即重新认领），
+  空闲零回调，与 LiveUI 贴皮那处观察器同类；
+- DOM 面不完整（宿主或测试桩只给了部分 API）时静默跳过——纯装饰，绝不把设置面板带下水。
+
+**标记是纯 alpha 模板**：mask 只用 alpha 通道，模板本身不命名任何颜色（一律
+`currentColor`，可见颜色来自 `background-color: currentColor`），所以它既不参与
+主题取色、也不在 `--fcts-*` 色表之外引入字面色。图形与 `icon.svg` 同一语义：中杠 + 上下两个内收箭头（「压缩」）
+
+**为什么可以接受这次越界**（登记在案的偏离）：不改任何上游行为、不碰 slot 台账、
+不新增命令或服务；认领判据只读自己那一行的可见文本。上游一旦给 `settings.section`
+加上 `icon` 字段，就删掉 `installSettingsNavIcon` 改用官方字段。
+
+验证：`node exploration/fc-settings-nav-icon-probe.mjs`（三插件 × 27 项，离线：抽出
+三个 `web/client.js` 的真实实现 + 最小 DOM 桩，覆盖谓词边界 / mask 与样式表形状 /
+只认领自己那一行 / 切语言重认领 / 空标签释放 / 卸载清干净 / 新 fiber 可重装，并核对
+三者用的是**三个不同**的属性名与样式表 id）。
