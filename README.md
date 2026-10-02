@@ -291,7 +291,7 @@ written to the profile's `cordis.patch.yml` (harness 0.1.7 onward; formerly
 | key | type | default | meaning |
 |-----|------|---------|---------|
 | `disableThinking` | boolean | `true` | Only the plugin's own summarization call carries `reasoningEffort:'off'`; everything else unchanged. |
-| `autoThresholdTokens` | number ≥ 32000 | `32000` | Projected-token trigger for the gate. **Floor 32000** (clamps back up at read time). |
+| `autoThresholdTokens` | number ≥ 32000 | `32000` | **Default** projected-token trigger for the gate. Every session without its own override uses this value; **Floor 32000** (clamps back up at read time). See [Per-session threshold](#per-session-threshold). |
 | `retainLatestTokens` | positive int ≥ 8000 | `8000` | Retain the latest N tokens verbatim; older history is summarized in one batch. **Floor 8000.** Drives both the auto gate and `/force-compact`. |
 | `turnEndForceCompactionEnabled` | boolean | `true` | Compact on the agent's `idle` transition. |
 | `debug` | boolean | `true` | Emit `[force-compact]` diagnostics to the plugin log. |
@@ -313,6 +313,42 @@ falling-ts-force-compact:
 
 Without the `settings` service the plugin falls back to the same defaults and still compacts —
 the namespace is optional, never a hard dependency.
+
+
+Every token-count field above also accepts a `K` / `M` suffix in the settings form
+(`32K`, `1M`, or a plain number); parsing is decimal (`32K` = 32000, `1M` = 1000000) and
+the floors and ceilings above still clamp. The same parser backs the per-session control.
+
+### Per-session threshold
+
+`autoThresholdTokens` is only the **default**. A single conversation can override it
+without touching the shared settings document:
+
+- The control is the chip sitting just to the **right of the context-usage percentage**
+  in the composer bottom strip (the same row that carries the built-in stats pills).
+  It shows a **fixed caption** — icon plus "Force-compact threshold" — so the row reads
+  the same in every session and the number never shifts the layout. The **effective**
+  value, the owning session and the overridden state live in its tooltip (and in the panel).
+- Click it to open a small panel: type a threshold and click Save, or click **use global
+  default** to drop the override again. Enter submits.
+- The input takes a plain number or a `K` / `M` suffix (`123K`, `1M`, `32000`). Anything
+  unparseable is refused with an inline message and nothing is written; clearing it falls
+  back to the default. The 32000 floor applies to overrides too.
+- While `threshold < contextWindow` the plugin also draws WHERE compaction will fire: a red
+  dot on the composer context ring, placed at the ring angle for `threshold / contextWindow`
+  (clockwise from twelve oclock, the same direction the ring fills), plus a red vertical
+  line on the expanded breakdown bar at the same ratio (exactly as tall as the bar). A
+  threshold at or above the context window draws nothing — occupancy can never reach it,
+  so there is no trigger point to mark.
+- Overrides live per session id under `sessionThresholds` in this namespace and are read
+  **only** by the session they belong to. Every gate (auto compaction, `/force-compact`,
+  region compaction, checkpoint, idle) resolves
+  `sessionThresholds[sessionId] ?? autoThresholdTokens`.
+- Absence is meaningful: removing the key restores the default, so an override can never
+  masquerade as a global change.
+- The chip renders in **both** performance-and-usage display modes (compact and detailed).
+  The built-in stats pills hide themselves when they have nothing to report; the threshold
+  chip stays put.
 
 ### Tuning for low-context llama.cpp
 

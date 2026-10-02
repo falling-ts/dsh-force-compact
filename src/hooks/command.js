@@ -106,7 +106,7 @@ async function __forceCompactCommandBody(ctx, invocation) {
   // `compactionMode` setting is read once here (raw, cheap) and passed so
   // the resolver need not re-read settings.
   const mode = await readRawSetting(ctx, 'compactionMode')
-  const settings = (await readSettings(ctx)) ?? DEFAULTS
+  const settings = (await readSettings(ctx, session)) ?? DEFAULTS
   const backend = await resolveCompaction(ctx, agent, mode)
   ctx.logger.debug(`[force-compact] ${session.id}: /force-compact handler entered (backend ${backend ? backend.kind : 'UNAVAILABLE'})`)
 

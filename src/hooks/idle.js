@@ -71,7 +71,7 @@ async function __handleAgentStatusBody(ctx, payload, mode) {
   // nothing to do (and no id to log) — degrade quietly rather than deref crash.
   const session = (agent && typeof agent === 'object') ? agent.session : undefined
   const sid = (session && typeof session.id === 'string') ? session.id : '?'
-  const settings = (await readSettings(ctx)) ?? DEFAULTS
+  const settings = (await readSettings(ctx, session)) ?? DEFAULTS
   if (settings.turnEndForceCompactionEnabled !== true) {
     // Visible so a tester who flipped the setting OFF can confirm the guard is
     // what suppressed the idle compaction (not a missing listener).

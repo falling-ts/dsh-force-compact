@@ -66,7 +66,7 @@ async function __compactSessionBody(ctx, agent, controller, mode) {
   // compaction trigger threshold and whether to disable thinking for the
   // summarization call. Falls back to composition defaults when the `settings`
   // service is not mounted.
-  const settings = (await readSettings(ctx)) ?? DEFAULTS
+  const settings = (await readSettings(ctx, session)) ?? DEFAULTS
 
   // Automatic compaction trigger gate: only compact when the session's context
   // occupancy reaches the configured threshold. Below it, the checkpoint is

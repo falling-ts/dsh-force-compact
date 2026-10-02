@@ -154,7 +154,7 @@ async function compactRetainingLatest(ctx, agent, signal, mode, sourceCommandId)
 
 /** Body of {@link compactRetainingLatest}; wrapped by its safe envelope. */
 async function __compactRetainingLatestBody(ctx, agent, signal, mode, sourceCommandId) {
-  const settings = (await readSettings(ctx)) ?? DEFAULTS
+  const settings = (await readSettings(ctx, (agent && typeof agent === 'object') ? agent.session : undefined)) ?? DEFAULTS
   const session = agent.session
   if (session === undefined || session === null) return false
   // Locate a usable compaction backend: the OFFICIAL `compaction` service
@@ -446,7 +446,7 @@ export const forceCompactIfNeeded = guardFn('guard.forceCompactIfNeeded', __forc
 
 /** Body of {@link forceCompactIfNeeded}; wrapped by its safe envelope. */
 async function __forceCompactIfNeededBody(ctx, agent, signal, mode) {
-  const settings = (await readSettings(ctx)) ?? DEFAULTS
+  const settings = (await readSettings(ctx, (agent && typeof agent === 'object') ? agent.session : undefined)) ?? DEFAULTS
   const session = (agent && typeof agent === 'object') ? agent.session : undefined
   // No usable session object → nothing to gate; let the request proceed.
   if (session === undefined || session === null || typeof session.id !== 'string') {

@@ -551,7 +551,7 @@ function mintMessageId() {
 async function __compactNowBuiltinBody(ctx, agent, signal, sourceCommandId, opts) {
   const session = agent.session
   if (session === undefined || typeof session.append !== 'function') return null
-  const settings = (await readSettings(ctx)) ?? DEFAULTS
+  const settings = (await readSettings(ctx, session)) ?? DEFAULTS
   if (!(settings.builtinEnabled !== false)) return null
 
   // Guard: refuse while a prior compaction transaction is still open (durable lock).
@@ -644,7 +644,7 @@ async function __compactNowBuiltinBody(ctx, agent, signal, sourceCommandId, opts
 async function __compactRegionBuiltinBody(ctx, start, end, agent, signal, sourceCommandId) {
   const session = agent.session
   if (session === undefined || typeof session.append !== 'function') return null
-  const settings = (await readSettings(ctx)) ?? DEFAULTS
+  const settings = (await readSettings(ctx, session)) ?? DEFAULTS
   if (!(settings.builtinEnabled !== false)) return null
   if (start > end) return null
   return runTransaction(ctx, agent, session, { start, end }, signal, settings, sourceCommandId)

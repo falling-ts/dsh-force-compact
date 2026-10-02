@@ -25,6 +25,51 @@ window.__ModuleLoader__.load({
     // `@deepseek-ai/dsh-client-store`；`@deepseek-ai/dsh-client-runtime` 不在共享模块表
     // 里，require 它会命中 client-modules 的 "missed the module table" 落空错误。
     const { createSnapshotStore } = require("@deepseek-ai/dsh-client-store");
+    // 弹层原语（PLATFORM_MODULES 内的静态基线包）：视口内定位 + 外部指针关闭。
+    // 弹层原语（基线平台模块）。与 resolveCommandIcon 同一防御姿态：模块表缺席
+    // （极简 composition）时降级为「固定贴底居中 + 无外部关闭」，chip 仍可点开保存。
+    const CHIP_PRIMITIVES = (() => {
+      try {
+        const ReactDOM = require("react-dom");
+        const primitives = require("@deepseek-ai/dsh-client-ui-primitives");
+        const portal = (ReactDOM === null || ReactDOM === undefined) ? undefined : ReactDOM.createPortal;
+        const anchor = (primitives === null || primitives === undefined) ? undefined : primitives.useAnchoredPosition;
+        const dismiss = (primitives === null || primitives === undefined) ? undefined : primitives.useDismissOnOutsidePointer;
+        return {
+          createPortal: typeof portal === "function" ? portal : null,
+          useAnchoredPosition: typeof anchor === "function" ? anchor : null,
+          useDismissOnOutsidePointer: typeof dismiss === "function" ? dismiss : null,
+        };
+      } catch (_moduleTableMiss) {
+        return { createPortal: null, useAnchoredPosition: null, useDismissOnOutsidePointer: null };
+      }
+    })();
+    /** 真原语在用时才做「先隐藏测量」；否则用固定贴底兜底样式。 */
+    const CHIP_ANCHORED = CHIP_PRIMITIVES.useAnchoredPosition !== null;
+    /** portal 缺席时就地渲染（面板本身是 position: fixed，观感一致）。 */
+    function createPortal(node, container) {
+      return CHIP_PRIMITIVES.createPortal === null ? node : CHIP_PRIMITIVES.createPortal(node, container);
+    }
+    /** 定位 hook：原语缺席时退化为「不测量、固定贴底」，hook 序列保持恒定。 */
+    function useChipAnchor(open, anchorRef, panelRef) {
+      if (!CHIP_ANCHORED) return null;
+      return CHIP_PRIMITIVES.useAnchoredPosition({ open: open, anchorRef: anchorRef, panelRef: panelRef, side: "top", gap: 8, margin: 12 });
+    }
+    /** 外部指针关闭：原语缺席时本组件自带 document 级兜底监听。 */
+    function useChipDismiss(rootRef, open, setOpen, panelRef) {
+      const available = CHIP_PRIMITIVES.useDismissOnOutsidePointer !== null;
+      if (available) CHIP_PRIMITIVES.useDismissOnOutsidePointer(rootRef, open, setOpen, panelRef);
+      React.useEffect(() => {
+        if (available || !open) return undefined;
+        const onDown = (e) => {
+          const root = rootRef.current;
+          if (root !== null && root !== undefined && typeof root.contains === "function" && root.contains(e.target)) return;
+          setOpen(false);
+        };
+        document.addEventListener("pointerdown", onDown, true);
+        return () => document.removeEventListener("pointerdown", onDown, true);
+      }, [open, available]);
+    }
 
     /** 该分区拥有的文案命名空间。 */
     const NS = "settings.forceCompact";
@@ -38,8 +83,8 @@ window.__ModuleLoader__.load({
       intro: "控制 force-compact 插件的压缩行为（强制压缩配置）。改动在 $DSH_HOME/settings.yaml 的 falling-ts-force-compact 段生效。",
       disableThinking: "压缩时关闭思考",
       disableThinkingHint: "为 true 时每次模型请求携带 reasoningEffort: off，关闭思考以节省 token。",
-      autoThresholdTokens: "自动压缩阈值（tokens）",
-      autoThresholdTokensHint: "会话总上下文 tokens ≥ 该值时，agent/pre-step 阈值门禁触发强制压缩。最小 32000；若填低于此值会自动重置为 32000。 支持 K/M 后缀（32K = 32000，1M = 1000000）。",
+      autoThresholdTokens: "自动压缩阈值（默认值，tokens）",
+      autoThresholdTokensHint: "会话总上下文 tokens ≥ 该值时，agent/pre-step 阈值门禁触发强制压缩。最小 32000；若填低于此值会自动重置为 32000。 支持 K/M 后缀（32K = 32000，1M = 1000000）。 这是全局默认值；单个会话可在输入框下方状态条右侧单独覆盖。",
       retainLatestTokens: "保留最新上下文（tokens）",
       retainLatestTokensHint: "自动/强制压缩时，从会话最新条目往前累加 token（按官方 tokenMeter 逐节点计数），直到 ≥ 该值停止；该截点之前的所有条目一次性发往大模型做摘要（原条目被遮蔽/跳过），保留的尾部逐字保留。默认 8000；最小 8000，若填低于此值会自动重置为 8000。 支持 K/M 后缀（32K = 32000，1M = 1000000）。",
       turnEndForceCompaction: "回合结束强制压缩",
@@ -85,6 +130,16 @@ window.__ModuleLoader__.load({
       badgeWorking16: "正在画饼给你吃",
       badgeWorking17: "正在偷渡灵感",
       badgeWorking18: "正在暗中观察",
+      thresholdChipAria: "本会话压缩阈值",
+      thresholdTitle: "本会话压缩阈值",
+      thresholdSessionLabel: "压缩阈值",
+      thresholdHint: "仅作用于当前会话；留空或点「使用全局默认」即回落到设置页的自动压缩阈值。支持 K/M 后缀（32K = 32000，1M = 1000000），最小 32000。",
+      thresholdSave: "保存",
+      thresholdInvalid: "无法解析：请输入纯数字或带 K/M 后缀的值（如 700000、700K、1M）。",
+      thresholdFailed: "保存失败，请重试。",
+      thresholdUseDefault: "使用全局默认",
+      thresholdOverridden: "已覆盖全局默认",
+      thresholdChipLabel: "强制压缩阈值",
       badgeWorking19: "马上就好(大概)",
     };
     const en = {
@@ -94,8 +149,8 @@ window.__ModuleLoader__.load({
       intro: "Control how the force-compact plugin compacts. Changes land under the falling-ts-force-compact section of $DSH_HOME/settings.yaml.",
       disableThinking: "Disable thinking during compaction",
       disableThinkingHint: "When true, every model request carries reasoningEffort: off to save tokens.",
-      autoThresholdTokens: "Auto-compaction threshold (tokens)",
-      autoThresholdTokensHint: "When the session's total context tokens ≥ this value, the agent/pre-step threshold gate force-compacts. Minimum 32000; values below are clamped back to 32000. K/M suffixes are accepted: 32K = 32000, 1M = 1000000.",
+      autoThresholdTokens: "Auto-compaction threshold (default, tokens)",
+      autoThresholdTokensHint: "When the session's total context tokens ≥ this value, the agent/pre-step threshold gate force-compacts. Minimum 32000; values below are clamped back to 32000. K/M suffixes are accepted: 32K = 32000, 1M = 1000000. This is the GLOBAL DEFAULT; one session can override it from the chip at the right edge of the stats strip under the composer.",
       retainLatestTokens: "Retain latest context (tokens)",
       retainLatestTokensHint: "When auto/forced compaction fires, walk backward from the LATEST surface entry accumulating per-node tokens (the official tokenMeter's prices) until the running sum REACHES OR EXCEEDS this budget; everything before that cutoff is sent to the summarizer in ONE batch (its entries become shadowed/skipped in derived history), and the retained tail stays VERBATIM. Default 8000; minimum 8000 — values below are clamped back to 8000. K/M suffixes are accepted: 32K = 32000, 1M = 1000000.",
       turnEndForceCompaction: "Force-compaction at turn end",
@@ -141,6 +196,16 @@ window.__ModuleLoader__.load({
       badgeWorking16: "Dangling a tasty promise",
       badgeWorking17: "Smuggling in inspiration",
       badgeWorking18: "Watching from the shadows",
+      thresholdChipAria: "Session compaction threshold",
+      thresholdTitle: "Session compaction threshold",
+      thresholdSessionLabel: "Compaction threshold",
+      thresholdHint: "Applies to THIS session only. Leave it blank or pick Use global default to fall back to the Auto-compaction threshold from Settings. K/M suffixes supported (32K = 32000, 1M = 1000000), minimum 32000.",
+      thresholdSave: "Save",
+      thresholdInvalid: "Unreadable value — enter a plain number or a K/M-suffixed one (700000, 700K, 1M).",
+      thresholdFailed: "Save failed, please retry.",
+      thresholdUseDefault: "Use global default",
+      thresholdOverridden: "Overrides the global default",
+      thresholdChipLabel: "Force-compact threshold",
       badgeWorking19: "Almost done (maybe)",
     };
     // ja / ko 由本插件作为**语言包**贡献（上游 @deepseek-ai/dsh-client-locale 只内置
@@ -153,8 +218,8 @@ window.__ModuleLoader__.load({
       intro: "force-compact プラグインの圧縮動作（強制圧縮設定）を制御します。変更は $DSH_HOME/settings.yaml の falling-ts-force-compact セクションに反映されます。",
       disableThinking: "圧縮時の思考を無効化",
       disableThinkingHint: "true のとき、このプラグイン自身の圧縮要約呼び出しに reasoningEffort: off を付与し、思考を無効化してトークンを節約します。通常の対話リクエストには影響しません（マシンの既定値のまま）。",
-      autoThresholdTokens: "自動圧縮のしきい値（トークン）",
-      autoThresholdTokensHint: "セッションの総コンテキストトークンがこの値以上になると、agent/pre-step のしきい値ゲートが強制圧縮を実行します。最小 32000。これ未満の値は 32000 に戻されます。 K/M 接尾辞にも対応：32K = 32000、1M = 1000000。",
+      autoThresholdTokens: "自動圧縮のしきい値（既定値、トークン）",
+      autoThresholdTokensHint: "セッションの総コンテキストトークンがこの値以上になると、agent/pre-step のしきい値ゲートが強制圧縮を実行します。最小 32000。これ未満の値は 32000 に戻されます。 K/M 接尾辞にも対応：32K = 32000、1M = 1000000。 これは全体の既定値です。セッション単位の上書きは入力欄の下の状態行の右端から行えます。",
       retainLatestTokens: "最新コンテキストの保持量（トークン）",
       retainLatestTokensHint: "自動／強制圧縮のとき、セッションの最新エントリから公式 tokenMeter のノード単位カウントでトークンを遡って加算し、この値に達した時点で停止します。その境界より前のエントリはまとめて要約 LLM に送られ（元のエントリは遮蔽／スキップされます）、保持された末尾はそのまま残ります。既定 8000、最小 8000。これ未満の値は 8000 に戻されます。 K/M 接尾辞にも対応：32K = 32000、1M = 1000000。",
       turnEndForceCompaction: "ターン終了時の強制圧縮",
@@ -200,6 +265,16 @@ window.__ModuleLoader__.load({
       badgeWorking16: "絵に描いた餅を焼いています",
       badgeWorking17: "ひらめきを密輸中",
       badgeWorking18: "影から様子をうかがっています",
+      thresholdChipAria: "このセッションの圧縮しきい値",
+      thresholdTitle: "このセッションの圧縮しきい値",
+      thresholdSessionLabel: "圧縮しきい値",
+      thresholdHint: "このセッションにのみ適用されます。空欄にするか「グローバル既定を使用」を選ぶと、設定ページの自動圧縮しきい値に戻ります。K/M 接尾辞に対応（32K = 32000、1M = 1000000）、最小 32000。",
+      thresholdSave: "保存",
+      thresholdInvalid: "解釈できません。数値または K/M 接尾辞付きの値（700000、700K、1M）を入力してください。",
+      thresholdFailed: "保存に失敗しました。もう一度お試しください。",
+      thresholdUseDefault: "グローバル既定を使用",
+      thresholdOverridden: "グローバル既定を上書き中",
+      thresholdChipLabel: "強制圧縮しきいち",
       badgeWorking19: "もうすぐです(たぶん)",
     };
     const ko = {
@@ -209,8 +284,8 @@ window.__ModuleLoader__.load({
       intro: "force-compact 플러그인의 압축 동작(강제 압축 설정)을 제어합니다. 변경 사항은 $DSH_HOME/settings.yaml의 falling-ts-force-compact 섹션에 반영됩니다.",
       disableThinking: "압축 시 사고 비활성화",
       disableThinkingHint: "true이면 이 플러그인 자체의 압축 요약 호출에 reasoningEffort: off를 실어 사고를 끄고 토큰을 절약합니다. 일반 대화 요청에는 영향을 주지 않습니다(머신 기본값 유지).",
-      autoThresholdTokens: "자동 압축 임계값(토큰)",
-      autoThresholdTokensHint: "세션의 총 컨텍스트 토큰이 이 값 이상이면 agent/pre-step 임계값 게이트가 강제 압축을 실행합니다. 최소 32000이며 이보다 낮은 값은 32000으로 되돌립니다. K/M 접미사도 지원합니다: 32K = 32000, 1M = 1000000.",
+      autoThresholdTokens: "자동 압축 임계값(기본값, 토큰)",
+      autoThresholdTokensHint: "세션의 총 컨텍스트 토큰이 이 값 이상이면 agent/pre-step 임계값 게이트가 강제 압축을 실행합니다. 최소 32000이며 이보다 낮은 값은 32000으로 되돌립니다. K/M 접미사도 지원합니다: 32K = 32000, 1M = 1000000. 이 값은 전역 기본값이며 개별 세션은 입력창 아래 상태 표시줄 오른쪽 칩에서 재정의할 수 있습니다.",
       retainLatestTokens: "최신 컨텍스트 유지량(토큰)",
       retainLatestTokensHint: "자동/강제 압축 시 세션의 최신 항목부터 공식 tokenMeter의 노드별 계산으로 토큰을 역산해 더하다가 이 값에 도달하면 멈춥니다. 그 경계 이전의 모든 항목은 한 번에 요약 LLM으로 보내지고(원본 항목은 가려지거나 건너뜀) 유지된 꼬리는 그대로 남습니다. 기본 8000, 최소 8000이며 이보다 낮은 값은 8000으로 되돌립니다. K/M 접미사도 지원합니다: 32K = 32000, 1M = 1000000.",
       turnEndForceCompaction: "턴 종료 시 강제 압축",
@@ -256,6 +331,16 @@ window.__ModuleLoader__.load({
       badgeWorking16: "그림의 떡을 구워주는 중",
       badgeWorking17: "영감을 밀수 중",
       badgeWorking18: "그림자에서 지켜보는 중",
+      thresholdChipAria: "이 세션 압축 임계값",
+      thresholdTitle: "이 세션 압축 임계값",
+      thresholdSessionLabel: "압축 임계값",
+      thresholdHint: "이 세션에만 적용됩니다. 비워 두거나 전역 기본값 사용을 누르면 설정 페이지의 자동 압축 임계값으로 돌아갑니다. K/M 접미사 지원(32K = 32000, 1M = 1000000), 최소 32000.",
+      thresholdSave: "저장",
+      thresholdInvalid: "해석할 수 없습니다. 숫자 또는 K/M 접미사 값(700000, 700K, 1M)을 입력하세요.",
+      thresholdFailed: "저장에 실패했습니다. 다시 시도하세요.",
+      thresholdUseDefault: "전역 기본값 사용",
+      thresholdOverridden: "전역 기본값 재정의",
+      thresholdChipLabel: "강제 압축 임계값",
       badgeWorking19: "거의 다 됐습니다(아마도)",
     };
 
@@ -1489,6 +1574,353 @@ window.__ModuleLoader__.load({
       }, "force-compact: settings nav icon");
     }
 
+
+    // ══════════ 会话级压缩阈值 chip（插槽 conversation.composer.dock）══════════
+    // 全局 autoThresholdTokens 仍是默认值；每个会话可在输入框下方状态条右侧
+    // 单独覆盖。宿主解析见 src/core/settings.js（sessionThresholds 映射 +
+    // readSettings(ctx, session)）；这里只负责展示与写回。
+    /** 宿主 settings 命名空间中存放会话覆盖的字段名（与 settings.js 对齐）。 */
+    const SESSION_THRESHOLD_FIELD = "sessionThresholds";
+    /** 与宿主 MIN_TOKEN_SCALES.autoThresholdTokens 同源的硬下界。 */
+    const THRESHOLD_FLOOR = 32000;
+
+    /** 紧凑 token 尺度文案：32000→32K，1000000→1M，其余原样。 */
+    function formatTokenScale(tokens) {
+      if (typeof tokens !== "number" || !Number.isFinite(tokens) || tokens <= 0) return "—";
+      const n = Math.trunc(tokens);
+      if (n % 1000000 === 0) return String(n / 1000000) + "M";
+      if (n % 1000 === 0) return String(n / 1000) + "K";
+      return String(n);
+    }
+
+    /** 本会话的覆盖值；未设置/不可解析 → undefined（＝用全局默认）。 */
+    function sessionOverrideOf(value, sessionId) {
+      if (typeof sessionId !== "string" || sessionId.length === 0) return undefined;
+      const map = (value !== null && typeof value === "object") ? value[SESSION_THRESHOLD_FIELD] : undefined;
+      if (map === null || map === undefined || typeof map !== "object" || Array.isArray(map)) return undefined;
+      const raw = map[sessionId];
+      return (typeof raw === "number" && Number.isFinite(raw) && raw > 0) ? Math.trunc(raw) : undefined;
+    }
+
+    /** 全局默认阈值；未写入/不可解析 → floor。 */
+    function defaultThresholdOf(value) {
+      const raw = (value !== null && typeof value === "object") ? value.autoThresholdTokens : undefined;
+      return (typeof raw === "number" && Number.isFinite(raw) && raw > 0) ? Math.trunc(raw) : THRESHOLD_FLOOR;
+    }
+
+
+
+    /** 稳定兜底：props 上没有 useProjection 时保持 hook 调用序恒定。 */
+    function noProjection() { return undefined; }
+
+    /** 上游 ContextMeter 的环几何（14px viewBox、r=5.5），与它逐像素对齐。 */
+    const RING_VIEW = 14;
+    const RING_RADIUS = 5.5;
+    /** 阈值标记的红色，与插件里报错文案同色。 */
+    const MARKER_COLOR = "#e5484d";
+
+    /**
+     * 会话阈值在上下文占用上的两处标记：
+     *   1. 底部圆环上，按 threshold / contextWindow 的角度画一个红点；
+     *   2. 展开面板横条上，按同一比例画一条红色竖线（高度严格等于横条）。
+     * 只有阈值严格小于上下文窗口（ratio < 1）才画——阈值 >= 窗口意味着占用永远
+     * 够不到它、压缩不会由占用触发，此时按需求不做任何处理。
+     * 圆环与面板都归 ui-conversation 所有，插件不能往 React 树里塞节点，所以这里
+     * 用几何对齐的 DOM overlay，并在 MutationObserver 里跟着面板开合重算。
+     */
+    function useThresholdMarkers(props, threshold) {
+      const up = (typeof props.useProjection === "function") ? props.useProjection : noProjection;
+      const sessionId = props.sessionId;
+      const pressure = up("contextPressure");
+      const capacity = (pressure !== null && pressure !== undefined
+        && typeof pressure.contextWindow === "number" && Number.isFinite(pressure.contextWindow)
+        && pressure.contextWindow > 0) ? pressure.contextWindow : undefined;
+      const ratio = (capacity === undefined || !Number.isFinite(threshold) || threshold <= 0)
+        ? undefined : threshold / capacity;
+
+      React.useEffect(() => {
+        if (ratio === undefined || ratio >= 1) return undefined;
+        let writing = false;
+        let markerParent = null;
+        let markerPosition = null;
+
+        /** 从本会话 chip 反查状态条，再从中取出上下文圆环的根与 svg。 */
+        const meterParts = () => {
+          const chip = document.querySelector("[data-fc-threshold-chip]");
+          if (chip === null) return null;
+          const wrap = chip.parentElement;
+          const dock = wrap === null ? null : wrap.parentElement;
+          if (dock === null) return null;
+          const root = [...dock.children].find((c) => c !== wrap);
+          if (!root) return null;
+          const svg = root.querySelector("svg");
+          if (svg === null) return null;
+          return { root: root, svg: svg };
+        };
+        /** 找到或就地创建 marker 节点（绝对定位、不吃指针事件）。 */
+        const ensureMarker = (parent, attr) => {
+          let el = parent.querySelector("[" + attr + "]");
+          if (el === null) {
+            el = document.createElement("span");
+            el.setAttribute(attr, "");
+            el.style.position = "absolute";
+            el.style.pointerEvents = "none";
+            el.style.background = MARKER_COLOR;
+            el.style.borderRadius = "1px";
+            el.style.zIndex = "1";
+            parent.appendChild(el);
+          }
+          return el;
+        };
+        const drop = (attr) => {
+          for (const el of document.querySelectorAll("[" + attr + "]")) el.remove();
+        };
+
+        const sync = () => {
+          writing = true;
+          try {
+            const parts = meterParts();
+            if (parts === null) { drop("data-fc-ring-marker"); drop("data-fc-bar-marker"); return; }
+            const mr = parts.root.getBoundingClientRect();
+            const sr = parts.svg.getBoundingClientRect();
+            if (mr.width === 0 || sr.width === 0) return;
+            const sx = sr.width / RING_VIEW;
+            const sy = sr.height / RING_VIEW;
+            // 与上游 strokeDasharray 同向：从 12 点起顺时针。
+            const theta = ratio * 2 * Math.PI;
+            const cx = (sr.left - mr.left) + (RING_VIEW / 2 + RING_RADIUS * Math.sin(theta)) * sx;
+            const cy = (sr.top - mr.top) + (RING_VIEW / 2 - RING_RADIUS * Math.cos(theta)) * sy;
+            const dot = Math.max(2.5, 3 * sx);
+            if (markerParent === null) {
+              markerParent = parts.root;
+              markerPosition = markerParent.style.position;
+              if (getComputedStyle(markerParent).position === "static") markerParent.style.position = "relative";
+            }
+            const ringMark = ensureMarker(markerParent, "data-fc-ring-marker");
+            ringMark.style.width = dot + "px";
+            ringMark.style.height = dot + "px";
+            ringMark.style.borderRadius = "50%";
+            ringMark.style.left = (cx - dot / 2) + "px";
+            ringMark.style.top = (cy - dot / 2) + "px";
+            // 展开面板横条：只有圆环按钮处于展开态时才存在。
+            const btn = parts.root.querySelector("button[aria-expanded=\"true\"]");
+            const panel = btn === null ? null : [...document.querySelectorAll("[role=\"dialog\"]")]
+              .find((el) => !el.hasAttribute("data-fc-threshold-panel"));
+            if (panel === undefined || panel === null) { drop("data-fc-bar-marker"); return; }
+            const bar = [...panel.children].find((c) => {
+              if (c.tagName !== "DIV") return false;
+              const r = c.getBoundingClientRect();
+              return r.height > 0 && r.height <= 8 && r.width > 20;
+            });
+            if (bar === undefined) { drop("data-fc-bar-marker"); return; }
+            const pr = panel.getBoundingClientRect();
+            const br = bar.getBoundingClientRect();
+            if (br.width === 0) { drop("data-fc-bar-marker"); return; }
+            const barMark = ensureMarker(panel, "data-fc-bar-marker");
+            barMark.style.width = "2px";
+            barMark.style.borderRadius = "1px";
+            barMark.style.height = br.height + "px";
+            barMark.style.left = (br.left - pr.left + br.width * ratio - 1) + "px";
+            barMark.style.top = (br.top - pr.top) + "px";
+          } finally { writing = false; }
+        };
+
+        const observer = new MutationObserver(() => { if (!writing) sync(); });
+        observer.observe(document.body, { childList: true, subtree: true });
+        const onResize = () => { if (!writing) sync(); };
+        window.addEventListener("resize", onResize);
+        sync();
+        return () => {
+          observer.disconnect();
+          window.removeEventListener("resize", onResize);
+          drop("data-fc-ring-marker");
+          drop("data-fc-bar-marker");
+          if (markerParent !== null && markerPosition !== null) markerParent.style.position = markerPosition;
+        };
+      }, [ratio, sessionId]);
+    }
+
+    /**
+     * 输入框下方状态条最右侧的会话阈值 chip：图标 + 固定文案，点击弹出输入框与
+     * 保存按钮。有效值 = 本会话覆盖值，缺席时回落到全局默认。
+     */
+    function CompressThresholdChip(props) {
+      const { sessionId, useForceCompact, t, saveSessionThreshold, clearSessionThreshold } = props;
+      const snap = useForceCompact((s) => s);
+      const value = (snap !== null && snap !== undefined && typeof snap.value === "object") ? snap.value : undefined;
+      const override = sessionOverrideOf(value, sessionId);
+      const fallback = defaultThresholdOf(value);
+      const effective = override === undefined ? fallback : override;
+      useThresholdMarkers(props, effective);
+
+      const [open, setOpen] = React.useState(false);
+      const [buf, setBuf] = React.useState("");
+      const [error, setError] = React.useState(null);
+      const [busy, setBusy] = React.useState(false);
+      const rootRef = React.useRef(null);
+      const panelRef = React.useRef(null);
+
+      const pos = useChipAnchor(open, rootRef, panelRef);
+      useChipDismiss(rootRef, open, setOpen, panelRef);
+      React.useEffect(() => {
+        if (!open) return undefined;
+        const onKey = (e) => { if (e.key === "Escape") setOpen(false); };
+        document.addEventListener("keydown", onKey);
+        return () => document.removeEventListener("keydown", onKey);
+      }, [open]);
+      // 打开瞬间用当前有效值重置草稿；编辑过程中不接受外部回灌。
+      React.useEffect(() => {
+        if (!open) return;
+        setBuf(formatTokenScale(effective));
+        setError(null);
+      }, [open]);
+
+      const settle = (promise, onOk) => {
+        setBusy(true);
+        Promise.resolve(promise).then((ok) => {
+          setBusy(false);
+          if (ok === true) { onOk(); setOpen(false); } else { setError(t("thresholdFailed")); }
+        }, () => { setBusy(false); setError(t("thresholdFailed")); });
+      };
+      const commit = () => {
+        const parsed = parseTokenScaleText(String(buf).trim(), undefined);
+        if (typeof parsed !== "number" || !Number.isFinite(parsed) || parsed <= 0) {
+          setError(t("thresholdInvalid"));
+          return;
+        }
+        const next = parsed < THRESHOLD_FLOOR ? THRESHOLD_FLOOR : Math.trunc(parsed);
+        setError(null);
+        settle(saveSessionThreshold(sessionId, next), () => {});
+      };
+      const useDefault = () => { setError(null); settle(clearSessionThreshold(sessionId), () => {}); };
+
+      const mark = h("svg", {
+        viewBox: "0 0 16 16", width: 14, height: 14, "aria-hidden": "true",
+        focusable: "false", fill: "currentColor", style: { flex: "none" },
+        dangerouslySetInnerHTML: { __html: NAV_MARK_PATH },
+      });
+      const label = formatTokenScale(effective);
+      const pillStyle = Object.assign({}, chipPillStyle,
+        open ? chipPillHoverStyle : null,
+        override === undefined ? null : { color: "var(--dsw-alias-label-secondary)" });
+
+      if (typeof sessionId !== "string" || sessionId.length === 0) return null;
+      const titleAttr = override === undefined
+        ? t("thresholdChipAria")
+        : t("thresholdChipAria") + " · " + t("thresholdOverridden");
+      return h("span", {
+        ref: rootRef, style: chipRootStyle,
+        "data-fc-threshold-chip": "", "data-fc-threshold-session": sessionId,
+      },
+        h("button", {
+          type: "button",
+          style: pillStyle,
+          "aria-haspopup": "dialog",
+          "aria-expanded": open,
+          "aria-label": t("thresholdChipAria") + ": " + label,
+          title: titleAttr,
+          onClick: () => { setError(null); setOpen(!open); },
+        // The pill shows a FIXED caption: the effective value lives in the
+        // tooltip, the aria-label and the panel, so the row reads the same in
+        // every session and the number never shifts the layout.
+        }, mark, h("span", { style: { minWidth: 0, overflow: "hidden", textOverflow: "ellipsis" } }, t("thresholdChipLabel"))),
+        open ? createPortal(
+          h("div", {
+            ref: panelRef, role: "dialog", "data-fc-threshold-panel": "", "aria-label": t("thresholdTitle"),
+            style: Object.assign({}, chipPanelStyle,
+              (pos !== null && pos !== undefined) ? pos : (CHIP_ANCHORED ? chipMeasureStyle : chipFallbackPosStyle)),
+          },
+            h("div", { style: chipTitleStyle },
+              h("span", { style: chipTitleLabelStyle }, mark, t("thresholdTitle")),
+              h("span", { style: { fontVariantNumeric: "tabular-nums" } }, label)),
+            h("div", { style: chipRuleStyle, "aria-hidden": "true" }),
+            h("div", { style: { marginBottom: 6, color: "var(--dsw-alias-label-tertiary)" } },
+              override === undefined
+                ? t("thresholdSessionLabel")
+                : t("thresholdSessionLabel") + " · " + t("thresholdOverridden")),
+            h("div", { style: chipRowStyle },
+              h("input", {
+                type: "text", value: buf, autoFocus: true, spellCheck: false, autoComplete: "off",
+                "aria-label": t("thresholdSessionLabel"),
+                placeholder: t("tokenScalePlaceholder"),
+                style: chipInputStyle, disabled: busy,
+                onChange: (e) => { setBuf(e.target.value); setError(null); },
+                onKeyDown: (e) => { if (e.key === "Enter") { e.preventDefault(); commit(); } },
+              }),
+              h("button", {
+                type: "button",
+                style: busy ? Object.assign({}, chipSaveStyle, chipSaveDisabledStyle) : chipSaveStyle,
+                disabled: busy, onClick: commit,
+              }, t("thresholdSave"))),
+            h("div", { style: { marginTop: 8, color: error === null ? "var(--dsw-alias-label-tertiary)" : "#e5484d" } },
+              error === null ? t("thresholdHint") : error),
+            override === undefined ? null : h("div", { style: { marginTop: 8 } },
+              h("button", { type: "button", style: chipLinkStyle, disabled: busy, onClick: useDefault },
+                t("thresholdUseDefault") + " · " + formatTokenScale(fallback)))),
+          document.body) : null);
+    }
+
+
+    /** chip 几何与皮肤：与 ui-chat 的 StatsPills / stat-dialog 同一套 token。 */
+    // `ui-conversation` renders the dock as [slot wrapper (display: contents),
+    // ContextMeter]; `order: 1` therefore parks this chip to the RIGHT of the
+    // meter (the context-usage percentage) instead of left of it.
+    const chipRootStyle = {
+      display: "inline-flex", alignItems: "center", minWidth: 0, order: 1,
+      fontSize: "calc(var(--dsh-content-font-size-secondary, 13px) - 1px)",
+      lineHeight: "calc(20px + var(--dsh-content-font-delta-secondary, 0px))",
+    };
+    const chipPillStyle = {
+      display: "inline-flex", alignItems: "center", gap: 6, boxSizing: "border-box",
+      maxWidth: "100%", padding: "1px 8px", border: "none", borderRadius: 999,
+      background: "transparent", color: "var(--dsw-alias-label-tertiary)",
+      font: "inherit", fontVariantNumeric: "tabular-nums", lineHeight: "inherit",
+      whiteSpace: "nowrap", cursor: "pointer",
+    };
+    const chipPillHoverStyle = {
+      background: "var(--dsw-alias-interactive-bg-hover)",
+      color: "var(--dsw-alias-label-secondary)",
+    };
+    const chipPanelStyle = {
+      position: "fixed", zIndex: 1100, boxSizing: "border-box",
+      width: "max-content",
+      minWidth: "min(300px, calc(100vw - 24px))",
+      maxWidth: "min(400px, calc(100vw - 24px))",
+      padding: 16, border: 0, borderRadius: "var(--dsw-radius-lg)",
+      background: "var(--dsw-specific-menu)",
+      backdropFilter: "var(--dsw-menu-backdrop-filter)",
+      boxShadow: "var(--dsw-elevation-prominent)",
+      fontSize: 12, lineHeight: "18px",
+      color: "var(--dsw-alias-label-secondary)", cursor: "default",
+    };
+    const chipMeasureStyle = { visibility: "hidden", left: 0, top: 0 };
+    const chipTitleStyle = {
+      display: "flex", justifyContent: "space-between", gap: 16, marginBottom: 8,
+      color: "var(--dsw-alias-label-primary)", fontWeight: 500,
+    };
+    const chipTitleLabelStyle = { display: "inline-flex", alignItems: "center", gap: 6, minWidth: 0 };
+    const chipRuleStyle = { marginBottom: 10, borderTop: "0.5px solid var(--dsw-alias-border-l2)" };
+    const chipRowStyle = { display: "flex", alignItems: "center", gap: 8 };
+    const chipInputStyle = {
+      flex: "1 1 auto", minWidth: 0, width: 120, textAlign: "right",
+      padding: "5px 10px", boxSizing: "border-box", borderRadius: 6,
+      border: "1px solid var(--dsw-alias-border-l1)",
+      backgroundColor: "transparent", outline: "none",
+      font: "inherit", fontVariantNumeric: "tabular-nums",
+      color: "var(--dsw-alias-label-primary)",
+    };
+    const chipSaveStyle = {
+      flex: "none", padding: "5px 12px", border: "none", borderRadius: 6,
+      background: brandGrad, color: "#fff", font: "inherit", fontWeight: 500,
+      cursor: "pointer", whiteSpace: "nowrap",
+    };
+    const chipSaveDisabledStyle = { opacity: 0.55, cursor: "default" };
+    const chipLinkStyle = {
+      padding: "2px 0", border: "none", background: "transparent",
+      color: "var(--dsw-alias-label-tertiary)", font: "inherit",
+      cursor: "pointer", textDecoration: "underline",
+    };
+
     function apply(ctx) {
       // zh 是键集事实源，en/ja/ko 必须与之逐键对齐（缺键时查找链回落到 en）。
       // 语言目录项与字典分开登记：addLanguage 可能因兄弟插件已注册同一 id 而让位
@@ -1561,6 +1993,14 @@ window.__ModuleLoader__.load({
       // 调用 unsub() 并把它的 void 返回值当第二个 effect 收集——既提前解绑了本次
       // 订阅，又不登记任何清理项，属错误用法。
       ctx.effect(() => unsub, "force-compact: scope subscription");
+      // ── 会话级阈值覆盖的写回口 ───────────────────────────────────────
+      // 用 mutate + 嵌套路径，避开「读整个 map 再整体写回」的竞态：宿主每一轮
+      // 请求都会写同一命名空间的 liveUi，并发写随时可能发生。清空 = unset 该
+      // 路径，键彻底消失，宿主随即回落到全局默认（见 src/core/settings.js）。
+      const saveSessionThreshold = (sessionId, tokens) =>
+        scope.mutate([{ op: "set", path: [SESSION_THRESHOLD_FIELD, sessionId], value: tokens }]);
+      const clearSessionThreshold = (sessionId) =>
+        scope.mutate([{ op: "unset", path: [SESSION_THRESHOLD_FIELD, sessionId] }]);
       const injected = () => ({
         hooks: { forceCompact: store },
         t: t,
@@ -1573,6 +2013,20 @@ window.__ModuleLoader__.load({
         label: () => t("nav"),
         inject: injected,
       }, ForceCompactSection));
+      // 会话级压缩阈值 chip：挂在输入框下方状态条插槽。order 100 排在 ui-chat
+      // StatsPills（order 0）之后，即该行可见项的右端。session 作用域保证组件
+      // 拿到当前 sessionId；当前值经 configForms 快照读，写回走上面的原子路径。
+      ctx.slots.inject("conversation.composer.dock", () => ctx.slots.register({
+        name: "conversation.composer.dock",
+        id: "force-compact-threshold",
+        order: 100,
+        inject: () => ({
+          hooks: { forceCompact: store },
+          t: t,
+          saveSessionThreshold: saveSessionThreshold,
+          clearSessionThreshold: clearSessionThreshold,
+        }),
+      }, CompressThresholdChip));
     }
 
     exports.apply = apply;

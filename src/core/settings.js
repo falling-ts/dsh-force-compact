@@ -240,6 +240,9 @@ export const DEFAULTS = Object.freeze({
  * @returns {Promise<{
  *   disableThinking: boolean,
  *   autoThresholdTokens: number,
+ *   autoThresholdTokensDefault: number,
+ *   sessionThresholdTokens: number|undefined,
+ *   sessionThresholds: Record<string, number>,
  *   retainLatestTokens: number,
  *   turnEndForceCompactionEnabled: boolean,
  *   debug: boolean,
@@ -252,13 +255,13 @@ export const DEFAULTS = Object.freeze({
  *   the resolved settings, or `null` when the `settings` service is not mounted
  *   (callers should fall back to their composition entry).
  */
-export async function readSettings(ctx) {
+export async function readSettings(ctx, session) {
   // SAFETY ENVELOPE: every model request and compaction path reads settings —
   // a throw escaping here would take down the model-request seam. Wrap the whole
   // read so ANY anomaly (a rejecting `settings.get`, a non-object stored value)
   // degrades to `null` (= "use the caller's composition defaults"), never throw.
   try {
-    return await __readSettingsBody(ctx)
+    return await __readSettingsBody(ctx, session)
   } catch (error) {
     const logger = (typeof ctx?.logger?.warn === 'function') ? ctx.logger.warn.bind(ctx.logger) : () => {}
     logger(`[force-compact] readSettings degraded to defaults — ${error instanceof Error ? error.message : String(error)}`)
@@ -266,7 +269,7 @@ export async function readSettings(ctx) {
   }
 }
 
-async function __readSettingsBody(ctx) {
+async function __readSettingsBody(ctx, session) {
   void ctx
   // Harness 0.1.7 removed `settings.get(ns)`: the live values now come from the
   // plugin's own Config refs (bound by `apply`). Build the raw section from those
@@ -322,9 +325,20 @@ async function __readSettingsBody(ctx) {
     : DEFAULTS.builtinEnabled)
   const maxSummaryTokens = asScaled('maxSummaryTokens', MIN_TOKEN_SCALES.maxSummaryTokens)
   const summarizationTimeoutMs = asTimeoutMs('summarizationTimeoutMs')
+  // Session-scoped threshold override (the composer-dock chip writes
+  // `sessionThresholds` through the client's configForms mirror). The GLOBAL
+  // `autoThresholdTokens` stays the default; a session entry that is present and
+  // resolvable REPLACES it for that one session, so every existing gate keeps
+  // comparing against `settings.autoThresholdTokens` and needs no other change.
+  const autoThresholdTokensDefault = autoThresholdTokens
+  const sessionThresholds = asSessionThresholds(section.sessionThresholds)
+  const sessionThresholdTokens = resolveSessionThreshold(sessionThresholds, session)
   return {
     disableThinking,
-    autoThresholdTokens,
+    autoThresholdTokens: sessionThresholdTokens === undefined ? autoThresholdTokensDefault : sessionThresholdTokens,
+    autoThresholdTokensDefault,
+    sessionThresholdTokens,
+    sessionThresholds,
     retainLatestTokens,
     turnEndForceCompactionEnabled,
     debug,
@@ -334,6 +348,43 @@ async function __readSettingsBody(ctx) {
     maxSummaryTokens,
     summarizationTimeoutMs,
   }
+}
+
+/**
+ * Normalize the raw `sessionThresholds` map (session id -> token budget) at the
+ * durable boundary: non-objects degrade to an EMPTY map, per-entry values run
+ * through the SHARED token-scale parser, and unparseable/non-positive entries are
+ * DROPPED rather than defaulted — a corrupt entry must fall back to the global
+ * default, never to a wrong-but-plausible number.
+ *
+ * @param {unknown} raw the stored field (any JSON shape).
+ * @returns {Record<string, number>} session id -> token budget, floors applied.
+ */
+function asSessionThresholds(raw) {
+  const out = {}
+  if (raw === null || raw === undefined || typeof raw !== 'object' || Array.isArray(raw)) return out
+  for (const key of Object.keys(raw)) {
+    if (typeof key !== 'string' || key.length === 0) continue
+    const parsed = parseTokenScale(raw[key], undefined)
+    if (!Number.isFinite(parsed) || parsed <= 0) continue
+    out[key] = parsed < MIN_TOKEN_SCALES.autoThresholdTokens ? MIN_TOKEN_SCALES.autoThresholdTokens : parsed
+  }
+  return out
+}
+
+/**
+ * Resolve one session's threshold override.
+ * @param {Record<string, number>} sessionThresholds normalized override map.
+ * @param {object|undefined} session the live session handle (read for `id`).
+ * @returns {number|undefined} the override, or undefined to use the global default.
+ */
+export function resolveSessionThreshold(sessionThresholds, session) {
+  if (sessionThresholds === undefined || sessionThresholds === null) return undefined
+  if (session === undefined || session === null) return undefined
+  const id = session.id
+  if (typeof id !== 'string' || id.length === 0) return undefined
+  const value = sessionThresholds[id]
+  return (Number.isFinite(value) && value > 0) ? value : undefined
 }
 
 /**
@@ -527,6 +578,12 @@ export async function buildConfigSchema() {
       // exposes object/any/string/number/boolean/array only. Absence-by-default
       // is inherent (no .default); readSettings ignores it.
       liveUi: asVolatile(z.any()),
+      // SESSION-SCOPED auto-compaction threshold overrides: { <session id>: tokens }.
+      // Written by the CLIENT half (composer-dock chip via configForms.set); the host
+      // only reads it in `readSettings`, where a present entry replaces the global
+      // `autoThresholdTokens` for that session. Same z.any()/volatile treatment as
+      // `liveUi`: the shape is validated at read time, not by the schema.
+      sessionThresholds: asVolatile(z.any()),
       // Hard wall-clock cap for ONE summarization stream (ms). Floored/ceiled at
       // read time by `MIN_TIMEOUT_MS` / `MAX_TIMEOUT_MS` (the schema is
       // descriptive here; those bounds are behavioral).
