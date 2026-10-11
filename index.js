@@ -55,7 +55,7 @@ import { forceCompactIfNeeded, thinkingDisabled, clearStuckCompressingBanner } f
 void thinkingDisabled
 import { registerCommand } from './src/hooks/command.js'
 import { handleAgentStatus } from './src/hooks/idle.js'
-import { registerLlmStreamHook } from './src/hooks/wire-rewrite.js'
+import { publishRequesting, publishResponding, publishTooling } from './src/core/ui-signal.js'
 import { guardFn, installCrashNet } from './src/core/crashnet.js'
 
 /** @type {string} the function plugin's display name. */
@@ -271,14 +271,11 @@ const __applyInner = (ctx, config) => {
   // EVERY guarded listener invokes `maybeRegisterCommand()` as its first
   // action; the first successful attempt settles the latch permanently.
 
-  // The llm/stream wire-rewrite hook (appends `reasoning_effort:"none"` for
-  // OpenAI-compatible targets like :8080 llama.cpp when `disableThinking` is
-  // on). Registered lazily via `maybeInstallWireRewrite` from each guarded
-  // listener below — same defer pattern as the command registration. The
-  // hook lives at `src/hooks/wire-rewrite.js`.
-  const maybeInstallWireRewrite = () => {
-    registerLlmStreamHook(ctx)
-  }
+  // The llm/stream LiveUI watermark hook that used to live here
+  // (`src/hooks/wire-rewrite.js`) is RETIRED: the "fresh random working pair per
+  // LLM call" watermark is superseded by the three explicit agent-action phases
+  // published from the `agent/request` / `agent/assistant-stream` /
+  // `tools/pre-execute` seams registered below.
 
   // Hook the core model request: a DELIBERATE PASS-THROUGH (2026-08 semantics
   // revision) — business model requests carry the machine's own reasoning
@@ -294,19 +291,59 @@ const __applyInner = (ctx, config) => {
     try {
       maybeInstallDebugSink()
       maybeRegisterCommand()
-      maybeInstallWireRewrite()
+      // LIVE UI SIGNAL — "模型请求中": the agent has issued a model request and
+      // is waiting for the model's first token (published as "模型响应中" by the
+      // `agent/assistant-stream` listener below). FIRE-AND-FORGET: a settings
+      // write must never sit on the request's critical path, and the publisher
+      // swallows its own rejections. Note this seam is traversed ONLY by the
+      // agent loop's own business requests — the plugin's compaction
+      // summarization call goes straight to `ctx.llm.stream` — so a
+      // compaction-time request can never publish this phase. It IS traversed
+      // once per RETRY attempt, which is correct: each attempt is a fresh wait.
+      void publishRequesting(ctx)
       // NOTE (2026-09): the former CONVERSATION-START Live-UI forced override
       // (publishWorkingOnStart, a fresh random working pair per conversation
       // start) is REMOVED. The badge is now cleared at conversation END
-      // instead: hooks/idle.js publishes an empty `""` text (isImportant=true)
-      // on every idle transition (ui-signal `publishEnd`), wiping stale
-      // bracket-form residue and any lingering working pair in one push.
+      // instead: hooks/idle.js publishes an empty `""` text on every idle
+      // transition (ui-signal `publishEnd`), wiping stale bracket-form residue
+      // and any lingering phase in one push.
       return await __agentRequestListenerBody(ctx, payload, next)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       ctx.logger.warn(`[force-compact] agent/request listener degraded — forwarding config unchanged (swallowed: ${message})`)
       try { return await next() } catch { return undefined }
     }
+  }))
+
+  // LIVE UI SIGNAL — "模型响应中": the model's FIRST token has arrived, and the
+  // phase lasts until the response ends (the next agent action then overwrites
+  // it). Fired on the `chunk` frame with `index === 0` — the first chunk of that
+  // attempt. The attempt's `start` frame deliberately does NOT fire it: the
+  // attempt opens before any token has arrived, which is still
+  // `publishRequesting`'s span. These frames are emitted ONLY by the agent
+  // loop's live attempt, so a compaction summarization stream (which the
+  // summarizer consumes directly from `ctx.llm.stream`) never produces one.
+  guard('agent/assistant-stream listener', () => ctx.on('agent/assistant-stream', ({ frame } = {}) => {
+    try {
+      if (frame === null || typeof frame !== 'object') return
+      if (frame.type !== 'chunk' || frame.index !== 0) return
+      // FIRE-AND-FORGET: chunk dispatch is on the live streaming path — a
+      // settings write must never delay a token, and the publisher never throws.
+      void publishResponding(ctx)
+    } catch { /* a status hint must never disturb the stream */ }
+  }))
+
+  // LIVE UI SIGNAL — "工具执行中": a non-model, agent-internal operation is
+  // running (a model-requested tool call). Registered as a Waterfall around the
+  // dispatch, so it MUST reach `next()` on every path; the publication rides
+  // fire-and-forget ahead of the chain. No completion publisher is needed: when
+  // the tool settles, the loop immediately issues its next model request, which
+  // publishes "模型请求中" over it.
+  guard('tools/pre-execute listener', () => ctx.on('tools/pre-execute', (_exec, next) => {
+    try {
+      void publishTooling(ctx)
+    } catch { /* never block a tool dispatch for a status hint */ }
+    return next()
   }))
 
 /** Body of the `agent/request` listener; wrapped by its safe envelope above. */
@@ -343,15 +380,15 @@ async function __agentRequestListenerBody(ctx, payload, next) {
     // so the step ALWAYS routes through `next()` (the Waterfall requirement).
     try { maybeInstallDebugSink() } catch { /* non-fatal */ }
     try { maybeRegisterCommand() } catch { /* non-fatal */ }
-    try { maybeInstallWireRewrite() } catch { /* non-fatal */ }
     const agent = payload && payload.agent
     const signal = payload && payload.signal
-    // (2026-09) Model-request hook: clear a STALE pinned "[强制压缩中>>]" banner on the live-UI
-    // badge when NO compaction is genuinely in flight (the "总是卡住" fix). Runs on EVERY model
-    // step — awaited, before the compaction attempt below — so a working-pair write lands FIRST
-    // and a fresh COMPRESSING banner (if this very step ends up compacting) still wins over it
-    // (no important-write race). The helper self-swallows all errors, so this await can never
-    // throw into the Waterfall `next()` hop.
+    // (2026-09) Model-request hook: clear a STALE pinned "[强制压缩中>>]" banner
+    // on the live-UI badge when NO compaction is genuinely in flight (the "总是
+    // 卡住" fix). Runs on EVERY model step — awaited, before the compaction attempt
+    // below — so the phase write lands FIRST and a fresh COMPRESSING banner (if this
+    // very step ends up compacting) still wins over it (no write race). The helper
+    // self-swallows all errors, so this await can never throw into the Waterfall
+    // `next()` hop.
     await clearStuckCompressingBanner(ctx, agent && agent.session)
     if (agent !== undefined && agent !== null && (signal === undefined || !signal.aborted)) {
       try {
@@ -387,7 +424,6 @@ async function __agentRequestListenerBody(ctx, payload, next) {
     // (as the other guarded listeners do) so the first idle transition is what
     // typically settles the `/force-compact` command registration.
     maybeRegisterCommand()
-    maybeInstallWireRewrite()
     // Fire-and-forget: trace listener liveness on the idle transition, read the
     // compactionMode raw (cheap), then hand off to the turn-end handler which
     // locates the per-realm compaction backend via `agent.ctx`.

@@ -87,7 +87,7 @@ busy 锁与表面一致性校验。
 每一类端点都宽容无视对方家族的键,故双发无害。字段打在 `src/engine/summarizer.js`
 (紧挨 `llm.stream(options)` 调用之前),**不在** `llm/stream` 瀑布里——早期草稿曾在那
 处尝试注入,实证证明结构性无效(中间层返回值被丢弃;就地改种子会使宿主崩溃);论证全文
-见 `src/hooks/wire-rewrite.js` 模块头部。该钩子现在只承担 LiveUI 水印角色。
+见 `src/hooks/wire-rewrite.js` 模块头部(该模块**已退役**,只留这份历史说明)。
 
 业务调用也要关思考?在请求头层面设定你 provider 的 `reasoningEffort`——插件有意退出
 该决定。
@@ -116,11 +116,28 @@ wire 字段的持久证据:
 极小的宿主→客户端信道(`liveUi` 设置字段被实时镜像到浏览器)替换**官方运行标签的前缀**——
 只动文字:harness 自己的计时文本、字体、颜色原样不动。
 
+状态文字**如实报告 agent 当前在做哪一类耗时动作**,共三类,各由一个 agent 缝驱动:
+
+| 状态 | 语义 | 触发点 |
+|------|------|--------|
+| **`模型请求中`** | 已发出模型请求,等第一个 token | `agent/request` waterfall |
+| **`模型响应中`** | 第一个 token 到达,持续到响应结束 | `agent/assistant-stream` 的首个 `chunk`(`index === 0`) |
+| **`工具执行中`** | 非模型的 agent 内部操作在跑 | `tools/pre-execute` waterfall |
+
+`responding` 挂在**首块**而不是 attempt 的 `start` 帧:后者在任何 token 到达**之前**就发出
+(紧跟 `llm.stream(request)` 调用),那一刻仍属 `requesting` 的时间跨度。
+
+**压缩摘要请求不计入这三类**(用户明确要求"排除压缩时请求")——这是**结构性排除**而非过滤:
+插件(与官方引擎)的摘要调用直连 `ctx.llm.stream`,不经过 `agent/request`、不产生
+`agent/assistant-stream` 帧、也不派发工具,三类相位的插入点它一个都碰不到。
+
+压缩横幅**保留**:
+
 - **`[强制压缩中>>>]`**——压缩即将提交前;
-- **`[压缩完成!]`**——压缩结果落定的瞬间;约 3 秒后,一条新鲜的随机工作中短句接替;
-- **轮换的俏皮短句**——平时每次模型请求都换一条;
-- **会话结束「还原」**——agent 转入 idle(一轮彻底结束)时推一个空文本(isImportant):
-  客户端把官方原文放回去并撤掉替换前缀。取代 2026-09 前的"会话开始时强制重绘随机工作态"。
+- **`[压缩完成!]`**——压缩结果落定的瞬间;之后由下一个 agent 动作(通常是继续循环的
+  `模型请求中`)自然覆盖,**不再有 3 秒回落定时器**;
+- **会话结束「还原」**——agent 转入 idle(一轮彻底结束)时推一个**空文本**;
+  客户端把官方原文放回去并撤掉替换前缀。
 
 harness 0.2.0 把这行运行态文案搬进了独立组件 `RunningStatus`(0.1.7 时的
 `button[data-turn-process] > span` 现在只渲染**已结束**回合),锚点是容器属性
@@ -147,9 +164,9 @@ harness 0.2.0 把这行运行态文案搬进了独立组件 `RunningStatus`(0.1.
 `::after { content: attr(data-shimmer-text) }` 从属性取)——只改文本节点的话,扫光扫过时会
 露出官方旧文案。观察器在 React 重写的同一微任务里重新贴上,所以计时继续走、且全程零轮询。
 
-徽标文字跟随应用语言:宿主写入语言无关的 `textId`(相位名或 `working.N`)加规范中文文本,
-客户端半部经自己的 `ctx.locale` zh/en/ja/ko 词典解析——英文界面显示英文俏皮话,中文界面
-保持原文。
+徽标文字跟随应用语言:宿主写入语言无关的 `textId`(**相位名**)加规范中文文本,
+客户端半部经自己的 `ctx.locale` zh/en/ja/ko 词典解析——英文界面显示 `Requesting model` /
+`Model responding` / `Running tool`,日文、韩文界面同理。
 
 发送方绝对安全:信令故障绝不误伤真实的压缩事务。
 
@@ -184,8 +201,8 @@ session/flush(session)                   # 持久化检查点
   调用)。
 - `src/hooks/command.js` —— `/force-compact` 命令(惰性注册)。
 - `src/hooks/idle.js` —— 回合结束强制压缩。
-- `src/hooks/wire-rewrite.js` —— `llm/stream` 的 LiveUI 水印钩子(不再做任何 wire
-  操作;缘由见模块头部历史注记)。
+- `src/hooks/wire-rewrite.js` —— **已退役**,只留历史说明(记录 `llm/stream` 缝为何
+  无法追加 wire 字段),无任何导出。
 - `src/engine/region.js` —— 选区(锚定头/尾,含官方工具配对台账)。
 - `src/engine/summarizer.js` —— 一次性 LLM 摘要器,与官方 `compaction-basic` 完全
   对齐(三级 target 解析、前缀缓存对齐、`purpose:'compaction'` 标签、fail-closed
@@ -325,9 +342,9 @@ falling-ts-force-compact:
 - **持久化:** 持久物为 `compaction/*` 括号事件 + 一条 `surfaceOp:replace` 的
   `user/message` 检查点,跨版本回放安全。
 - **客户端半部:** `web/client.js` 新增「强制压缩」设置分区(本地化标签),支持实时改
-  值(uSES 安全镜像),除一处有意保留的 3 秒定时器(纯表现层,见下)外无任何定时/状态。
-- **唯一的有意定时器:** `publishDone` 的 3 秒回落(表现层,见插件 AGENTS.md 例外节);
-  其余全部纯监听器 + 进程内 `Map` 强制标记。
+  值(uSES 安全镜像),无任何定时器或跨会话状态。
+- **无定时器:** 全插件不引入任何 timer——原 `publishDone` 的 3 秒回落已随随机状态
+  文本一并删除(见 `AGENTS.md` 的 LiveUI 节);其余全部纯监听器 + 进程内 `Map` 强制标记。
 
 ---
 
@@ -337,11 +354,12 @@ falling-ts-force-compact:
 
 *设置页面——**强制压缩** 分区;上方九个字段全部支持不改重启地实时编辑。*
 
-![会话页面——工作中短句替换掉官方标签的前缀](assets/live-conversation.png)
+![会话页面——状态文字替换掉官方标签的前缀](assets/live-conversation.png)
 
-*会话页面——LiveUI 信令改写每个运行中回合标签的前缀(压缩中 / 完成 / 轮换工作中短句),
-harness 计时在它后面继续走;会话结束(idle)时官方原文被还原。该截图摄于 2026-09 去色之前:
-现在徽标是官方灰色文字、官方字体。*
+*会话页面——LiveUI 信令把每个运行中回合标签的前缀改写成当前 agent 动作
+(`模型请求中` / `模型响应中` / `工具执行中`,压缩时是 `[强制压缩中>>>]` / `[压缩完成!]`),
+harness 计时在它后面继续走;会话结束(idle)时官方原文被还原。该截图摄于 2026-09 改版之前:
+现在显示的是上面这三类实际状态,徽标保持官方灰色文字、官方字体。*
 
 ---
 

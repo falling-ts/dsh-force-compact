@@ -39,7 +39,7 @@ import {
   validateSurfaceRegionSafe,
 } from '../engine/region.js'
 import { resolveCompaction } from '../engine/backend.js'
-import { publishCompressing, publishDone, publishUiStatus, randomWorkingStatus, PHASE_COMPRESSING, LIVE_UI_FIELD } from '../core/ui-signal.js'
+import { publishCompressing, publishDone, publishRequesting, PHASE_COMPRESSING, LIVE_UI_FIELD } from '../core/ui-signal.js'
 import { isCompactionActive } from '../engine/builtin.js'
 import { guardFn, renderCrash, captureThrowSite, appendCrashLine as appendDiag } from '../core/crashnet.js'
 import { getProjectedTokens } from '../core/projected.js'
@@ -314,7 +314,7 @@ async function __compactRetainingLatestBody(ctx, agent, signal, mode, sourceComm
       + `retainedTokens(after-boundary-snap)=${region.retainedTokens}`
     )
     try {
-      // LIVE UI SIGNAL — PIN RED "compressing" BEFORE the region compaction
+      // LIVE UI SIGNAL — PIN the COMPRESSING banner BEFORE the region compaction
       // commits. Publishers swallow their own failures, so the messenger can
       // never affect whether the compaction itself commits.
       await publishCompressing(ctx)
@@ -333,9 +333,9 @@ async function __compactRetainingLatestBody(ctx, agent, signal, mode, sourceComm
         )
         continue
       }
-      // COMMITTED — range shadowed + summary added. Pin GREEN "done" NOW; the
-      // next model request's `llm/stream` watermark replaces it with a fresh
-      // random working pair shortly after.
+      // COMMITTED — range shadowed + summary added. Pin the DONE banner NOW; the
+      // next agent action overwrites it (normally the `agent/request` of the
+      // step this guard is running inside, which publishes "模型请求中").
       await publishDone(ctx)
       committedAny = true
       ctx.logger.info(
@@ -361,25 +361,27 @@ async function __compactRetainingLatestBody(ctx, agent, signal, mode, sourceComm
  * but ONLY when no compaction is actually in flight for the session right now.
  *
  * WHY THIS EXISTS: a compaction that never commits (every round fails, or a
- * summarization stream hangs past its 90 s hard timeout) leaves the pinned red
- * COMPRESSING banner on the badge. The per-call `llm/stream` watermark pushes
- * working pairs NON-importantly, and the guard inside `publishUiStatus` REFUSES
- * to overwrite a `[`-prefixed bracket text — so that residue sticks (the "总是
- * 卡住" symptom). On every model step, when the session has NO open
- * `compaction/start` bracket (nothing genuinely in flight) AND the badge currently
- * shows a COMPRESSING bracket (phase === 'compressing'), force a fresh random
- * working pair with isImportant=true to override it (including residue that
- * persisted to `settings.yaml` across a restart). A DONE banner (phase 'done') is
- * left to its own 3 s fallback timer, and a working / end badge needs no override.
- * When a compaction IS in flight, the banner is a genuine in-progress indicator and
- * is left untouched.
+ * summarization stream hangs past its 90 s hard timeout) leaves the pinned
+ * COMPRESSING banner on the badge. The next agent action normally overwrites it
+ * (every phase writes unconditionally), so within a live session the residue
+ * self-heals. The one case that does NOT self-heal is a banner PERSISTED to the
+ * settings file across a restart: the badge can come up showing
+ * `[强制压缩中>>>]` for a compaction that died with the previous process. On
+ * every model step, when the session has NO open `compaction/start` bracket
+ * (nothing genuinely in flight) AND the badge currently shows a COMPRESSING
+ * bracket (phase === 'compressing'), publish this step's real phase
+ * ({"模型请求中"} — the agent is about to issue the request) to override it. A
+ * DONE banner (phase 'done') needs no override: it is likewise overwritten by
+ * the next action, and unlike the red COMPRESSING banner it does not claim a
+ * transaction is in progress. When a compaction IS in flight, the banner is a
+ * genuine in-progress indicator and is left untouched.
  *
- * Awaited (NOT fire-and-forget) and fully contained: the caller awaits this so the
- * working-pair write LANDS before any COMPRESSING banner a compaction in the SAME
- * step would publish — otherwise the two important writes race and a working pair
- * could transiently mask a genuine in-progress compaction. `publishUiStatus`
- * swallows all of its own rejections, and this body is additionally try/caught, so
- * a UI clear can NEVER throw into (or disturb) the model-request path.
+ * Awaited (NOT fire-and-forget) and fully contained: the caller awaits this so
+ * the phase write LANDS before any COMPRESSING banner a compaction in the SAME
+ * step would publish — otherwise the two writes race and a request phase could
+ * transiently mask a genuine in-progress compaction. `publishUiStatus` swallows
+ * all of its own rejections, and this body is additionally try/caught, so a UI
+ * clear can NEVER throw into (or disturb) the model-request path.
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @param {import('@deepseek-ai/dsh-session').Session} session
  * @returns {Promise<void>}
@@ -388,18 +390,18 @@ export async function clearStuckCompressingBanner(ctx, session) {
   try {
     if (session === undefined || session === null) return
     if (isCompactionActive(session)) return // genuinely compacting — preserve the banner
-    // Only override a STALE COMPRESSING bracket — the "[强制压缩中>>>" residue a
+    // Only override a STALE COMPRESSING bracket — the "[强制压缩中>>>]" residue a
     // failed/hung compaction leaves behind when `publishDone` never fires. A DONE
-    // banner (phase 'done') is left to its own 3 s fallback timer, and a working /
-    // end badge needs no override. Harness 0.1.7 removed `settings.get(ns)`; this
-    // reads the live Config ref the plugin was bound with. Cosmetic read: a miss
-    // simply means "nothing stuck to clear" (no push, no churn).
+    // banner (phase 'done') needs no override (see the note above). Harness 0.1.7
+    // removed `settings.get(ns)`; this reads the live Config ref the plugin was
+    // bound with. Cosmetic read: a miss simply means "nothing stuck to clear"
+    // (no push, no churn).
     const liveUi = await readRawSetting(ctx, LIVE_UI_FIELD)
     const phase = (liveUi != null && typeof liveUi === 'object' && typeof liveUi.phase === 'string')
       ? liveUi.phase
       : undefined
     if (phase !== PHASE_COMPRESSING) return // nothing stuck to clear
-    await publishUiStatus(ctx, randomWorkingStatus(), true) // override the stale bracket
+    await publishRequesting(ctx) // override the stale bracket with this step's real phase
   } catch { /* a UI clear must never disturb the request path */ }
 }
 

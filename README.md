@@ -107,8 +107,8 @@ Each family tolerates-and-ignores the foreign key, so emitting both is harmless.
 stamped in `src/engine/summarizer.js` (immediately before `llm.stream(options)`), NOT in the
 `llm/stream` waterfall — a prior draft injected there but proved ineffective structurally
 (middle-layer returns are discarded; in-place seed mutation crashes the host); see the
-`src/hooks/wire-rewrite.js` module header for the write-up. That hook now serves only the
-LiveUI watermark role.
+`src/hooks/wire-rewrite.js` module header for the write-up (that module is now **retired** and
+keeps only this historical record).
 
 Need thinking off on **business calls** too? Set your provider's `reasoningEffort` at the
 request-header level — the plugin deliberately stays out of that decision.
@@ -139,14 +139,31 @@ A tiny host→client messenger (the `liveUi` settings field mirrored live to the
 official running label's leading phrase beside the turn. Only the text changes: the harness's own
 elapsed-time text, font, and colour are left exactly as shipped.
 
+The status text reports **which kind of time-consuming agent action is running**, one phase per kind.
+Three phases, each driven by one agent seam:
+
+| Status | Meaning | Insertion point |
+|--------|---------|-----------------|
+| **`模型请求中`** (Requesting model) | the agent issued a model request and is waiting for the first token | the `agent/request` waterfall |
+| **`模型响应中`** (Model responding) | the first token arrived; lasts to the end of the response | the first `chunk` of `agent/assistant-stream` (`index === 0`) |
+| **`工具执行中`** (Running tool) | a non-model, agent-internal operation is running | the `tools/pre-execute` waterfall |
+
+`responding` hangs on the **first chunk**, not on the attempt's `start` frame: `start` is emitted
+*before* any token arrives (right after the `llm.stream(request)` call), and that moment still
+belongs to `requesting`'s span.
+
+**A compaction summarization request never publishes any of the three** (the user asked to exclude
+compaction-time requests). That is a **structural** exclusion, not a filter: the plugin's (and the
+official engine's) summarizer calls `ctx.llm.stream` directly, so it traverses no `agent/request`
+waterfall, produces no `agent/assistant-stream` frame, and dispatches no tools.
+
+The compaction banners are **kept**:
+
 - **`[强制压缩中>>>]`** — just before a compaction commits;
-- **`[压缩完成!]`** — the instant a compaction lands; 3 s later a fresh random working line
-  takes over;
-- **a rotating playful one-liner** — otherwise, on every model request;
-- **Restored at conversation end** — when the agent goes `idle` (the turn is fully
-  done), an empty text (isImportant) is pushed: the client puts the official label back
-  and drops its replacement prefix. Replaces the former conversation-START forced
-  working override (removed 2026-09).
+- **`[压缩完成!]`** — the instant a compaction lands; the next agent action (normally the continuing
+  loop's `模型请求中`) then overwrites it. There is **no 3 s fallback timer** any more;
+- **Restored at conversation end** — when the agent goes `idle` (the turn is fully done), an **empty
+  text** is pushed: the client puts the official label back and drops its replacement prefix.
 
 Harness 0.2.0 moved that line into its own `RunningStatus` component — the old
 `button[data-turn-process] > span` now renders only **settled** turns — anchored on the
@@ -175,9 +192,10 @@ copy whose glyphs come from CSS `::after { content: attr(data-shimmer-text) }`),
 the text node would let the sweep reveal the official wording. The observer re-applies in the same
 microtask in which React rewrites the label, so the clock keeps ticking and nothing polls.
 
-Label text follows the app language: the host writes a locale-independent `textId` (the phase name or
-`working.N`) plus the canonical Chinese text, and the client half resolves it through its own
-`ctx.locale` zh/en/ja/ko dictionaries — an English UI shows English one-liners, a Chinese UI keeps the
+Label text follows the app language: the host writes a locale-independent `textId` (**the phase
+name**) plus the canonical Chinese text, and the client half resolves it through its own
+`ctx.locale` zh/en/ja/ko dictionaries — an English UI shows `Requesting model` /
+`Model responding` / `Running tool`, a Chinese UI keeps the
 originals.
 
 Badge text follows the app language: the host writes a locale-independent `textId`
@@ -217,8 +235,8 @@ Supporting modules:
   process-local force flag (`thinkingDisabled` survives only as a legacy predicate).
 - `src/hooks/command.js` — the `/force-compact` command (lazily registered).
 - `src/hooks/idle.js` — turn-end forced compaction.
-- `src/hooks/wire-rewrite.js` — the `llm/stream` LiveUI watermark hook (no wire manipulation;
-  historical note in the module header).
+- `src/hooks/wire-rewrite.js` — **retired**; keeps only the historical note on why the
+  `llm/stream` seam cannot carry wire fields. No exports.
 - `src/engine/region.js` — head/tail-anchored region selection (with the official pairing ledger).
 - `src/engine/summarizer.js` — the one-shot LLM summarizer, fully aligned with official
   `compaction-basic` (target resolution, prefix-cache alignment, `purpose:'compaction'` tag,
@@ -373,9 +391,10 @@ predictably onto the UI figure.
 - **Persistence:** durable output is the `compaction/*` bracket events + a
   `surfaceOp:replace` `user/message` checkpoint, replay-safe across builds.
 - **Client half:** `web/client.js` adds the settings section "Force Compact" (localized
-  labels), live-editable without restart (uSES-safe mirror).
-- **One intentional timer:** the 3 s `publishDone` fallback (presentation-only, documented
-  deviation). Otherwise the plugin is pure listeners + a process-local `Map` force flag.
+  labels), live-editable without restart (uSES-safe mirror), with no timers or cross-session state.
+- **No timers at all:** the former 3 s `publishDone` fallback was removed together with the random
+  status texts it repainted (see the LiveUI section in `AGENTS.md`). Otherwise the plugin is pure
+  listeners + a process-local `Map` force flag.
 
 ---
 
@@ -386,12 +405,13 @@ predictably onto the UI figure.
 *Settings page — the **Force Compact** section; all nine fields above are editable live
 without a restart.*
 
-![Conversation page — the working line replacing the official label's leading phrase](assets/live-conversation.png)
+![Conversation page — the status text replacing the official label's leading phrase](assets/live-conversation.png)
 
-*Conversation page — the LiveUI signal rewrites the leading phrase of each running turn's label
-(compressing / done / a rotating working line) while the harness clock keeps ticking after it; at
-conversation end the official label is restored. The screenshot predates the 2026-09 colour removal:
-the badge is now plain grey text in the official font.*
+*Conversation page — the LiveUI signal rewrites each running turn's label to the current agent
+action (`模型请求中` / `模型响应中` / `工具执行中`; `[强制压缩中>>>]` / `[压缩完成!]` while compacting)
+while the harness clock keeps ticking after it; at conversation end the official label is restored.
+The screenshot predates the 2026-09 revision: it now shows those three real phases, and the badge
+stays plain grey text in the official font.*
 
 ---
 

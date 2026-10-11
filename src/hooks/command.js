@@ -156,7 +156,7 @@ async function __forceCompactCommandBody(ctx, invocation) {
               break
             }
           }
-          // LIVE UI SIGNAL — PIN RED "compressing" BEFORE the round's commit.
+          // LIVE UI SIGNAL — PIN the COMPRESSING banner BEFORE the round's commit.
           // Both publishers swallow their own failures, so the messenger can
           // never disturb the actual compaction outcome returned below.
           await publishCompressing(ctx)
@@ -196,8 +196,8 @@ async function __forceCompactCommandBody(ctx, invocation) {
             + `${result.shadowedSeqs?.length ?? '?'} nodes (~${result.shadowedTokenCount ?? '?'} tokens)`,
           )
         }
-        // COMMITTED at least once — pin GREEN "done"; the next model request's
-        // `llm/stream` watermark overwrites it shortly after (natural cadence,
+        // COMMITTED at least once — pin the DONE banner; the next agent action
+        // ("模型请求中" from the continuing loop) overwrites it (natural cadence,
         // no timer). Report the LAST round's shadowed count to the user.
         if (committedAny) {
           await publishDone(ctx)

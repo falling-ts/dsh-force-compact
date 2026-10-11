@@ -77,7 +77,7 @@ async function __handleAgentStatusBody(ctx, payload, mode) {
     // what suppressed the idle compaction (not a missing listener).
     ctx.logger.debug(`[force-compact] ${sid}: turn-end compaction disabled by settings — idle transition ignored`)
     // CONVERSATION-END CLEAR (2026-09): every idle path ends with the badge
-    // cleared — an empty `""` text (isImportant) restores the official look.
+    // cleared — an empty `""` text restores the official look.
     // `publishEnd` swallows its own failures; it never throws into the
     // `agent/status` dispatch.
     await publishEnd(ctx)
@@ -146,7 +146,7 @@ async function __handleAgentStatusBody(ctx, payload, mode) {
           break
         }
       }
-      // LIVE UI SIGNAL — PIN RED "compressing" BEFORE the round's compaction
+      // LIVE UI SIGNAL — PIN the COMPRESSING banner BEFORE the round's compaction
       // commits. Publishers swallow their own failures — the messenger can
       // never perturb the compaction transaction itself.
       await publishCompressing(ctx)
@@ -166,23 +166,20 @@ async function __handleAgentStatusBody(ctx, payload, mode) {
         + `${result.shadowedSeqs?.length ?? '?'} nodes (~${result.shadowedTokenCount ?? '?'} tokens)`,
       )
     }
-    // Pin GREEN "done" once at least one round committed; the next model
-    // request's `llm/stream` watermark redraws a fresh random working pair
-    // within seconds — no dedicated timer needed.
+    // Pin the DONE banner once at least one round committed. It is overwritten
+    // by the next agent action (the continuing loop's "模型请求中"), or — on
+    // this idle path — cleared right below by the conversation-end clear. There
+    // is no fallback timer: the former 3 s repaint of a random working text was
+    // removed with the random status texts themselves.
     if (committedAny) await publishDone(ctx)
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     ctx.logger.warn(`[force-compact] ${session.id}: idle compaction via ${backend?.kind} FAILED — ${message}`)
   }
   // ── CONVERSATION-END CLEAR (2026-09) — the badge is cleared at conversation
-  // END (replacing the former conversation-START forced working-pair override
-  // that lived in index.js): an empty `""` text with isImportant=true wipes
-  // whatever the compaction left on the badge — a stale red `[强制压缩中>>>]`
-  // when nothing committed (the self-healing case this clear now covers), or
-  // the green `[压缩完成!]` when a round did. The publisher swallows its own
-  // failures; it never throws into the `agent/status` dispatch.
-  // NOTE: when a round DID commit, the DONE banner's 3-second fallback timer
-  // (`publishDone` in ui-signal.js) may repaint a fresh working pair ~3 s
-  // AFTER this clear — pre-existing behavior, intentionally left untouched.
+  // END: an empty `""` text wipes whatever the compaction left on the badge — a
+  // stale `[强制压缩中>>>]` when nothing committed (the self-healing case this
+  // clear covers), or the `[压缩完成!]` banner when a round did. The publisher
+  // swallows its own failures; it never throws into the `agent/status` dispatch.
   await publishEnd(ctx)
 }

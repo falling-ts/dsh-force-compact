@@ -2,17 +2,43 @@
 
 本规则适用于 `dsh-force-compact/`，并补充[集合约定](../AGENTS.md)。
 
-## 例外：`publishDone` 的单用途定时器（有意偏离集合约定"不引入 timer"）
+## LiveUI 状态文字：三类 agent 耗时动作（2026-10 整体改版）
 
-集合约定要求插件"纯 Host 监听器：不引入 timer"。本插件在
-`src/core/ui-signal.js` 的 `publishDone` 中存在**一处有意的单用途定时器**
-（`DONE_FALLBACK_MS = 3000` ms）：发布 `[压缩完成!]` DONE 横幅后，3 秒后
-以 `isImportant=true` 强制重绘一条随机 working 文本，把 UI 还原到常规
-工作中外观。该定时器是纯表现层（fire-and-forget `setTimeout`，无内存态、
-无持久化、不影响任何压缩事务或模型请求），为用户明确要求的 UI 行为，
-**不属于**"引入 timer"所指的计时型副作用（如周期调度 / 延时重试），故予以
-豁免。除此一处之外，本插件仍不引入任何 timer；`queueForceCompact` 的
-process-local `Map` 标记也无 timer。
+运行态那行文案不再显示随机俏皮话，而是**如实报告 agent 当前在做哪一类耗时动作**。
+三类相位，各由一个 agent 缝驱动：
+
+| 相位 | 中文文案 | 语义 | 插入点 |
+|------|---------|------|--------|
+| `requesting` | `模型请求中` | 已发出模型请求，等第一个 token | `agent/request` waterfall（`index.js`） |
+| `responding` | `模型响应中` | 第一个 token 到达，持续到响应结束 | `agent/assistant-stream` 的 `chunk` 且 `index === 0` |
+| `tooling` | `工具执行中` | 非模型的 agent 内部操作在跑 | `tools/pre-execute` waterfall |
+
+**为什么 `responding` 挂在首块而不是 attempt 的 `start` 帧**：`start` 在任何 token 到达
+**之前**就发出（`agent.ts:438`，紧跟 `llm.stream(request)` 调用之后），那一刻仍属
+`requesting` 的时间跨度。`index === 0` 才是"第一个 token 到了"，正是用户要的分界。
+
+**压缩摘要请求被结构性排除**（用户明确要求"排除压缩时请求"）：本插件（与官方引擎）的
+摘要调用**直连 `ctx.llm.stream`**，因此①不经过 `agent/request` waterfall，②不产生
+`agent/assistant-stream` 帧（那些帧只由 agent loop 的 `AssistantStreamAttempt` 发出），
+③不派发任何工具。三类相位的插入点它一个都碰不到——这是**结构排除**，不靠过滤条件。
+`exploration/fc-agent-phase-probe.mjs` 把这条锁死（含"summarizer 中不出现任何 publishXxx"
+与"插件内不再有任何 `llm/stream` 监听器"）。
+
+**保留的压缩横幅**（用户确认保留）：`compressing` = `[强制压缩中>>>]`、
+`done` = `[压缩完成!]`。DONE 之后**不再有 3 秒回落定时器**——原来那个
+`DONE_FALLBACK_MS = 3000` 会在横幅后再补一条随机文本；随机文本既已删除，该定时器失去
+存在理由，一并移除（本插件因此**不再引入任何 timer**，上述"例外"节随之删除）。DONE 的
+生命周期改为"natural cadence"：下一个 agent 动作（通常是继续循环的 `agent/request` →
+`模型请求中`）自然覆盖它；被中断的会话则由 idle 的 `end` 清空兜底。
+
+**`[` 前缀闸门一并移除**：`publishUiStatus` 原先默认拒绝覆盖以 `[` 开头的当前文本
+（保护压缩横幅），只有 `isImportant=true` 能穿透。该闸门与 3 秒回落是配套的——没有回落，
+闸门会把横幅**永久钉在屏幕上**。现在每个相位都无条件覆盖，`publishUiStatus` 不再有
+`isImportant` 参数。`guard.js` 的 `clearStuckCompressingBanner` 保留但收窄了理由：它现在
+只为**跨重启持久化**的残留横幅服务（内存内的残留由下一个相位自然覆盖），并以本步的真实
+相位 `publishRequesting` 覆盖，不再写随机文本。
+
+**`end` 仍是空串清空**：客户端收到空文本即断开 DOM 观察器并还原官方原文。
 
 ## 例外：LiveUI 贴皮的 `MutationObserver`（有意偏离"客户端不引入额外订阅"）
 
@@ -406,47 +432,46 @@ llama.cpp 原生支持关闭推理的两种 wire 形态（`server-common.cpp`）
 - `chat_template_kwargs: { enable_thinking: false }`（1286-1291 行）——依赖
   模板本身支持 `enable_thinking` 占位符，不如前者鲁棒。
 
-**实现**：`src/hooks/wire-rewrite.js` 提供一个 `llm/stream` Waterfall 监听器
-（挂在 `ctx.llm.stream` 前的单一 LLM 出口缝，参见
-`deepseek-harness/packages/llm/llm/src/index.ts` 的 `llm/stream` 事件）。
-每次出 LLM 调用前，钩子按以下规则做**无条件全量追加**（不再有 provider/model
-目标门控——`reasoning_effort:"none"` 在所有已知后端上都无害：真 DeepSeek 容忍
-未知顶层键、llama.cpp/OAI 兼容层直接解析执行），因此一旦 `disableThinking`
-开启就对**每一次**出站调用（业务请求 + 本插件摘要调用）追加，消除"目标识别
-启发式漏判某条 Qwen 路由 → 静默仍思考"的死角：
+**实现位置（历史修订）**：本节曾描述 `src/hooks/wire-rewrite.js` 在 `llm/stream`
+Waterfall 上做"无条件全量追加"。该做法**从未生效且已彻底撤销**——`wire-rewrite.js`
+现已退役（只留历史说明，无任何导出）；真正的 wire 追加落在
+`src/engine/summarizer.js` 构造 `options` 处（见上文模块头部的两条结构性原因）。
+下列"规则表"与"双层保险"是**改动前的设计记录**，保留以说明为什么这条路走不通：
 
-| 条件 | 行为 |
+| 条件 | （已废弃的）行为 |
 |------|------|
 | `disableThinking` 设置为 `true` | 在 `next()` 返回的 options 上做**浅拷贝**，追加 `reasoning_effort: 'none'` 后返回；原有 `thinking` 字段保留不动，形成**双层保险**。 |
 | `disableThinking` 缺失 / 为 `false` | `return await next()` 原样转发，零开销短路（不分配、不改写）。 |
 
-**双层保险（关键设计）**：`disableThinking` 现在由**两处**协同关闭思考，二者互补、各有覆盖：
-- **层 1（请求缝，adapter 产出）**：`agent/request` waterfall 设 `reasoningEffort:'off'`，经 DeepSeek 适配器序列化为 wire 字段 `thinking:{type:'disabled'}`。**真 DeepSeek API 认这个字段**；在 llama.cpp/OAI 兼容端点上该顶层键不被 schema 识别、被透传进 `llama_params` 后忽略——故此层对 llama.cpp **无效**。
-- **层 2（wire 缝，本钩子追加）**：`llm/stream` waterfall 在 adapter 序列化之后追加顶层 `reasoning_effort:"none"`。**llama.cpp/OAI 兼容端点认这个字段**（`server-common.cpp:1295-1304` 特判为 `inputs.enable_thinking=false`，与 jinja 模板能力无关）；真 DeepSeek 端点将该未知键静默忽略——故此层对真 DeepSeek **无害**。
+**双层保险（已废弃的历史设计）**：曾经的设计是两层协同关闭思考：
+- **层 1（请求缝）**：`agent/request` waterfall 盖 `reasoningEffort:'off'`。该盖章已在
+  2026-08 的语义收窄中**停用**（见上文"`disableThinking` 语义收窄"），且它从未服务过
+  llama.cpp。
+- **层 2（wire 缝）**：`llm/stream` waterfall 追加顶层 `reasoning_effort:"none"`。该监听器
+  **从未生效**（两条结构性原因见 `wire-rewrite.js` 模块头部），现已**退役**。
 
-任一端点至少收到它能理解的其中一个字段，`disableThinking:true` 即在**任何后端**
-都如实关闭思考，两层之间无盲区。
+**当前唯一生效的关闭路径**是 `builtin.js → summarizer.js`：`disableThinking=true` 时摘要
+调用同时带 `reasoningEffort`（经能力探测降级到最省可用档位）与 wire 字段
+`reasoning_effort:"none"`，由 `summarizer.js` 在构造 options 处直接写入。
 
 **为何不做目标识别**：早期版本曾用 `isOpenAiCompatibleTarget`（`provider` 含
 `llama` / `model` 以 `.gguf` 结尾）做保守门控，但漏判某条非常规路由的后果就是
 回到静默失效；而误判（真 DeepSeek 被多打一未知键）本就无害。既然两端点都无害，
 干脆去掉门控改为全量追加——覆盖率确定性最高，也不再有启发式要维护。
 
-**惰性幂等安装**：与 `maybeRegisterCommand` 同套路——`maybeInstallWireRewrite`
-在每个受守卫的监听器（`agent/request` / `agent/pre-step` / `agent/status`
-idle 过渡）首次进入时被调用，内部 `registered` 闩锁保证同一生命周期内至多
-装一次。`apply` 启动期不调用（预设平面晚挂载，启动期强装会与后续 adapter
-注册竞态）。
+**惰性幂等安装（已随钩子退役）**：本节所描述的 `maybeInstallWireRewrite`（在每个受守卫的
+监听器首次进入时安装 `llm/stream` 钩子）已随 `wire-rewrite.js` 一并删除。现有的懒安装只剩
+debug-sink 与 `/force-compact` 命令两处（见 `index.js` 的 `maybeInstallDebugSink` /
+`maybeRegisterCommand`）。
 
 **为何不用独立 `registerAdapter`**：harness 已把 llama.cpp 流量路由经由
 DeepSeek 适配器（无独立的 llama.cpp 适配器包），再起一份 adapter 会与既有
-注册冲突或被组合顺序掩盖。`llm/stream` 是官方认可的"调整下一次调用序列化
-方式"的拦截缝，不破坏单一 LLM 出口不变量。详见
-`docs/llm-stream-llamacpp-adaptation.md` §7（A/B/C 三方案，此处采用 A）。
+注册冲突或被组合顺序掩盖。真正采用的是"在 `summarizer.js` 构造 options 处直接写
+wire 字段"（相当于方案 A 的落点修正）。详见
+`docs/llm-stream-llamacpp-adaptation.md` §7。
 
-**观测**：钩子仅在真正改写时输出一条
-`ctx.logger.debug('[force-compact] llm/stream: appended reasoning_effort="none" (disableThinking on) for <provider>/<model>')`，
-供事后核查；`disableThinking` 关闭或不改写路径零日志。
+**观测**：`summarizer.js` 在每次摘要调用前输出一条 wire-fields 诊断行
+（`reasoningEffort='…' + reasoning_effort=(absent …)`），供事后核查实际下发的字段。
 
 ### 摘要器：深度对齐官方 `compaction-basic`（2026-08 升级）
 
@@ -493,12 +518,10 @@ DeepSeek 适配器（无独立的 llama.cpp 适配器包），再起一份 adapt
 **legacy predicate**（不再被热路径调用，但仍导出供将来需要 blanket-off
 语义的消费方复用）。
 
-**文档滞后警示**：下方"Wire 层补丁"章节描述的"双层保险"（layer 1 =
-`agent/request` 盖 `'off'`）是**改动前的行为**——layer 1 已停用；layer 2
-（`src/hooks/wire-rewrite.js` 的 `llm/stream` 透传）目前也仅是 LiveUI 水印
-钩子，不再做 wire 追加。真实有效的思考关闭只剩 `builtin.js → summarizer.js`
-一条线；对 llama.cpp/OpenAI 兼容端点的"压缩调用关闭思考"是否真的落到 wire
-字段，取决于所经 adapter 的序列化（见下方 wire 层章节的局限说明）。
+**文档状态**：上方"Wire 层补丁"章节保留的是**历史设计记录**——layer 1
+（`agent/request` 盖 `'off'`）已停用；layer 2（`wire-rewrite.js` 的 `llm/stream` 钩子）
+从未生效且已退役。真实有效的思考关闭只剩 `builtin.js → summarizer.js` 一条线
+（在构造 options 处直接写入 `reasoningEffort` 与 `reasoning_effort:"none"`）。
 
 ---
 
@@ -666,11 +689,12 @@ idle loop compaction — after 2 round(s) the projected context ~39438 tokens is
 活动语言 → 其 fallback 链 → `en` → `common` 命名空间 → **键名本身**，所以缺键**不报错**，
 只会静默回落到 en（或显示键名）——这正是必须由探针守住的原因。
 
-**LiveUI 徽章**：宿主发出的 `liveUi` 只带语言无关的 `textId`（相位名或 `working.N`）
-加规范中文 `text`；客户端把 `textId` 映射为 `badgeCompressing`/`badgeDone`/`badgeEnd`/
-`badgeWorkingN` 后按活动语言取词，仅当 `textId` 缺失/未知时才回落到宿主的中文 `text`。
-`badgeWorking0..19` 的顺序必须与宿主 `src/core/ui-signal.js` 的 `WORKING_TEXTS` 逐位一致
-（客户端 zh 条目会**遮蔽**宿主 text，漂移即改变 zh 用户实际看到的文案）。
+**LiveUI 徽章**：宿主发出的 `liveUi` 只带语言无关的 `textId`（**相位名**）加规范中文
+`text`；客户端用一个 `PHASE_KEYS` 表把 `textId` 映射为
+`badgeRequesting`/`badgeResponding`/`badgeTooling`/`badgeCompressing`/`badgeDone`/`badgeEnd`
+后按活动语言取词，仅当 `textId` 缺失/未知时才回落到宿主的中文 `text`。相位集合与词典键
+的对应由 `exploration/fc-badge-i18n-parity-probe.mjs` 逐键锁死（宿主 `PHASE_TEXTS` ↔
+客户端 `PHASE_KEYS` ↔ 四语词典三者必须同时对齐；客户端 zh 条目会**遮蔽**宿主 text）。
 
 **贴皮方式（2026-09-30 改版，随 harness 0.2.0）**：运行态那行文案在 0.2.0 搬进了独立组件
 `RunningStatus`（0.1.7 时它住在 `button[data-turn-process] > span` 里，而那个按钮现在只渲染
@@ -807,7 +831,7 @@ export），由 `builtinCommandName(descriptor)` 按 `definitionId` 命中；命
 
 ## 概览
 
-- 插件的持久效果是**追加到会话日志的压缩事务**——具体形态取决于实际走了哪条引擎：走官方时落 `compaction/*` 系列（`compaction/start`、`compaction/summary`、`compaction/end`）加一个 `surfaceOp:replace` 的 `user/message`；走内置时同样落 `compaction/*` 系列（`compaction/start`、`compaction/summary`、`compaction/end`，字段形状与官方完全一致）加同样形态的 `user/message`。两种事务都以"前置括号事件 + 后置 replace 表面节点"的形式落地。除上文"例外"节的单用途定时器（`ui-signal.js` `publishDone`，有意偏离，见该节）外，插件不引入 timer 或内存态存储；Host 半部保持是**核心模型请求缝**（`agent/request` / `agent/pre-step`）与 `session/flush` 上的纯 Host 监听器。**另有一个 web client 半部**（`web/client.js`，`package.json` 的 `exports["./client"]` + `dsh.client.platform: web`，经 client module 系统自动组成，无需改 web-app 组合）：仅注册一个 `settings.section`（设置页左侧菜单"强制压缩 / Force Compact"分区，order 30），经 `ctx.configForms.get('falling-ts-force-compact')` 镜像成 uSES 安全的 `SnapshotStore` 并读写字段（`scope.set`/`scope.unset` 写回 `settings.yaml`），**不**引入 timer、跨会话内存态或周期订阅（唯一的 DOM 观察器见上文「LiveUI 贴皮的 `MutationObserver`」例外）；client 半部 `inject: ['slots','locale','configForms']`（这三个 client 服务在 client 启动时即可用，与 Host 侧的 `compaction` 运行时依赖不同）。**liveUi 徽标文字四语**：宿主发出的 `liveUi` 事件携带语言无关的 `textId`（相位名或 `working.N`）+ 规范中文 `text`；badge 显示文本由 client 半部经 `ctx.locale` 的 **zh/en/ja/ko** 词典按 `textId` 本地化（`badgeCompressing`/`badgeDone`/`badgeWorkingN`），跟随应用语言——英文 UI 显示英文俏皮话，日文/韩文 UI 显示对应译文，中文 UI 保持原文；它只替换官方运行标签的前缀，harness 计时原样保留（详见下文"界面文案与语言"节的贴皮方式）。语言目录项与词典登记见下文"界面文案与语言"节。
+- 插件的持久效果是**追加到会话日志的压缩事务**——具体形态取决于实际走了哪条引擎：走官方时落 `compaction/*` 系列（`compaction/start`、`compaction/summary`、`compaction/end`）加一个 `surfaceOp:replace` 的 `user/message`；走内置时同样落 `compaction/*` 系列（`compaction/start`、`compaction/summary`、`compaction/end`，字段形状与官方完全一致）加同样形态的 `user/message`。两种事务都以"前置括号事件 + 后置 replace 表面节点"的形式落地。插件**不引入任何 timer**（原 `publishDone` 的 3 秒回落已随随机状态文本一并删除，见上文 LiveUI 节），也不引入跨会话内存态存储；Host 半部是**四个 agent 缝**（`agent/request` / `agent/pre-step` / `agent/assistant-stream` / `tools/pre-execute`）与 `session/flush` 上的纯 Host 监听器。**另有一个 web client 半部**（`web/client.js`，`package.json` 的 `exports["./client"]` + `dsh.client.platform: web`，经 client module 系统自动组成，无需改 web-app 组合）：仅注册一个 `settings.section`（设置页左侧菜单"强制压缩 / Force Compact"分区，order 30），经 `ctx.configForms.get('falling-ts-force-compact')` 镜像成 uSES 安全的 `SnapshotStore` 并读写字段（`scope.set`/`scope.unset` 写回配置文件），**不**引入 timer、跨会话内存态或周期订阅（唯一的 DOM 观察器见上文「LiveUI 贴皮的 `MutationObserver`」例外）；client 半部 `inject: ['slots','locale','configForms']`（这三个 client 服务在 client 启动时即可用，与 Host 侧的 `compaction` 运行时依赖不同）。**liveUi 徽标文字四语**：宿主发出的 `liveUi` 事件携带语言无关的 `textId`（相位名）+ 规范中文 `text`；badge 显示文本由 client 半部经 `ctx.locale` 的 **zh/en/ja/ko** 词典按 `textId` 本地化（`badgeRequesting`/`badgeResponding`/`badgeTooling`/`badgeCompressing`/`badgeDone`/`badgeEnd`），跟随应用语言——英文 UI 显示英文文案，日文/韩文 UI 显示对应译文（见上文「LiveUI 状态文字」与「界面文案与语言」两节）。译文，中文 UI 保持原文；它只替换官方运行标签的前缀，harness 计时原样保留（详见下文"界面文案与语言"节的贴皮方式）。语言目录项与词典登记见下文"界面文案与语言"节。
 - **两条压缩引擎**（见上文"双引擎架构"节）：
   - **官方引擎**——`compaction` 服务提供的 `compactNow` / `compactRegion`，由 preset 平面（`include:agent-presets:compaction-basic`）挂载，**是运行时可选依赖**：插件**不**声明 `inject`——profile 层条目在进程启动时激活，彼时 preset 平面尚未挂载该服务，硬 `inject` 会导致 `assertEntriesActivated` 启动断言失败；各压缩路径在事件时经 `findOfficialService`（`engine/backend.js`）按 `compactionMode`（`realm` 先试 `agent.ctx` 再试 `ctx`；`global` 只试 `ctx`）定位。
   - **内置引擎**——`src/engine/builtin.js` 自实现的完整压缩事务，只依赖 `ctx.sessions.append`、`ctx.llm.stream`、`ctx.tokenMeter.estimateMessage`（全部经 `ctx.get` 读取、可缺省、对 `undefined` 做守卫）。它追加**官方命名的 `compaction/*` 事件**（`compaction/start`、`compaction/summary`、`compaction/end`）与 `user/message`(replace)——**复用**官方词汇而非私造 `fc-compact/*`，因为官方类型天生在 `KNOWN_SESSION_EVENT_TYPES` 编目内，重载无需 `ignorable` 标记即可跨 build 持久（详见上文"为什么内置引擎改用官方 `compaction/*` 词汇"一节）。代价是须满足官方全局 `compaction/invariant` 监听器的全部不变量（共享 `compactionId`、owner/turn 一致、`shadowedSeqs` 对齐 `shadowedRange`、`provider`/`model` 必填、无错 `end` 需紧跟 `summary`）。两引擎并存时优先级：官方可达即用官方；官方不可达才落到内置（`builtinEnabled !== false` 且 `agent.session` / `llm.service/stream` 可用）。

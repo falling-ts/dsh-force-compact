@@ -108,28 +108,12 @@ window.__ModuleLoader__.load({
       unavailable: "设置不可用",
       loading: "加载中…",
       notWritable: "（当前为只读/内存模式，改动仅本进程生效）",
+      badgeRequesting: "模型请求中",
+      badgeResponding: "模型响应中",
+      badgeTooling: "工具执行中",
       badgeCompressing: "[强制压缩中>>>]",
       badgeDone: "[压缩完成!]",
       badgeEnd: "",
-      badgeWorking0: "正在酝酿骚操作",
-      badgeWorking1: "正在憋大招",
-      badgeWorking2: "灵感正在路上",
-      badgeWorking3: "脑细胞开会中",
-      badgeWorking4: "灵魂拷问进行中",
-      badgeWorking5: "偷偷翻你底牌",
-      badgeWorking6: "量子纠缠计算中",
-      badgeWorking7: "假装很忙",
-      badgeWorking8: "摸鱼式工作中",
-      badgeWorking9: "疯狂敲键盘(精神上)",
-      badgeWorking10: "正在缝合上下文",
-      badgeWorking11: "正在驯服混沌",
-      badgeWorking12: "正在召唤赛博大脑",
-      badgeWorking13: "正在翻阅《天机》",
-      badgeWorking14: "GPU 正在冒烟",
-      badgeWorking15: "正在跟熵值搏斗",
-      badgeWorking16: "正在画饼给你吃",
-      badgeWorking17: "正在偷渡灵感",
-      badgeWorking18: "正在暗中观察",
       thresholdChipAria: "本会话压缩阈值",
       thresholdTitle: "本会话压缩阈值",
       thresholdSessionLabel: "压缩阈值",
@@ -140,7 +124,6 @@ window.__ModuleLoader__.load({
       thresholdUseDefault: "使用全局默认",
       thresholdOverridden: "已覆盖全局默认",
       thresholdChipLabel: "强制压缩阈值",
-      badgeWorking19: "马上就好(大概)",
     };
     const en = {
       nav: "Force Compact",
@@ -174,28 +157,12 @@ window.__ModuleLoader__.load({
       unavailable: "Settings unavailable",
       loading: "Loading…",
       notWritable: "(read-only / memory mode; changes are process-local)",
+      badgeRequesting: "Requesting model",
+      badgeResponding: "Model responding",
+      badgeTooling: "Running tool",
       badgeCompressing: "[Compacting…]",
       badgeDone: "[Compaction complete!]",
       badgeEnd: "",
-      badgeWorking0: "Cooking up a wild move",
-      badgeWorking1: "Charging up a big move",
-      badgeWorking2: "Inspiration is on the way",
-      badgeWorking3: "Brain cells in session",
-      badgeWorking4: "Soul-searching in progress",
-      badgeWorking5: "Sneaking a peek at your cards",
-      badgeWorking6: "Quantum-entangled computing",
-      badgeWorking7: "Looking busy",
-      badgeWorking8: "Low-key slacking (working)",
-      badgeWorking9: "Pounding keys furiously (mentally)",
-      badgeWorking10: "Stitching context together",
-      badgeWorking11: "Taming the chaos",
-      badgeWorking12: "Summoning a cyber brain",
-      badgeWorking13: "Leafing through heaven's manual",
-      badgeWorking14: "GPU is smoking",
-      badgeWorking15: "Wrestling with entropy",
-      badgeWorking16: "Dangling a tasty promise",
-      badgeWorking17: "Smuggling in inspiration",
-      badgeWorking18: "Watching from the shadows",
       thresholdChipAria: "Session compaction threshold",
       thresholdTitle: "Session compaction threshold",
       thresholdSessionLabel: "Compaction threshold",
@@ -206,7 +173,6 @@ window.__ModuleLoader__.load({
       thresholdUseDefault: "Use global default",
       thresholdOverridden: "Overrides the global default",
       thresholdChipLabel: "Force-compact threshold",
-      badgeWorking19: "Almost done (maybe)",
     };
     // ja / ko 由本插件作为**语言包**贡献（上游 @deepseek-ai/dsh-client-locale 只内置
     // zh/en；LanguageRegistration 的 label 用该语言自述，fallback 必须已注册并以
@@ -243,28 +209,12 @@ window.__ModuleLoader__.load({
       unavailable: "設定を利用できません",
       loading: "読み込み中…",
       notWritable: "（現在は読み取り専用／メモリモードのため、変更はこのプロセス内でのみ有効です）",
+      badgeRequesting: "モデルにリクエスト中",
+      badgeResponding: "モデルが応答中",
+      badgeTooling: "ツールを実行中",
       badgeCompressing: "[強制圧縮中>>>]",
       badgeDone: "[圧縮完了!]",
       badgeEnd: "",
-      badgeWorking0: "大胆な一手を思案中",
-      badgeWorking1: "大技をチャージ中",
-      badgeWorking2: "ひらめきが向かっています",
-      badgeWorking3: "脳細胞が会議中",
-      badgeWorking4: "魂の問い詰め中",
-      badgeWorking5: "こっそり手札を覗き中",
-      badgeWorking6: "量子もつれ計算中",
-      badgeWorking7: "忙しいフリ中",
-      badgeWorking8: "サボりながら作業中",
-      badgeWorking9: "キーボードを狂ったように叩いています(精神的に)",
-      badgeWorking10: "コンテキストを縫合中",
-      badgeWorking11: "混沌を手なずけ中",
-      badgeWorking12: "サイバー脳を召喚中",
-      badgeWorking13: "『天機』をめくっています",
-      badgeWorking14: "GPU が煙を上げています",
-      badgeWorking15: "エントロピーと格闘中",
-      badgeWorking16: "絵に描いた餅を焼いています",
-      badgeWorking17: "ひらめきを密輸中",
-      badgeWorking18: "影から様子をうかがっています",
       thresholdChipAria: "このセッションの圧縮しきい値",
       thresholdTitle: "このセッションの圧縮しきい値",
       thresholdSessionLabel: "圧縮しきい値",
@@ -274,8 +224,7 @@ window.__ModuleLoader__.load({
       thresholdFailed: "保存に失敗しました。もう一度お試しください。",
       thresholdUseDefault: "グローバル既定を使用",
       thresholdOverridden: "グローバル既定を上書き中",
-      thresholdChipLabel: "強制圧縮しきいち",
-      badgeWorking19: "もうすぐです(たぶん)",
+      thresholdChipLabel: "強制圧縮しきい値",
     };
     const ko = {
       nav: "강제 압축",
@@ -309,28 +258,12 @@ window.__ModuleLoader__.load({
       unavailable: "설정을 사용할 수 없습니다",
       loading: "불러오는 중…",
       notWritable: "(현재 읽기 전용/메모리 모드라 변경은 이 프로세스에서만 적용됩니다)",
+      badgeRequesting: "모델 요청 중",
+      badgeResponding: "모델 응답 중",
+      badgeTooling: "도구 실행 중",
       badgeCompressing: "[강제 압축 중>>>]",
       badgeDone: "[압축 완료!]",
       badgeEnd: "",
-      badgeWorking0: "대담한 한 수를 구상 중",
-      badgeWorking1: "필살기를 충전 중",
-      badgeWorking2: "영감이 오고 있습니다",
-      badgeWorking3: "뇌세포 회의 중",
-      badgeWorking4: "영혼 심문 진행 중",
-      badgeWorking5: "몰래 당신의 패를 엿보는 중",
-      badgeWorking6: "양자 얽힘 계산 중",
-      badgeWorking7: "바쁜 척하는 중",
-      badgeWorking8: "딴짓하며 일하는 중",
-      badgeWorking9: "키보드를 미친 듯이 두드리는 중(정신적으로)",
-      badgeWorking10: "컨텍스트를 꿰매는 중",
-      badgeWorking11: "혼돈을 길들이는 중",
-      badgeWorking12: "사이버 두뇌를 소환 중",
-      badgeWorking13: "《천기》를 넘겨보는 중",
-      badgeWorking14: "GPU가 연기를 내뿜는 중",
-      badgeWorking15: "엔트로피와 씨름 중",
-      badgeWorking16: "그림의 떡을 구워주는 중",
-      badgeWorking17: "영감을 밀수 중",
-      badgeWorking18: "그림자에서 지켜보는 중",
       thresholdChipAria: "이 세션 압축 임계값",
       thresholdTitle: "이 세션 압축 임계값",
       thresholdSessionLabel: "압축 임계값",
@@ -341,7 +274,6 @@ window.__ModuleLoader__.load({
       thresholdUseDefault: "전역 기본값 사용",
       thresholdOverridden: "전역 기본값 재정의",
       thresholdChipLabel: "강제 압축 임계값",
-      badgeWorking19: "거의 다 됐습니다(아마도)",
     };
 
     /** 必需服务（cordis fiber inject）。configForms 由 ui-settings 提供。 */
@@ -956,12 +888,14 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Live UI 徽章的贴皮入口。宿主半部（core/ui-signal.js）在四个时机改写本
-     * 命名空间的 liveUi 字段：每次出站 LLM 调用开始时写入随机工作态；强制压缩
-     * 开始前写入固定「[强制压缩中>>>]」；压缩成功后写入固定「[压缩完成!]」；
-     * 会话结束（agent 转入 idle，hooks/idle.js）写入空字符串 text —— 语义是
+     * Live UI 徽章的贴皮入口。宿主半部（core/ui-signal.js）在六个相位改写本
+     * 命名空间的 liveUi 字段，其中三类是 agent 耗时动作：模型请求中 / 模型响应中 /
+     * 工具执行中（分别由 index.js 的 agent/request、agent/assistant-stream、
+     * tools/pre-execute 三条缝驱动）；其余三条是压缩横幅与清空：
+     * 强制压缩开始前的固定「[强制压缩中>>>]」、压缩成功后的固定「[压缩完成!]」、
+     * 会话结束（agent 转入 idle，hooks/idle.js）的空字符串 text —— 语义是
      * "清空"（还原官方原文、断开观察器）。
-     * 文本按 textId 经下方词典做 zh/en/ja/ko 本地化（跟随应用语言）。
+     * 文本按 textId（即相位名）经下方词典做 zh/en/ja/ko 本地化（跟随应用语言）。
      * 只替换运行态那行**文字**的前缀，前缀的鲸鱼动画图标与分隔线原样保留。
      * 机制与 DOM 定位策略见下方「官方运行标签的前缀替换器」注释块。
      */
@@ -1252,19 +1186,22 @@ window.__ModuleLoader__.load({
       paintedLabels.clear();
     }
 
-    // 把宿主写下的语言无关 textId 映射到本 NS 的词典键。相位猜成语同名键
-    // （compressing/done/end → badgeCompressing/badgeDone/badgeEnd），工作态
-    // 'working.N' → badgeWorkingN（0..19，与 src/core/ui-signal.js 的
-    // WORKING_TEXTS 长度对齐）；越界/未知一律 null（回落到规范中文 text）。
+    // 把宿主写下的语言无关 textId 映射到本 NS 的词典键。textId 恒为相位名
+    // （requesting/responding/tooling/compressing/done/end），逐个对应到
+    // badgeRequesting / badgeResponding / badgeTooling / badgeCompressing /
+    // badgeDone / badgeEnd；未知一律 null（回落到宿主规范中文 text）。
+    const PHASE_KEYS = Object.freeze({
+      requesting: "badgeRequesting",
+      responding: "badgeResponding",
+      tooling: "badgeTooling",
+      compressing: "badgeCompressing",
+      done: "badgeDone",
+      end: "badgeEnd",
+    });
     function textIdToKey(textId) {
-      if (textId === "compressing" || textId === "done" || textId === "end") {
-        return "badge" + textId[0].toUpperCase() + textId.slice(1);
-      }
-      if (textId.indexOf("working.") === 0) {
-        const n = textId.slice("working.".length);
-        if (/^\d+$/.test(n) && Number(n) < 20) return "badgeWorking" + n;
-      }
-      return null;
+      return (typeof textId === "string" && Object.prototype.hasOwnProperty.call(PHASE_KEYS, textId))
+        ? PHASE_KEYS[textId]
+        : null;
     }
 
     // 显示文本：优先按 textId 经 t() 取当前语种词典的译文；t 缺失 / textId
