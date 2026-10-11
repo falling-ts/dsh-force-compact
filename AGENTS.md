@@ -148,7 +148,7 @@ resolveCompaction
 | `compaction-basic/src/region.ts` `validateSurfaceRegion`（界外拒绝 + 索引倒置拒绝 + **双侧平衡校验**） | `region.js` 导出 `validateSurfaceRegion`（throwing，官方语义）+ `validateSurfaceRegionSafe`（hot-path 安全壳，异常归一化为 `null`） | 提交前双重把关：不平衡候选在此被拒绝并记日志（fail-loud），不再带着可能劈裂 tool 对的边界往下走；会话核自身的 replace 校验仍是最后一道网 |
 | `compaction-basic/src/region.ts` `prepareCompaction` 的 surface 一致性交叉校验（meter 快照必须与 `session.surface.nodes` 逐位相等） | `hooks/guard.js` 选区之后、花钱之前 | 并发修改导致快照过期时整体拒绝本次尝试（下一步新鲜快照重试），绝不摘要错误的字节 |
 | `compaction-basic/src/region.ts` `inspectCompactionEntryState` + `assertCompactionInactive`（反向一次扫描同时收集 openTurn / 未配对 `compaction/start` / 最新 `session/end-seed`；**晚于孤儿 start 的 end-seed ⇒ 视为 constructor 继承残留，忽略**） | `builtin.js` `inspectCompactionEntryState` / `assertNoActiveCompaction`（原 `hasOpenFctLock` 由此重构而来） | busy 锁定语义与官方完全一致：真·在途事务拒入；跨生命周期继承的孤儿标记不再永久楔死后续压缩 |
-| `compaction-basic/src/summarizer.ts` `COMPACTION_INSTRUCTION` + `CHECKPOINT_PREAMBLE` + `<compacted-summary>` framing | `src/engine/summarizer.js`（逐字对齐，含七节结构与 Rules 段） | 指令文案与官方单源实现逐字一致——摘要输出结构、"(none)" 占位规则、prior-checkpoint 合并规则、"不得提及本次压缩"禁令全部相同 |
+| `compaction-basic/src/summarizer.ts` `COMPACTION_INSTRUCTION` + `CHECKPOINT_PREAMBLE` + `<compacted-summary>` framing | `src/engine/summarizer.js`（**结构对齐、文案本地化**，含八节结构与 Rules 段） | **结构**与官方单源实现一致——八节顺序、「（无）」占位规则、prior-checkpoint 合并规则、"不得提及本次压缩"禁令、"只输出检查点正文"禁令全部相同；**文案改为中文**（见下节"摘要指令中文化"）。两条 `<compacted-summary>` 标签逐字保留（它们是结构锚点，非文案） |
 | `compaction-basic` 摘要调用的 `system` + `tools` 前缀缓存对齐 | `builtin.js` 摘要输入（**已恢复 `tools` 传入**，撤销此前的二分法临时关闭） | 辅助调用成为上次路由请求的真前缀，复用热 KV 缓存；此前怀疑 `tools` 引发 provider `reading 'kind'` 崩溃，后经活体验证证实该崩溃源于 vendor 侧重放路径（与 `options.tools` 无关），故恢复全量对齐 |
 
 **未移植项及原因**（有意识的差异，非遗漏）：
@@ -159,6 +159,39 @@ resolveCompaction
   装官方的两种 stability 检查。
 - `compaction-tool-result-pruner`（独立的 tool result 修剪通路）——与本插件职责正交
   （它是"原地剪枝超限 tool result"，不是"区域替换"），不移植。
+
+### 摘要指令中文化（2026-10-11，实测驱动）
+
+**背景**：dsh-chinese 的规则要求全程用中文思考与输出，实测可见输出守得很好（中文密度
+0.66，仅 3% 的块以英文为主），但**推理流明显漏**（210 个长推理块里 26% 以英文为主，
+平均密度 0.46）。定位到两个结构性诱因之一就在本插件：摘要指令是一份**英文模板**，
+8 个 `##` 小标题全部硬编码英文，且这份摘要会被**重新注入上下文**——模型每隔一段就被
+自己产出的英文小标题示范一次"正式的推理用英文写"。
+
+**一处既有的隐藏偏离**：本节原先声称指令与官方**逐字一致**，但实际并非如此——
+官方 Rules 段写的是 `Write concise English engineering prose.`，本插件写的是
+`Write concise engineering prose.`（**"English" 一词已被悄悄删掉**）。这说明"让摘要
+说中文"的意图早就存在，只是仅删掉一个词、而把英文小标题留着，不足以改变输出语言。
+
+**本次改动**（`src/engine/summarizer.js`）：
+
+1. `COMPACTION_INSTRUCTION` **整份改为中文**：正文改用中文陈述，8 个小标题改为
+   「原始请求与意图 / 关键技术概念 / 文件与代码 / 错误与修复 / 待办事项 / 当前工作 /
+   下一步 / 关键上下文」，Rules 段改为"正文用中文书写"，并**显式保留**原有的
+   逐字保留清单（路径、命令、错误字符串、标识符、数值、函数签名、语法片段——
+   正是 dsh-chinese 中文规则里那条"代码与符号不翻译、不改写"的豁免，两边口径一致）。
+2. `CHECKPOINT_PREAMBLE` 一并中文化——它同样会落进检查点、同样被后续请求读到。
+3. **两条 `<compacted-summary>` 标签逐字不动**：它们是**结构锚点**而非文案，
+   官方 `frameSummary` 与 `compaction-basic` 的 prior-checkpoint 合并规则都按这两个
+   标签识别，改了会破坏合并语义。
+
+**与官方的对齐口径据此收窄**：从"文案逐字一致"改为"**结构一致、文案本地化**"——
+保留的硬约束是**八节顺序**、「（无）」占位规则、prior-checkpoint 合并规则、
+"不得提及本次压缩"与"只输出检查点正文"两条禁令。这是**有意的偏离**（第 4 条，
+与"规则文本不可配置"同族），不再算作"逐字移植"。
+
+**注意**：官方 `compaction-basic`（本插件的 priority-1 路径）**仍是英文指令**。
+本插件只在自己接管（builtin 引擎）时本地化；真要走官方引擎，其英文指令不受本改动影响。
 
 REGION-PICK 诊断行新增 `boundaryKind=` 字段；加载标记升级为
 `v2026-08-25-p0-p1-port`（dev-server stdout 可见）。

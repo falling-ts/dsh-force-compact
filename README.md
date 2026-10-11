@@ -238,9 +238,12 @@ Supporting modules:
 - `src/hooks/wire-rewrite.js` — **retired**; keeps only the historical note on why the
   `llm/stream` seam cannot carry wire fields. No exports.
 - `src/engine/region.js` — head/tail-anchored region selection (with the official pairing ledger).
-- `src/engine/summarizer.js` — the one-shot LLM summarizer, fully aligned with official
-  `compaction-basic` (target resolution, prefix-cache alignment, `purpose:'compaction'` tag,
-  fail-closed finish classification, usage capture).
+- `src/engine/summarizer.js` — the one-shot LLM summarizer, aligned with official
+  `compaction-basic` in **structure** (target resolution, prefix-cache alignment,
+  `purpose:'compaction'` tag, fail-closed finish classification, usage capture); the
+  summarization **instruction text is localized to Chinese** (structure identical, copy
+  localized, with both `<compacted-summary>` tags kept verbatim). The official engine still
+  uses the English instruction — see the "摘要指令中文化" section in `AGENTS.md`.
 - `src/engine/builtin.js` — the builtin persistent transaction (official `compaction/*` vocab).
 - `src/engine/checkpoint.js` — preview + shrink gate + delegation to the compaction service.
 - `src/core/projected.js` — provider-anchored `projectedTokens`.

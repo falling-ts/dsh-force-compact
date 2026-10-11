@@ -204,9 +204,11 @@ session/flush(session)                   # 持久化检查点
 - `src/hooks/wire-rewrite.js` —— **已退役**,只留历史说明(记录 `llm/stream` 缝为何
   无法追加 wire 字段),无任何导出。
 - `src/engine/region.js` —— 选区(锚定头/尾,含官方工具配对台账)。
-- `src/engine/summarizer.js` —— 一次性 LLM 摘要器,与官方 `compaction-basic` 完全
-  对齐(三级 target 解析、前缀缓存对齐、`purpose:'compaction'` 标签、fail-closed
-  终局分类、用量采集)。
+- `src/engine/summarizer.js` —— 一次性 LLM 摘要器,与官方 `compaction-basic` **结构**对齐
+  (三级 target 解析、前缀缓存对齐、`purpose:'compaction'` 标签、fail-closed
+  终局分类、用量采集);摘要**指令文案为中文**(结构一致、文案本地化,两条
+  `<compacted-summary>` 标签逐字保留) —— 官方引擎仍用英文指令,详见 `AGENTS.md`
+  的"摘要指令中文化"一节。
 - `src/engine/builtin.js` —— 内置持久事务(官方 `compaction/*` 词汇)。
 - `src/engine/checkpoint.js` —— 预览 + 缩容门禁 + 委托压缩服务。
 - `src/core/projected.js` —— provider 锚定的 `projectedTokens`。
