@@ -605,6 +605,39 @@ dsh 安装提供）：`dsh-settings`（Config/表单）、`dsh-compaction`
 `source={"kind":"compact-checkpoint","compactionId":"fc-…"}`、
 `surfaceOp={"op":"replace","startSeq":35,"endSeq":38}`。
 
+## harness 0.2.1 适配（2026-10-19，rc.2 逐缝核对）
+
+peer 下界升至 **`>=0.2.1-rc.1`**（0.2.1 列车），vendor 升至 cordis `>=4.0.5` /
+schemastery `>=3.18.5`。这次是**真实换车**（0.2.0-rc.2 → 0.2.1-rc.2，1925 commits），
+不是同列车补丁，所以下界必须跟着走——`peer-range-probe.mjs` 的规则正是"声明的列车下界
+必须与 checkout 同列车"，换车而不改下界会直接红。
+
+0.2.1 逐缝核对（本插件依赖的缝**全部仍在**，签名未变）：
+
+- `settings.configure` / `settings.update(ns, patch, expectedRevision?)` / `settings.describe()`；
+- `compaction.compactNow` / `compactRegion`；`llm.stream` / `llm.resolveCallConfig`；
+- `tokenMeter` 的 `heuristicTokens`（折价仍用它，不是 `tokens`——这条不变，见上文"口径纠偏"）；
+- `agents.get`、`sessions.append`、`session/flush`、`sessionProjections`；
+- `agent/status` / `agent/pre-step` / `agent/request` / `agent/assistant-stream` 四事件；
+  `tools/pre-execute`、`session/flush`；`commands.register`；
+- 客户端 `ctx.configForms.get` + `ConfigForm` 五方法、`settings.section` 槽（仍
+  `kind:'list'; scope:'root'`）、`ctx.locale`、`createSnapshotStore`；
+- `ui-primitives` 的 `IconCompactOutlineRegular` / `useAnchoredPosition` /
+  `useDismissOnOutsidePointer` 仍在（`projectUserText` 被移除，但本插件未使用它）。
+
+0.2.1 大面积删除 `./invariant` 导出（compaction、agent、system-prompt 等），本插件
+**一个都没用到**，无影响。
+
+**主题硬编码色清理（同日）**：`web/client.js` 里两处 `#e5484d` 改为官方语义 token
+`var(--dsw-alias-state-error-primary)`（浅/暗两套主题各自定义）。这是 `theme-token-probe.mjs`
+从 45 项变 46 项后抓到的那一条——它扫的是"设置区除品牌色/阴影白名单外不得出现字面色"。
+
+端到端复核（3099 实例，`DSH_HOME=~/.dsh-web`，0.2.1-rc.2）：`pluginInventory/list` 中
+`include:falling-ts-force-compact` 为 `enabled:true` / `fiberPhase:active`；
+`settings/describe` 出现 `falling-ts-force-compact`（`applies: live`）；真浏览器加载页面
+后 `#falling-ts-theme-tokens` 样式表已注入、**页面零错误**（证明客户端半部在 0.2.1 上
+正常求值并注入 token 表）。
+
 ## harness 0.2.0 适配（2026-09-30，rc.2 逐缝核对）
 
 peer 下界**不动**：仍是 `>=0.2.0-rc.1`（0.2.0 列车的首个 prerelease）。rc.1 → rc.2 是同一

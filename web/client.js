@@ -1553,8 +1553,8 @@ window.__ModuleLoader__.load({
     /** 上游 ContextMeter 的环几何（14px viewBox、r=5.5），与它逐像素对齐。 */
     const RING_VIEW = 14;
     const RING_RADIUS = 5.5;
-    /** 阈值标记的红色，与插件里报错文案同色。 */
-    const MARKER_COLOR = "#e5484d";
+    /** 阈值标记的红色，沿用官方错误语义 token（浅/暗两套主题各自定义）。 */
+    const MARKER_COLOR = "var(--dsw-alias-state-error-primary)";
 
     /**
      * 会话阈值在上下文占用上的两处标记：
@@ -1789,7 +1789,7 @@ window.__ModuleLoader__.load({
                 style: busy ? Object.assign({}, chipSaveStyle, chipSaveDisabledStyle) : chipSaveStyle,
                 disabled: busy, onClick: commit,
               }, t("thresholdSave"))),
-            h("div", { style: { marginTop: 8, color: error === null ? "var(--dsw-alias-label-tertiary)" : "#e5484d" } },
+            h("div", { style: { marginTop: 8, color: error === null ? "var(--dsw-alias-label-tertiary)" : "var(--dsw-alias-state-error-primary)" } },
               error === null ? t("thresholdHint") : error),
             override === undefined ? null : h("div", { style: { marginTop: 8 } },
               h("button", { type: "button", style: chipLinkStyle, disabled: busy, onClick: useDefault },
