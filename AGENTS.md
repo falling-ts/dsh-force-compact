@@ -605,6 +605,68 @@ dsh 安装提供）：`dsh-settings`（Config/表单）、`dsh-compaction`
 `source={"kind":"compact-checkpoint","compactionId":"fc-…"}`、
 `surfaceOp={"op":"replace","startSeq":35,"endSeq":38}`。
 
+## harness 0.2.1-rc.3 适配（2026-10-24，零改动）
+
+上游 `687f282e86`（rc.2）→ `22ddee3792`（master HEAD，`dsh-v0.2.1-rc.3-1533-g22ddee3792`），
+**1539 个提交**；版本列车仍是 **0.2.1**（rc.2 → rc.3），vendor `cordis 4.0.5` /
+`schemastery 3.18.5` 未变 → peer 下界 **`>=0.2.1-rc.1` 不动**（同列车补丁收窄下界只会让
+rc.1 运行时被 boot 期预检静默禁用）。
+
+本插件依赖的缝逐条核对（**全部仍在**，源码无需改动）：
+
+- `agent/pre-step`：**新增可选字段 `payload.modelSelection`**（`Readonly<ModelSelection>`，
+  该步骤捕获的 provider/model/未省 effort，重试间保持不变）。纯增量——本插件的监听器只读
+  `payload.agent` 与 `payload.signal`，多出来的字段不影响判定。`PreStepDecision` 仍是
+  `{kind:'reject'} | {kind:'enter', messages, startsRequestSeries?}`，语义未变。
+- `agent/request`：**被标记 `@deprecated`**（"Retained for existing listeners; do not add new
+  listeners"），且文档明确"替换返回值**必须保持 provider、model、reasoningEffort 三者不变**"。
+  本插件在该缝上是**纯透传**（`await next()` 后原样返回配置），既不换路由也不改档位，
+  因此仍然完全合规；它之所以保留，是因为懒安装（debug-sink / `/force-compact` 命令）搭着
+  这条缝的首次激活，且 waterfall 必须 `next()`。
+  **新增的模型选择出口**是 `agent.model.select()`（`AgentModel`，配 `agent.model.current()`），
+  走 session 投影持久化；其对应投影为 `modelSelection`。本插件**不使用**它：本插件的
+  `disableThinking` 自 2026-08 起就只作用于自己的摘要调用（`summarizer.js` 构造 options），
+  从不替业务请求选档位，所以没有迁移需求。
+- `agent/status` / `agent/assistant-stream`：签名逐字未变。
+- `tools/pre-execute`：声明**搬到了 `packages/core/tools/src/events.ts`**（原来是
+  `src/index.ts`），签名逐字未变；本插件按事件名监听，路径搬家无影响。
+- `session/flush`：签名未变（`(session) => Promise<void> | void`）。
+- `compaction.compactNow` / `compactRegion`：`compaction` 包本身**只改了版本号**，
+  抽象方法签名逐字未变。
+- `llm.stream` / `llm.resolveCallConfig`、`tokenMeter` 的 `heuristicTokens`（折价口径仍是它，
+  不是 `tokens`）、`agents.get`、`sessions.append`、`sessionProjections.snapshot()` 的
+  `values.contextPressure.projectedTokens`：全部未变。
+- **`compaction-basic`（优先级 1 的官方引擎）行为有变，但不影响本插件的移植块**：它新增
+  `agent/request` 上的**模型切换压缩**（切到小窗模型前先压），并把
+  `reservedCompletionTokens` 的参数从 `agent` 换成 `EpochHeader`；`context-overflow` 分支
+  改为先 `toolResultPruner.pruneSession` 再选区。这些都是官方引擎自己的内部编排，本插件的
+  facade 只调用 `compactNow` / `compactRegion` 两个抽象方法，签名未变。
+- 客户端：`ctx.configForms.get` + `ConfigForm` 五方法（`getSnapshot`/`subscribe`/`set`/
+  `unset`/`mutate`，写方法仍回答 `Promise<boolean>`）、`settings.section` 槽
+  （仍 `kind:'list'; scope:'root'`）、`ctx.locale.bind/register/addLanguage`
+  （`LOCALE_IDS` 仍是 `['zh','en']`）、`ctx.slots.inject`、`createSnapshotStore`、
+  `IconCompactOutlineRegular` / `useAnchoredPosition` / `useDismissOnOutsidePointer`
+  （`ui-primitives` 改动 107 个文件，但这三个符号仍在）——全部未变。
+
+**探针随动（唯一需要改的东西）**：0.2.1-rc.3 把**设置入口从侧栏底部的独立「设置」节点搬进了
+账号菜单**（页面上已不存在裸「设置」文本节点）。三个浏览器探针原来按"点击文本等于设置的元素"
+进入设置页，在新版上会停在首页，连带 `fc-settings-nav-icon-live-probe.mjs` 全红（是**探针**
+失效，不是图标贴面回归）。现改为先按账号菜单广告的快捷键 `Control+Alt+,` 打开，未打开时再走
+「账号菜单 → 设置」菜单项兜底；改后 `fc-settings-nav-icon-live-probe.mjs 3099`
+**28 项全绿**（三行精确认领、官方行未被误标、mask 模板分别绘制 44/48/48 个不透明像素），
+`web-020-settings-probe.mjs` 与 `sc-settings-ui-probe.mjs` 同步修好（后者 7 项全绿）。
+
+端到端复核（3099 隔离实例，`DSH_HOME=~/.dsh-web`，0.2.1-rc.3，UI 显示 `0.2.1-rc.3-22ddee3`）：
+`pluginInventory/list` 中五个插件全部 `enabled:true` / `fiberPhase:active`；
+`settings/describe` 出现 `falling-ts-force-compact`（`revision: 4`，`applies: live`）；
+`/force-compact` 命令项在真实菜单里带图标且文案完整；`web-ding` 的 `signal` 记录了真实回合
+结束信号（证明 `agent/status` 的 idle 转变照常驱动）。离线门禁：
+`fc-plugin-load-probe`、`fc-bracket-order-probe`（8）、`fc-summary-effort-probe`（19）、
+`fc-shadow-price-parity-probe`（38）、`fc-estimate-parity-probe`（33）、
+`fc-livetext-prefix-probe`（24）、`fc-livetext-apply-probe`（12）、
+`fc-command-face-probe`（39）、`fc-badge-i18n-parity-probe`、`fc-command-menu-probe 3099`（14，
+真实浏览器）全部通过。
+
 ## harness 0.2.1 适配（2026-10-19，rc.2 逐缝核对）
 
 peer 下界升至 **`>=0.2.1-rc.1`**（0.2.1 列车），vendor 升至 cordis `>=4.0.5` /
