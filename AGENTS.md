@@ -605,6 +605,62 @@ dsh 安装提供）：`dsh-settings`（Config/表单）、`dsh-compaction`
 `source={"kind":"compact-checkpoint","compactionId":"fc-…"}`、
 `surfaceOp={"op":"replace","startSeq":35,"endSeq":38}`。
 
+## harness 0.2.1-rc.5 适配（2026-10-30，零改动）
+
+基线切到 **`dsh-v0.2.1-rc.5`**（`b830ec950f`，页面版本串 `0.2.1-rc.5-b830ec9`）——npm 上
+`@deepseek-ai/dsh-*` 的 `next` dist-tag 所指版本，即「线上最新 rc」。
+
+**先看拓扑，否则会误读上一节**：rc.4 / rc.5 是从 **rc.3 tag 拉出的 release 分支**
+（`worktree/release-dsh-0.2.1-rc.5`），相对 rc.3 只多 **13 个修复提交**（`ui-chat` 的 thinking
+块、`ui-conversation` 的 slot 目录、`llm-deepseek-account` / `mcp-client` 的 stdout 诊断），
+**不含** master 上 rc.3 之后的 1500+ 提交（那条线已到 `0.2.2-alpha.2`，`alpha` dist-tag 指的
+就是它）。所以上一节里的两处「变更」——`agent/pre-step` 新增 `modelSelection`、
+`agent/request` 标 `@deprecated`——**在 rc.5 上都不存在**；本插件在 rc.5 上比在 master 上
+更"无坑"。
+
+逐缝核对（**全部仍在**，源码无需改动）：
+
+- `agent/pre-step` 载荷仍是 `{ agent, messages, turn, step, signal }`
+  （`core/agent/src/runtime-types.ts:320`），**没有 `modelSelection`**；
+  `PreStepDecision` 判别式未变。
+- `agent/request` 全文**搜不到 `@deprecated`**，仍是普通 waterfall，本插件在其上纯透传。
+- `tools/pre-execute` **仍在 `core/tools/src/index.ts:154`**——master 把它搬到了
+  `src/events.ts`，rc.5 没有那次搬家（`src/events.ts` 不存在）。本插件按事件名监听，位置无关。
+- `session/flush`（`core/session/src/index.ts:82`）签名未变。
+- `compaction.compactNow`（`compaction/compaction/src/index.ts:162`）/ `compactRegion`（:187）
+  抽象方法签名未变；`tokenMeter` 的 `heuristicTokens` 仍在
+  （`llm/token-meter/src/types.ts:53`、`surface-fold.ts:29`、`route-pricing.ts:42`）——
+  折价口径仍是它，**不是 `tokens`**。
+- `llm.stream`（`llm/llm/src/index.ts:75` 的 waterfall）/ `resolveCallConfig`（:894）未变；
+  `sessionProjections.snapshot()` 的 `values.contextPressure.projectedTokens` 仍在
+  （`projection.ts:45` / `usage-projection.ts:69`）。
+- 客户端 `ctx.configForms.get` + `ConfigForm` 五方法、`settings.section` 槽（仍 `kind:'list'`）、
+  `ctx.locale`、`createSnapshotStore`、`IconCompactOutlineRegular` / `useAnchoredPosition` /
+  `useDismissOnOutsidePointer` 全部仍在。
+
+端到端复核（3099 隔离实例，`DSH_HOME=~/.dsh-web`，0.2.1-rc.5）：
+`node exploration/fc-command-menu-probe.mjs 3099` **14 项全绿**（真浏览器里 `/force-compact`
+菜单项带图标、文案完整）；`node exploration/fc-settings-nav-icon-live-probe.mjs 3099`
+**28 项全绿**（三插件的设置导航图标贴面全在，mask 像素数与 rc.3 一致）；
+`node exploration/fc-threshold-settings-label-probe.mjs 3099` **7 项全绿**（「自动压缩阈值」
+读作「默认值」、提示指向会话覆盖、另两个字段未动）；离线门禁全部 exit=0；
+`pluginInventory/list` 中 `include:falling-ts-force-compact` 为 `enabled:true` /
+`fiberPhase:active`；`settings/describe` 出现 `falling-ts-force-compact`（`applies: live`）。
+
+**探针随动（两处，都是探针自身的环境耦合，不是插件回归）**：
+
+1. `fc-threshold-settings-label-probe.mjs` 原本把地址**硬编码**成
+   `http://127.0.0.1:3080/`，且靠点裸「设置」文本进设置页。3080 上若跑的是另一个 home 的旧
+   实例（前端 bundle 陈旧、版本串都解析不出），它会以"pane 空"给出 6 项**假失败**。
+   现改为**接受端口参数**（默认 3080 保持旧用法），并复用 `fc-settings-nav-icon-live-probe`
+   已验证的入口顺序：先按 `Control+Alt+,`，未开再走旧「设置」节点，最后走「账号菜单 → 设置」。
+   改后对 3099 跑 **7/7 全绿**。
+2. `fc-threshold-marker-probe.mjs` 需要**一个已打开、带上下文压力的会话**才会渲染
+   `[data-fc-threshold-chip]`，而它靠硬编码的会话名「熟悉项目」定位（那是旧 home 的数据）。
+   现改为：会话名走第三个参数、`ringGeometry` / `barGeometry` 加 null 保护、**页面没有 chip
+   时干净跳过**（打印 SKIP 与用法，exit 0）。把"环境没准备好"报成红色失败，比不跑更糟。
+   注意它验证的几何逻辑**并未失效**——只是新 home 的空态首页没有可点的会话。
+
 ## harness 0.2.1-rc.3 适配（2026-10-24，零改动）
 
 上游 `687f282e86`（rc.2）→ `22ddee3792`（master HEAD，`dsh-v0.2.1-rc.3-1533-g22ddee3792`），
